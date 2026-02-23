@@ -1,4 +1,5 @@
 import SwiftUI
+import SwiftData
 import FoundationModels
 
 // MARK: - Message Model
@@ -250,6 +251,9 @@ final class ChatViewModel: Identifiable {
     /// RAG configuration
     var ragSettings: RAGSettings = .default
 
+    /// Reference to the shared agent orchestrator for Manager-Worker pattern
+    var orchestrator: AgentOrchestrator?
+
     private static let maxTurnsBeforeRotation = 6
     private static let estimatedMaxTokens = 4096.0
     private static let charsPerToken = 3.5
@@ -259,6 +263,39 @@ final class ChatViewModel: Identifiable {
         customSystemPrompt?.isEmpty == false
             ? customSystemPrompt!
             : Self.defaultInstructions
+    }
+
+    /// Effective max turns before context rotation (reduced when workers consume context).
+    private var effectiveMaxTurns: Int {
+        if let orchestrator, orchestrator.hasActiveWorkers {
+            return max(Self.maxTurnsBeforeRotation - 1, 3)
+        }
+        return Self.maxTurnsBeforeRotation
+    }
+
+    /// Create a LanguageModelSession, using the orchestrator's Manager-Worker tools when available.
+    private func createSession(instructions: String, conversationSummary: String? = nil) -> LanguageModelSession {
+        if let orchestrator, orchestrator.hasActiveWorkers {
+            return orchestrator.createManagerSession(
+                baseInstructions: instructions,
+                conversationSummary: conversationSummary
+            )
+        } else if let summary = conversationSummary {
+            let inst = instructions
+            return LanguageModelSession {
+                """
+                \(inst)
+
+                Previous conversation context: \(summary)
+                Continue the conversation naturally.
+                """
+            }
+        } else {
+            let inst = instructions
+            return LanguageModelSession {
+                inst
+            }
+        }
     }
 
     // MARK: - Init
@@ -272,6 +309,16 @@ final class ChatViewModel: Identifiable {
         }
     }
 
+    /// Rebuild the session with current orchestrator tools.
+    /// Call after the orchestrator is assigned to pick up worker tools.
+    func rebuildSessionIfNeeded() {
+        guard let orchestrator, orchestrator.hasActiveWorkers else { return }
+        session = createSession(
+            instructions: activeInstructions,
+            conversationSummary: conversationSummary
+        )
+    }
+
     /// Restore from persisted data
     init(from data: ConversationData) {
         self.id = data.id
@@ -281,6 +328,7 @@ final class ChatViewModel: Identifiable {
         self.customSystemPrompt = data.customSystemPrompt
         self.hasAutoTitle = !data.messages.isEmpty
 
+        // Initial session without tools — will be rebuilt after orchestrator is assigned
         let instructions = data.customSystemPrompt?.isEmpty == false
             ? data.customSystemPrompt!
             : Self.defaultInstructions
@@ -358,7 +406,7 @@ final class ChatViewModel: Identifiable {
         }
 
         do {
-            if turnCount >= Self.maxTurnsBeforeRotation {
+            if turnCount >= effectiveMaxTurns {
                 await rotateSession()
             }
 
@@ -399,19 +447,13 @@ final class ChatViewModel: Identifiable {
         hasAutoTitle = false
         title = "New Chat"
         contextUsage = 0
-        let instructions = activeInstructions
-        session = LanguageModelSession {
-            instructions
-        }
+        session = createSession(instructions: activeInstructions)
         notifyChanged()
     }
 
     func updateSystemPrompt(_ prompt: String?) {
         customSystemPrompt = prompt
-        let instructions = activeInstructions
-        session = LanguageModelSession {
-            instructions
-        }
+        session = createSession(instructions: activeInstructions)
         turnCount = 0
         contextUsage = 0
         notifyChanged()
@@ -613,15 +655,10 @@ final class ChatViewModel: Identifiable {
 
         conversationSummary = summary
 
-        let instructions = activeInstructions
-        session = LanguageModelSession {
-            """
-            \(instructions)
-
-            Previous conversation context: \(summary)
-            Continue the conversation naturally.
-            """
-        }
+        session = createSession(
+            instructions: activeInstructions,
+            conversationSummary: summary
+        )
         turnCount = 0
 
         messages.append(Message(role: .system, content: "Context refreshed — I still remember the key points."))
@@ -630,12 +667,13 @@ final class ChatViewModel: Identifiable {
     private func updateContextEstimate() {
         let instructionChars = Double(activeInstructions.count)
         let summaryChars = Double(conversationSummary?.count ?? 0)
+        let toolSchemaChars = Double(orchestrator?.estimatedToolSchemaCharacters ?? 0)
 
         let sessionMessageCount = turnCount * 2
         let recentMessages = messages.suffix(sessionMessageCount)
         let messageChars = recentMessages.reduce(0.0) { $0 + Double($1.content.count) }
 
-        let totalEstimatedTokens = (instructionChars + summaryChars + messageChars) / Self.charsPerToken
+        let totalEstimatedTokens = (instructionChars + summaryChars + messageChars + toolSchemaChars) / Self.charsPerToken
         contextUsage = min(totalEstimatedTokens / Self.estimatedMaxTokens, 1.0)
     }
 
@@ -698,6 +736,7 @@ final class ConversationStore {
     let knowledgeBaseStore = KnowledgeBaseStore()
     var ragSettings: RAGSettings = .default
     var defaultSystemPrompt: String = ChatViewModel.defaultInstructions
+    let orchestrator = AgentOrchestrator()
 
     private static let saveKey = "saved_conversations"
     private static let ragSettingsKey = "rag_settings"
@@ -716,8 +755,18 @@ final class ConversationStore {
                 conversation.memoryStore = memoryStore
                 conversation.knowledgeBaseStore = knowledgeBaseStore
                 conversation.ragSettings = ragSettings
+                conversation.orchestrator = orchestrator
                 conversation.onChange { [weak self] in self?.saveToDisk() }
             }
+        }
+    }
+
+    /// Provide the SwiftData ModelContext to the orchestrator. Call from the view layer.
+    func configureOrchestrator(with modelContext: ModelContext) {
+        orchestrator.configure(with: modelContext)
+        // Rebuild sessions for existing conversations to pick up any enabled workers
+        for conversation in conversations {
+            conversation.rebuildSessionIfNeeded()
         }
     }
 
@@ -727,9 +776,13 @@ final class ConversationStore {
         conversation.memoryStore = memoryStore
         conversation.knowledgeBaseStore = knowledgeBaseStore
         conversation.ragSettings = ragSettings
+        conversation.orchestrator = orchestrator
         // Apply the default system prompt if user has customized it
         if defaultSystemPrompt != ChatViewModel.defaultInstructions {
             conversation.updateSystemPrompt(defaultSystemPrompt)
+        } else {
+            // Rebuild session to pick up worker tools if orchestrator is configured
+            conversation.rebuildSessionIfNeeded()
         }
         conversation.onChange { [weak self] in self?.saveToDisk() }
         conversations.insert(conversation, at: 0)

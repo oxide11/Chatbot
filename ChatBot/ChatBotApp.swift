@@ -6,6 +6,7 @@
 //
 
 import SwiftUI
+import SwiftData
 
 @main
 struct ChatBotApp: App {
@@ -15,6 +16,7 @@ struct ChatBotApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView(store: store)
+                .modelContainer(for: WorkerProfile.self)
                 .onOpenURL { url in
                     // Handle engram://shared or chatbot://shared URL from Share Extension
                     if (url.scheme == "engram" || url.scheme == "chatbot") && url.host == "shared" {

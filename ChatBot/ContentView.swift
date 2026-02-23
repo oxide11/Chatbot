@@ -1,4 +1,5 @@
 import SwiftUI
+import SwiftData
 import UniformTypeIdentifiers
 
 #if canImport(UIKit)
@@ -42,6 +43,7 @@ enum AppInfo {
 
 struct ContentView: View {
     var store: ConversationStore
+    @Environment(\.modelContext) private var modelContext
     @State private var searchText = ""
     @State private var showingSettings = false
     @State private var renamingConversationID: UUID?
@@ -99,6 +101,7 @@ struct ContentView: View {
         }
         .onAppear {
             store.conversations.first?.checkAvailability()
+            store.configureOrchestrator(with: modelContext)
         }
     }
 
@@ -137,7 +140,7 @@ struct ContentView: View {
                             }
                             Divider()
                             Button(role: .destructive) {
-                                store.deleteConversation(id: conversation.id)
+                                deletingConversationID = conversation.id
                             } label: {
                                 Label("Delete", systemImage: "trash")
                             }
@@ -181,6 +184,22 @@ struct ContentView: View {
         } message: {
             Text("Enter a new name for this conversation.")
         }
+        .alert("Delete Chat?", isPresented: Binding(
+            get: { deletingConversationID != nil },
+            set: { if !$0 { deletingConversationID = nil } }
+        )) {
+            Button("Delete", role: .destructive) {
+                if let id = deletingConversationID {
+                    store.deleteConversation(id: id)
+                }
+                deletingConversationID = nil
+            }
+            Button("Cancel", role: .cancel) {
+                deletingConversationID = nil
+            }
+        } message: {
+            Text("This conversation will be permanently deleted.")
+        }
     }
 
     private var sidebarBottomBar: some View {
@@ -213,7 +232,8 @@ struct ContentView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.regular)
-                .help("New Chat")
+                .keyboardShortcut("n", modifiers: .command)
+                .help("New Chat (⌘N)")
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
@@ -325,8 +345,28 @@ struct ChatDetailView: View {
     private var chatView: some View {
         VStack(spacing: 0) {
             messageList
+            workerIndicator
             contextBar
             inputBar
+        }
+    }
+
+    // MARK: - Worker Indicator
+
+    @ViewBuilder
+    private var workerIndicator: some View {
+        if let orchestrator = viewModel.orchestrator, orchestrator.hasActiveWorkers {
+            HStack(spacing: 4) {
+                Image(systemName: "person.2.badge.gearshape")
+                    .font(.system(size: 9))
+                Text("\(orchestrator.activeTools.count) worker\(orchestrator.activeTools.count == 1 ? "" : "s") available")
+                    .font(.system(size: 10))
+            }
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(.fill.quaternary, in: .capsule)
+            .padding(.top, 4)
         }
     }
 
@@ -842,6 +882,7 @@ struct SettingsView: View {
     @State private var showingDeleteAllConfirmation = false
     @State private var showingMemories = false
     @State private var showingKnowledgeBases = false
+    @State private var showingWorkers = false
     @State private var defaultPromptDraft = ""
 
     var body: some View {
@@ -880,10 +921,26 @@ struct SettingsView: View {
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
+
+                    Button {
+                        showingWorkers = true
+                    } label: {
+                        HStack {
+                            Label("Workers", systemImage: "person.2.badge.gearshape")
+                            Spacer()
+                            Text("\(store.orchestrator.activeTools.count)")
+                                .foregroundStyle(.secondary)
+                            Image(systemName: "chevron.right")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.tertiary)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
                 } header: {
                     Text("Intelligence")
                 } footer: {
-                    Text("Memories are facts extracted from conversations. Knowledge bases are imported documents.")
+                    Text("Memories are extracted from conversations. Knowledge bases are imported documents. Workers are specialized AI personas for task delegation.")
                 }
 
                 // MARK: Retrieval
@@ -1009,6 +1066,9 @@ struct SettingsView: View {
             }
             .sheet(isPresented: $showingKnowledgeBases) {
                 KnowledgeBaseListView(knowledgeBaseStore: store.knowledgeBaseStore)
+            }
+            .sheet(isPresented: $showingWorkers) {
+                WorkerLibraryView(orchestrator: store.orchestrator)
             }
         }
         #if os(macOS)
