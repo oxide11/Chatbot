@@ -72,14 +72,14 @@ struct ShareExtensionView: View {
                         Label(
                             selectedAction == .saveAsMemory
                                 ? "Memory saved successfully!"
-                                : "Content queued — open ChatBot to continue.",
+                                : "Content queued — open Engram to continue.",
                             systemImage: "checkmark.circle.fill"
                         )
                         .foregroundStyle(.green)
                     }
                 }
             }
-            .navigationTitle("Share to ChatBot")
+            .navigationTitle("Share to Engram")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {

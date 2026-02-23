@@ -607,13 +607,8 @@ final class ConversationStore {
     var selectedConversationID: UUID?
     let memoryStore = MemoryStore()
     let knowledgeBaseStore = KnowledgeBaseStore()
-    var ragSettings: RAGSettings = .default {
-        didSet { saveRAGSettings() }
-    }
-    /// Global default system prompt applied to new conversations
-    var defaultSystemPrompt: String = ChatViewModel.defaultInstructions {
-        didSet { saveDefaultSystemPrompt() }
-    }
+    var ragSettings: RAGSettings = .default
+    var defaultSystemPrompt: String = ChatViewModel.defaultInstructions
 
     private static let saveKey = "saved_conversations"
     private static let ragSettingsKey = "rag_settings"
@@ -716,11 +711,11 @@ final class ConversationStore {
         conversations = decoded.map { ChatViewModel(from: $0) }
     }
 
-    private func saveRAGSettings() {
+    /// Call after changing ragSettings to persist and propagate to conversations.
+    func applyRAGSettings() {
         if let data = try? JSONEncoder().encode(ragSettings) {
             SharedDataManager.sharedDefaults.set(data, forKey: Self.ragSettingsKey)
         }
-        // Propagate to all active conversations
         for conversation in conversations {
             conversation.ragSettings = ragSettings
         }
@@ -732,7 +727,8 @@ final class ConversationStore {
         ragSettings = decoded
     }
 
-    private func saveDefaultSystemPrompt() {
+    /// Call after changing defaultSystemPrompt to persist.
+    func applyDefaultSystemPrompt() {
         SharedDataManager.sharedDefaults.set(defaultSystemPrompt, forKey: Self.defaultSystemPromptKey)
     }
 
