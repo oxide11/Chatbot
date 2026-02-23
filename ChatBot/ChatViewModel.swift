@@ -235,6 +235,9 @@ final class ChatViewModel: Identifiable {
     /// RAG context that was used for the most recent response
     private(set) var lastRAGContext: RAGContext?
 
+    /// Names of workers that were invoked during the most recent response
+    private(set) var lastWorkerInvocations: [String] = []
+
     private var session: LanguageModelSession
     private var turnCount = 0
     private var conversationSummary: String?
@@ -397,10 +400,13 @@ final class ChatViewModel: Identifiable {
         isResponding = true
         isWaitingForFirstToken = true
         streamingText = ""
+        lastWorkerInvocations = []
 
         defer {
             isResponding = false
             isWaitingForFirstToken = false
+            // Drain any worker invocations that occurred during this turn
+            lastWorkerInvocations = orchestrator?.invocationTracker.drain() ?? []
             updateContextEstimate()
             notifyChanged()
         }
@@ -479,10 +485,12 @@ final class ChatViewModel: Identifiable {
         isResponding = true
         isWaitingForFirstToken = true
         streamingText = ""
+        lastWorkerInvocations = []
 
         defer {
             isResponding = false
             isWaitingForFirstToken = false
+            lastWorkerInvocations = orchestrator?.invocationTracker.drain() ?? []
             updateContextEstimate()
             notifyChanged()
         }

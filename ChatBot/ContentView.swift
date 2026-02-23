@@ -500,6 +500,11 @@ struct ChatDetailView: View {
                                        let rag = viewModel.lastRAGContext, !rag.isEmpty {
                                         RAGIndicatorView(context: rag)
                                     }
+
+                                    // Worker invocation indicator
+                                    if isLastAssistant, !viewModel.lastWorkerInvocations.isEmpty {
+                                        WorkerInvocationView(workerNames: viewModel.lastWorkerInvocations)
+                                    }
                                 }
                             }
                             .id(message.id)
@@ -835,6 +840,37 @@ struct RAGIndicatorView: View {
         .padding(.horizontal, 8)
         .padding(.vertical, 3)
         .background(.fill.quaternary, in: .capsule)
+    }
+}
+
+// MARK: - Worker Invocation Indicator
+
+struct WorkerInvocationView: View {
+    let workerNames: [String]
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "person.2.badge.gearshape")
+                .font(.system(size: 9))
+            Text(summary)
+                .font(.system(size: 10))
+        }
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .background(.fill.quaternary, in: .capsule)
+    }
+
+    private var summary: String {
+        let unique = Array(Set(workerNames))
+        if unique.count == 1 {
+            let count = workerNames.count
+            if count == 1 {
+                return "Used \(unique[0])"
+            }
+            return "Used \(unique[0]) (\(count)x)"
+        }
+        return "Used \(unique.joined(separator: ", "))"
     }
 }
 

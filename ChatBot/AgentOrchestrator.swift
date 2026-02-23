@@ -10,6 +10,38 @@ import Foundation
 import SwiftData
 import FoundationModels
 
+/// Thread-safe tracker for worker invocations during a single response turn.
+/// Used by `DynamicWorkerTool.call()` (which may run off the MainActor) to
+/// record which workers were invoked, so the UI can display it afterward.
+final class WorkerInvocationTracker: Sendable {
+    private let lock = NSLock()
+    private let _invocations = UnsafeMutableBufferPointer<[String]>.allocate(capacity: 1)
+
+    init() {
+        _invocations.initialize(repeating: [])
+    }
+
+    deinit {
+        _invocations.deallocate()
+    }
+
+    /// Record a worker invocation (called from any thread).
+    func record(_ workerName: String) {
+        lock.lock()
+        _invocations[0].append(workerName)
+        lock.unlock()
+    }
+
+    /// Retrieve and clear all recorded invocations.
+    func drain() -> [String] {
+        lock.lock()
+        let result = _invocations[0]
+        _invocations[0] = []
+        lock.unlock()
+        return result
+    }
+}
+
 @Observable
 final class AgentOrchestrator {
 
@@ -18,6 +50,9 @@ final class AgentOrchestrator {
 
     /// The SwiftData model context for fetching profiles.
     private var modelContext: ModelContext?
+
+    /// Thread-safe tracker that workers write to when invoked.
+    let invocationTracker = WorkerInvocationTracker()
 
     /// Whether any workers are currently enabled and available.
     var hasActiveWorkers: Bool { !activeTools.isEmpty }
@@ -41,7 +76,7 @@ final class AgentOrchestrator {
 
         do {
             let profiles = try modelContext.fetch(descriptor)
-            activeTools = profiles.map { DynamicWorkerTool(from: $0) }
+            activeTools = profiles.map { DynamicWorkerTool(from: $0, tracker: invocationTracker) }
         } catch {
             activeTools = []
         }

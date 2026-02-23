@@ -24,11 +24,17 @@ struct DynamicWorkerTool: Tool {
     /// Sanitized tool name derived from the worker profile name.
     let workerName: String
 
+    /// Human-readable display name for UI notifications.
+    let displayName: String
+
     /// The trigger description — tells the Manager when to use this worker.
     let workerDescription: String
 
     /// The worker's full system instructions / persona.
     private let workerSystemInstructions: String
+
+    /// Thread-safe tracker to record invocations for UI feedback.
+    private let tracker: WorkerInvocationTracker?
 
     // MARK: - Tool Protocol
 
@@ -37,17 +43,22 @@ struct DynamicWorkerTool: Tool {
 
     typealias Arguments = WorkerTaskArguments
 
-    init(from profile: WorkerProfile) {
+    init(from profile: WorkerProfile, tracker: WorkerInvocationTracker? = nil) {
         // Sanitize name for use as a tool identifier
         self.workerName = profile.name
             .replacingOccurrences(of: " ", with: "_")
             .lowercased()
             .filter { $0.isLetter || $0.isNumber || $0 == "_" }
+        self.displayName = profile.name
         self.workerDescription = profile.triggerDescription
         self.workerSystemInstructions = profile.systemInstructions
+        self.tracker = tracker
     }
 
     func call(arguments: WorkerTaskArguments) async throws -> String {
+        // Record this invocation for UI notification
+        tracker?.record(displayName)
+
         // Create an ephemeral worker session — it lives only for this call
         let instructions = workerSystemInstructions
         let workerSession = LanguageModelSession {
@@ -59,7 +70,7 @@ struct DynamicWorkerTool: Tool {
             return response.content
         } catch {
             // Return errors as text so the Manager can report gracefully
-            return "Worker '\(workerName)' encountered an error: \(error.localizedDescription)"
+            return "Worker '\(displayName)' encountered an error: \(error.localizedDescription)"
         }
         // workerSession is deallocated here — ephemeral by design
     }
