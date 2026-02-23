@@ -17,7 +17,16 @@ struct WorkerLibraryView: View {
     @State private var showingAddWorker = false
     @State private var editingWorker: WorkerProfile?
     @State private var showingDeleteAllConfirmation = false
+    @State private var showingRestoreConfirmation = false
     var orchestrator: AgentOrchestrator
+
+    private var builtInWorkers: [WorkerProfile] {
+        workers.filter(\.isBuiltIn).sorted { $0.name < $1.name }
+    }
+
+    private var customWorkers: [WorkerProfile] {
+        workers.filter { !$0.isBuiltIn }
+    }
 
     var body: some View {
         NavigationStack {
@@ -39,14 +48,24 @@ struct WorkerLibraryView: View {
                         .help("Add Worker")
                     }
                     ToolbarItem(placement: .automatic) {
-                        if !workers.isEmpty {
-                            Button(role: .destructive) {
-                                showingDeleteAllConfirmation = true
+                        Menu {
+                            Button {
+                                showingRestoreConfirmation = true
                             } label: {
-                                Image(systemName: "trash")
+                                Label("Restore Built-In Workers", systemImage: "arrow.counterclockwise")
                             }
-                            .help("Delete All Workers")
+                            if !workers.isEmpty {
+                                Divider()
+                                Button(role: .destructive) {
+                                    showingDeleteAllConfirmation = true
+                                } label: {
+                                    Label("Delete All Workers", systemImage: "trash")
+                                }
+                            }
+                        } label: {
+                            Image(systemName: "ellipsis.circle")
                         }
+                        .help("More Options")
                     }
                 }
                 .alert("Delete All Workers?", isPresented: $showingDeleteAllConfirmation) {
@@ -58,7 +77,16 @@ struct WorkerLibraryView: View {
                     }
                     Button("Cancel", role: .cancel) {}
                 } message: {
-                    Text("This will permanently delete all worker profiles.")
+                    Text("This will permanently delete all worker profiles, including built-in ones.")
+                }
+                .alert("Restore Built-In Workers?", isPresented: $showingRestoreConfirmation) {
+                    Button("Restore") {
+                        BuiltInWorkers.addMissingPresets(in: modelContext)
+                        orchestrator.refreshTools()
+                    }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("This will re-add any missing built-in workers with default settings. Existing workers will not be modified.")
                 }
                 .sheet(isPresented: $showingAddWorker) {
                     WorkerEditorView(orchestrator: orchestrator)
@@ -78,72 +106,114 @@ struct WorkerLibraryView: View {
             ContentUnavailableView {
                 Label("No Workers", systemImage: "person.2.badge.gearshape")
             } description: {
-                Text("Workers are specialized AI personas that the assistant can delegate tasks to. Create workers for code review, writing, summarization, and more.")
+                Text("Workers are specialized AI personas that the assistant can delegate tasks to.")
             } actions: {
-                Button("Add Worker") {
-                    showingAddWorker = true
+                VStack(spacing: 8) {
+                    Button("Restore Built-In Workers") {
+                        BuiltInWorkers.addMissingPresets(in: modelContext)
+                        orchestrator.refreshTools()
+                    }
+                    Button("Create Custom Worker") {
+                        showingAddWorker = true
+                    }
                 }
             }
         } else {
             List {
-                Section {
-                    ForEach(workers) { worker in
-                        Button {
-                            editingWorker = worker
-                        } label: {
-                            HStack(spacing: 12) {
-                                Image(systemName: worker.icon)
-                                    .font(.title2)
-                                    .foregroundStyle(worker.isEnabled ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
-                                    .frame(width: 32)
-
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text(worker.name)
-                                        .font(.body.weight(.medium))
-                                        .foregroundStyle(.primary)
-                                    Text(worker.triggerDescription)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                        .lineLimit(2)
-                                }
-
-                                Spacer()
-
-                                Toggle("", isOn: Binding(
-                                    get: { worker.isEnabled },
-                                    set: { newValue in
-                                        worker.isEnabled = newValue
-                                        orchestrator.refreshTools()
-                                    }
-                                ))
-                                .labelsHidden()
-                            }
-                            .padding(.vertical, 2)
+                // Built-in workers section
+                if !builtInWorkers.isEmpty {
+                    Section {
+                        ForEach(builtInWorkers) { worker in
+                            workerRow(worker)
                         }
-                        .buttonStyle(.plain)
-                        .contextMenu {
-                            Button {
-                                editingWorker = worker
-                            } label: {
-                                Label("Edit", systemImage: "pencil")
-                            }
-                            Button(role: .destructive) {
-                                modelContext.delete(worker)
-                                orchestrator.refreshTools()
-                            } label: {
-                                Label("Delete", systemImage: "trash")
-                            }
-                        }
+                    } header: {
+                        Text("Built-In")
+                    } footer: {
+                        Text("Powered by the on-device model. Tap to customize.")
                     }
-                    .onDelete { offsets in
-                        for index in offsets {
-                            modelContext.delete(workers[index])
+                }
+
+                // Custom workers section
+                if !customWorkers.isEmpty {
+                    Section {
+                        ForEach(customWorkers) { worker in
+                            workerRow(worker)
                         }
-                        orchestrator.refreshTools()
+                        .onDelete { offsets in
+                            for index in offsets {
+                                modelContext.delete(customWorkers[index])
+                            }
+                            orchestrator.refreshTools()
+                        }
+                    } header: {
+                        Text("Custom")
                     }
-                } footer: {
+                }
+
+                // Footer info
+                Section {} footer: {
                     Text("Each enabled worker slightly reduces the available context window. Changes apply to new conversations or after a context refresh.")
                 }
+            }
+        }
+    }
+
+    private func workerRow(_ worker: WorkerProfile) -> some View {
+        Button {
+            editingWorker = worker
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: worker.icon)
+                    .font(.title2)
+                    .foregroundStyle(worker.isEnabled ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
+                    .frame(width: 32)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 6) {
+                        Text(worker.name)
+                            .font(.body.weight(.medium))
+                            .foregroundStyle(.primary)
+                        if worker.isBuiltIn {
+                            Text("BUILT-IN")
+                                .font(.system(size: 8, weight: .bold))
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 2)
+                                .background(.fill.tertiary, in: .capsule)
+                        }
+                    }
+                    Text(worker.triggerDescription)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+
+                Spacer()
+
+                Toggle("", isOn: Binding(
+                    get: { worker.isEnabled },
+                    set: { newValue in
+                        worker.isEnabled = newValue
+                        orchestrator.refreshTools()
+                    }
+                ))
+                .labelsHidden()
+            }
+            .padding(.vertical, 2)
+        }
+        .buttonStyle(.plain)
+        .contextMenu {
+            Button {
+                editingWorker = worker
+            } label: {
+                Label("Edit", systemImage: "pencil")
+            }
+            Divider()
+            Button(role: .destructive) {
+                modelContext.delete(worker)
+                orchestrator.refreshTools()
+            } label: {
+                Label("Delete", systemImage: "trash")
             }
         }
     }
@@ -168,10 +238,11 @@ struct WorkerEditorView: View {
 
     // Curated SF Symbols relevant to AI worker personas
     private let iconOptions = [
-        "person.crop.circle", "brain.head.profile", "hammer", "book",
-        "terminal", "paintbrush", "chart.bar", "globe",
-        "doc.text", "graduationcap", "wrench.and.screwdriver",
-        "lightbulb", "magnifyingglass", "pencil.and.ruler"
+        "person.crop.circle", "brain.head.profile", "terminal", "globe",
+        "lightbulb", "doc.text", "doc.text.magnifyingglass",
+        "text.badge.checkmark", "pencil.and.outline", "pencil.and.ruler",
+        "hammer", "wrench.and.screwdriver", "paintbrush", "chart.bar",
+        "book", "graduationcap", "magnifyingglass", "theatermasks"
     ]
 
     private var canSave: Bool {
@@ -249,6 +320,9 @@ struct WorkerEditorView: View {
                 if isEditing, let worker = existing {
                     Section {
                         LabeledContent("Created", value: worker.createdAt.formatted(date: .abbreviated, time: .shortened))
+                        if worker.isBuiltIn {
+                            LabeledContent("Type", value: "Built-In")
+                        }
                     } header: {
                         Text("Info")
                     }

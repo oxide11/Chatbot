@@ -7,38 +7,31 @@
 //
 
 import Foundation
+import Synchronization
 import SwiftData
 import FoundationModels
 
 /// Thread-safe tracker for worker invocations during a single response turn.
 /// Used by `DynamicWorkerTool.call()` (which may run off the MainActor) to
 /// record which workers were invoked, so the UI can display it afterward.
-final class WorkerInvocationTracker: Sendable {
-    private let lock = NSLock()
-    private let _invocations = UnsafeMutableBufferPointer<[String]>.allocate(capacity: 1)
-
-    init() {
-        _invocations.initialize(repeating: [])
-    }
-
-    deinit {
-        _invocations.deallocate()
-    }
+///
+/// Explicitly `nonisolated` so it can be called from any actor context;
+/// internal synchronization is handled by `Mutex`.
+nonisolated final class WorkerInvocationTracker: Sendable {
+    private let _invocations = Mutex<[String]>([])
 
     /// Record a worker invocation (called from any thread).
-    func record(_ workerName: String) {
-        lock.lock()
-        _invocations[0].append(workerName)
-        lock.unlock()
+    nonisolated func record(_ workerName: String) {
+        _invocations.withLock { $0.append(workerName) }
     }
 
     /// Retrieve and clear all recorded invocations.
-    func drain() -> [String] {
-        lock.lock()
-        let result = _invocations[0]
-        _invocations[0] = []
-        lock.unlock()
-        return result
+    nonisolated func drain() -> [String] {
+        _invocations.withLock { invocations in
+            let result = invocations
+            invocations = []
+            return result
+        }
     }
 }
 
@@ -60,8 +53,11 @@ final class AgentOrchestrator {
     // MARK: - Configuration
 
     /// Provide the SwiftData model context. Call once from the view layer.
+    /// Seeds built-in workers on first launch and loads enabled tools.
     func configure(with modelContext: ModelContext) {
         self.modelContext = modelContext
+        BuiltInWorkers.seedIfNeeded(in: modelContext)
+        BuiltInWorkers.addMissingPresets(in: modelContext)
         refreshTools()
     }
 
