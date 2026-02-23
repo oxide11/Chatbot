@@ -3,7 +3,7 @@ import FoundationModels
 
 // MARK: - Message Model
 
-struct Message: Identifiable, Codable {
+struct Message: Identifiable, Codable, Sendable {
     let id: UUID
     let role: Role
     let content: String
@@ -23,7 +23,7 @@ struct Message: Identifiable, Codable {
 
 // MARK: - Persisted Conversation Data
 
-struct ConversationData: Identifiable, Codable {
+struct ConversationData: Identifiable, Codable, Sendable {
     let id: UUID
     var title: String
     let createdAt: Date
@@ -33,7 +33,7 @@ struct ConversationData: Identifiable, Codable {
 
 // MARK: - Memory Entry (RAG)
 
-struct MemoryEntry: Identifiable, Codable {
+struct MemoryEntry: Identifiable, Codable, Hashable, Sendable {
     let id: UUID
     let content: String
     let keywords: [String]
@@ -165,27 +165,29 @@ final class MemoryStore {
             let lines = response.content.components(separatedBy: "\n").filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
 
             for line in lines {
-                if line.trimmingCharacters(in: .whitespaces).uppercased() == "NONE" { continue }
+                let trimmedLine = line.trimmingCharacters(in: .whitespaces)
+                if trimmedLine.uppercased() == "NONE" || trimmedLine.isEmpty { continue }
 
                 // Parse "[keyword1, keyword2] fact text"
-                if let bracketEnd = line.firstIndex(of: "]") {
-                    let bracketStart = line.index(after: line.startIndex)
-                    let keywordsStr = String(line[bracketStart..<bracketEnd])
+                if trimmedLine.hasPrefix("["),
+                   let bracketEnd = trimmedLine.firstIndex(of: "]") {
+                    let keywordsStart = trimmedLine.index(after: trimmedLine.startIndex)
+                    let keywordsStr = String(trimmedLine[keywordsStart..<bracketEnd])
                     let keywords = keywordsStr.components(separatedBy: ",").map {
                         $0.trimmingCharacters(in: .whitespaces).lowercased()
                     }.filter { !$0.isEmpty }
 
-                    let factStart = line.index(after: bracketEnd)
-                    let fact = String(line[factStart...]).trimmingCharacters(in: .whitespaces)
+                    let factStart = trimmedLine.index(after: bracketEnd)
+                    let fact = String(trimmedLine[factStart...]).trimmingCharacters(in: .whitespaces)
 
                     if !fact.isEmpty && !keywords.isEmpty {
                         addMemory(fact, keywords: keywords, source: conversationTitle)
                     }
                 } else {
                     // No bracket format — store the whole line with auto-extracted keywords
-                    let words = tokenize(line)
-                    if !line.isEmpty {
-                        addMemory(line, keywords: Array(words.prefix(5)), source: conversationTitle)
+                    let keywords = SharedDataManager.extractKeywords(from: trimmedLine, limit: 5)
+                    if !keywords.isEmpty {
+                        addMemory(trimmedLine, keywords: keywords, source: conversationTitle)
                     }
                 }
             }
@@ -194,24 +196,11 @@ final class MemoryStore {
         }
     }
 
-    // MARK: - Tokenization (internal for reuse by AddMemoryView)
+    // MARK: - Tokenization
 
+    /// Delegates to SharedDataManager's canonical tokenizer.
     func tokenize(_ text: String) -> Set<String> {
-        let stopWords: Set<String> = [
-            "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
-            "have", "has", "had", "do", "does", "did", "will", "would", "could",
-            "should", "may", "might", "shall", "can", "to", "of", "in", "for",
-            "on", "with", "at", "by", "from", "as", "into", "about", "that",
-            "this", "it", "its", "and", "or", "but", "not", "no", "so", "if",
-            "i", "me", "my", "you", "your", "we", "our", "they", "them", "their",
-            "what", "which", "who", "how", "when", "where", "why"
-        ]
-
-        let words = text.lowercased()
-            .components(separatedBy: CharacterSet.alphanumerics.inverted)
-            .filter { $0.count > 2 && !stopWords.contains($0) }
-
-        return Set(words)
+        SharedDataManager.tokenize(text)
     }
 
     private func saveToDisk() {
@@ -242,11 +231,15 @@ final class ChatViewModel: Identifiable {
     /// Approximate context usage as a fraction (0.0 – 1.0)
     private(set) var contextUsage: Double = 0
 
+    /// RAG context that was used for the most recent response
+    private(set) var lastRAGContext: RAGContext?
+
     private var session: LanguageModelSession
     private var turnCount = 0
     private var conversationSummary: String?
     private var hasAutoTitle = false
     private var onChanged: (() -> Void)?
+    var currentStreamingTask: Task<Void, Never>?
 
     /// Reference to the shared memory store for RAG retrieval
     var memoryStore: MemoryStore?
@@ -370,11 +363,17 @@ final class ChatViewModel: Identifiable {
             }
 
             // Build prompt with RAG-retrieved memories
-            let enrichedPrompt = buildEnrichedPrompt(for: text)
+            let (enrichedPrompt, ragContext) = buildEnrichedPrompt(for: text)
+            lastRAGContext = ragContext
 
             try await streamResponse(to: enrichedPrompt)
             turnCount += 1
             triggerHaptic()
+        } catch is CancellationError {
+            // User stopped generation — save partial text if available
+            if !streamingText.isEmpty {
+                messages.append(Message(role: .assistant, content: streamingText))
+            }
         } catch let error as LanguageModelSession.GenerationError {
             await handleGenerationError(error, originalPrompt: text)
         } catch {
@@ -382,6 +381,12 @@ final class ChatViewModel: Identifiable {
         }
 
         streamingText = ""
+    }
+
+    /// Stop the current generation, preserving any partial response.
+    func stopGenerating() {
+        currentStreamingTask?.cancel()
+        currentStreamingTask = nil
     }
 
     // MARK: - Chat Management
@@ -417,6 +422,45 @@ final class ChatViewModel: Identifiable {
         notifyChanged()
     }
 
+    /// Regenerate the last assistant response by re-sending the previous user message.
+    func regenerateLastResponse() async {
+        // Find the last assistant message and the user message before it
+        guard let lastAssistantIndex = messages.lastIndex(where: { $0.role == .assistant }) else { return }
+        let precedingMessages = messages[..<lastAssistantIndex]
+        guard let lastUserMessage = precedingMessages.last(where: { $0.role == .user }) else { return }
+
+        let userText = lastUserMessage.content
+
+        // Remove the last assistant message
+        messages.remove(at: lastAssistantIndex)
+
+        isResponding = true
+        isWaitingForFirstToken = true
+        streamingText = ""
+
+        defer {
+            isResponding = false
+            isWaitingForFirstToken = false
+            updateContextEstimate()
+            notifyChanged()
+        }
+
+        do {
+            let (enrichedPrompt, ragContext) = buildEnrichedPrompt(for: userText)
+            lastRAGContext = ragContext
+            try await streamResponse(to: enrichedPrompt)
+            triggerHaptic()
+        } catch is CancellationError {
+            if !streamingText.isEmpty {
+                messages.append(Message(role: .assistant, content: streamingText))
+            }
+        } catch {
+            messages.append(Message(role: .system, content: "Regeneration failed: \(error.localizedDescription)"))
+        }
+
+        streamingText = ""
+    }
+
     /// Export conversation as plain text
     func exportAsText() -> String {
         var lines: [String] = []
@@ -442,16 +486,21 @@ final class ChatViewModel: Identifiable {
 
     // MARK: - RAG Integration
 
-    /// Build an enriched prompt by prepending relevant memories and document chunks
-    private func buildEnrichedPrompt(for userText: String) -> String {
+    /// Build an enriched prompt by prepending relevant memories and document chunks.
+    /// Returns the prompt string and a RAGContext describing what was injected.
+    private func buildEnrichedPrompt(for userText: String) -> (prompt: String, context: RAGContext) {
         let maxContextChars = ragSettings.contextBudgetCharacters
         var contextBlocks: [String] = []
         var usedChars = 0
+        var memoryCount = 0
+        var chunkCount = 0
+        var docNames: Set<String> = []
 
         // Retrieve memories
         if ragSettings.memoryRetrievalEnabled, let store = memoryStore {
             let relevantMemories = store.retrieve(for: userText, limit: ragSettings.maxMemoryResults)
             if !relevantMemories.isEmpty {
+                memoryCount = relevantMemories.count
                 let block = relevantMemories.map { "- \($0.content)" }.joined(separator: "\n")
                 contextBlocks.append("Remembered context from previous conversations:\n\(block)")
                 usedChars += block.count
@@ -470,6 +519,11 @@ final class ChatViewModel: Identifiable {
                     if chunkChars + text.count > budget { break }
                     chunkTexts.append(text)
                     chunkChars += text.count
+                    chunkCount += 1
+                    // Resolve KB name
+                    if let kb = kbStore.knowledgeBases.first(where: { $0.id == chunk.knowledgeBaseID }) {
+                        docNames.insert(kb.name)
+                    }
                 }
                 if !chunkTexts.isEmpty {
                     contextBlocks.append("Relevant knowledge base excerpts:\n\(chunkTexts.joined(separator: "\n---\n"))")
@@ -477,13 +531,22 @@ final class ChatViewModel: Identifiable {
             }
         }
 
-        guard !contextBlocks.isEmpty else { return userText }
+        let ragContext = RAGContext(
+            memoryCount: memoryCount,
+            documentChunkCount: chunkCount,
+            documentNames: docNames.sorted()
+        )
 
-        return """
+        guard !contextBlocks.isEmpty else {
+            return (userText, ragContext)
+        }
+
+        let enriched = """
         [\(contextBlocks.joined(separator: "\n\n"))]
 
         \(userText)
         """
+        return (enriched, ragContext)
     }
 
     // MARK: - Private
@@ -492,6 +555,8 @@ final class ChatViewModel: Identifiable {
         let stream = session.streamResponse(to: prompt)
         var fullText = ""
         for try await partial in stream {
+            // Support cancellation — keep partial text
+            try Task.checkCancellation()
             if isWaitingForFirstToken {
                 isWaitingForFirstToken = false
             }
@@ -576,8 +641,11 @@ final class ChatViewModel: Identifiable {
 
     private func triggerHaptic() {
         #if os(iOS)
-        let generator = UINotificationFeedbackGenerator()
-        generator.notificationOccurred(.success)
+        Task { @MainActor in
+            let generator = UINotificationFeedbackGenerator()
+            generator.prepare()
+            generator.notificationOccurred(.success)
+        }
         #endif
     }
 
@@ -590,7 +658,28 @@ final class ChatViewModel: Identifiable {
 
 // MARK: - RAG Settings
 
-struct RAGSettings: Codable {
+/// Describes what RAG context was injected for a given response.
+struct RAGContext {
+    let memoryCount: Int
+    let documentChunkCount: Int
+    let documentNames: [String]
+
+    var isEmpty: Bool { memoryCount == 0 && documentChunkCount == 0 }
+
+    var summary: String {
+        var parts: [String] = []
+        if memoryCount > 0 {
+            parts.append("\(memoryCount) memor\(memoryCount == 1 ? "y" : "ies")")
+        }
+        if documentChunkCount > 0 {
+            let names = documentNames.joined(separator: ", ")
+            parts.append("\(documentChunkCount) chunk\(documentChunkCount == 1 ? "" : "s") from \(names)")
+        }
+        return parts.joined(separator: " · ")
+    }
+}
+
+struct RAGSettings: Codable, Sendable {
     var memoryRetrievalEnabled: Bool = true
     var knowledgeBaseRetrievalEnabled: Bool = true
     var maxMemoryResults: Int = 3
@@ -620,14 +709,15 @@ final class ConversationStore {
         loadDefaultSystemPrompt()
         loadFromDisk()
         if conversations.isEmpty {
-            let initial = ChatViewModel()
-            conversations.append(initial)
-        }
-        for conversation in conversations {
-            conversation.memoryStore = memoryStore
-            conversation.knowledgeBaseStore = knowledgeBaseStore
-            conversation.ragSettings = ragSettings
-            conversation.onChange { [weak self] in self?.saveToDisk() }
+            // createConversation handles memoryStore, knowledgeBaseStore, ragSettings, defaultSystemPrompt, and onChange
+            _ = createConversation()
+        } else {
+            for conversation in conversations {
+                conversation.memoryStore = memoryStore
+                conversation.knowledgeBaseStore = knowledgeBaseStore
+                conversation.ragSettings = ragSettings
+                conversation.onChange { [weak self] in self?.saveToDisk() }
+            }
         }
     }
 
@@ -637,6 +727,10 @@ final class ConversationStore {
         conversation.memoryStore = memoryStore
         conversation.knowledgeBaseStore = knowledgeBaseStore
         conversation.ragSettings = ragSettings
+        // Apply the default system prompt if user has customized it
+        if defaultSystemPrompt != ChatViewModel.defaultInstructions {
+            conversation.updateSystemPrompt(defaultSystemPrompt)
+        }
         conversation.onChange { [weak self] in self?.saveToDisk() }
         conversations.insert(conversation, at: 0)
         selectedConversationID = conversation.id
@@ -661,18 +755,19 @@ final class ConversationStore {
         saveToDisk()
     }
 
+    func renameConversation(id: UUID, to newTitle: String) {
+        guard let conversation = conversations.first(where: { $0.id == id }) else { return }
+        let trimmed = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        conversation.title = trimmed
+        saveToDisk()
+    }
+
     func deleteAllConversations() {
         conversations.removeAll()
         selectedConversationID = nil
-        let fresh = ChatViewModel()
-        fresh.checkAvailability()
-        fresh.memoryStore = memoryStore
-        fresh.knowledgeBaseStore = knowledgeBaseStore
-        fresh.ragSettings = ragSettings
-        fresh.onChange { [weak self] in self?.saveToDisk() }
-        conversations.append(fresh)
+        let fresh = createConversation()
         selectedConversationID = fresh.id
-        saveToDisk()
     }
 
     func selectedConversation() -> ChatViewModel? {

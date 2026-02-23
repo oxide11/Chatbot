@@ -10,10 +10,6 @@ import AppKit
 
 // MARK: - Custom Colors
 
-extension ShapeStyle where Self == Color {
-    static var userBubble: Color { Color("UserBubble", bundle: nil) }
-}
-
 extension Color {
     static var userBubbleColor: Color {
         #if os(iOS) || os(tvOS) || os(visionOS)
@@ -48,6 +44,9 @@ struct ContentView: View {
     var store: ConversationStore
     @State private var searchText = ""
     @State private var showingSettings = false
+    @State private var renamingConversationID: UUID?
+    @State private var renameDraft = ""
+    @State private var deletingConversationID: UUID?
 
     private var groupedConversations: [(String, [ChatViewModel])] {
         let filtered = searchText.isEmpty
@@ -130,6 +129,13 @@ struct ContentView: View {
                             }
                         }
                         .contextMenu {
+                            Button {
+                                renameDraft = conversation.title
+                                renamingConversationID = conversation.id
+                            } label: {
+                                Label("Rename", systemImage: "pencil")
+                            }
+                            Divider()
                             Button(role: .destructive) {
                                 store.deleteConversation(id: conversation.id)
                             } label: {
@@ -152,41 +158,66 @@ struct ContentView: View {
         .searchToolbarBehavior(.minimize)
         #endif
         .navigationTitle("Chats")
-        .toolbar {
-            #if os(macOS)
-            ToolbarItem(placement: .navigation) {
-                settingsButton
-            }
-            ToolbarItem(placement: .primaryAction) {
-                newChatButton
-            }
-            #else
-            ToolbarItem(placement: .topBarLeading) {
-                settingsButton
-            }
-            ToolbarItem(placement: .topBarTrailing) {
-                newChatButton
-            }
-            #endif
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            sidebarBottomBar
         }
         .sheet(isPresented: $showingSettings) {
             SettingsView(store: store)
         }
-    }
-
-    private var settingsButton: some View {
-        Button {
-            showingSettings = true
-        } label: {
-            Label("Settings", systemImage: "gearshape")
+        .alert("Rename Chat", isPresented: Binding(
+            get: { renamingConversationID != nil },
+            set: { if !$0 { renamingConversationID = nil } }
+        )) {
+            TextField("Chat name", text: $renameDraft)
+            Button("Rename") {
+                if let id = renamingConversationID {
+                    store.renameConversation(id: id, to: renameDraft)
+                }
+                renamingConversationID = nil
+            }
+            Button("Cancel", role: .cancel) {
+                renamingConversationID = nil
+            }
+        } message: {
+            Text("Enter a new name for this conversation.")
         }
     }
 
-    private var newChatButton: some View {
-        Button {
-            _ = store.createConversation()
-        } label: {
-            Label("New Chat", systemImage: "plus")
+    private var sidebarBottomBar: some View {
+        VStack(spacing: 0) {
+            Divider()
+            HStack(spacing: 12) {
+                Button {
+                    showingSettings = true
+                } label: {
+                    Image(systemName: "gearshape")
+                        .font(.title3)
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Settings")
+
+                Spacer()
+
+                Button {
+                    _ = store.createConversation()
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "plus")
+                            .font(.body.weight(.semibold))
+                        Text("New Chat")
+                            .font(.body.weight(.medium))
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 7)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.regular)
+                .help("New Chat")
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(.bar)
         }
     }
 
@@ -213,6 +244,8 @@ struct ChatDetailView: View {
     @State private var inputText = ""
     @State private var showingSystemPrompt = false
     @State private var systemPromptDraft = ""
+    @State private var showScrollToBottom = false
+    @State private var copiedMessageID: UUID?
     @FocusState private var isInputFocused: Bool
 
     var body: some View {
@@ -227,17 +260,19 @@ struct ChatDetailView: View {
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
         #endif
+        #if os(macOS)
         .toolbar {
-            #if os(macOS)
-            ToolbarItem(placement: .primaryAction) {
+            ToolbarItem(placement: .automatic) {
                 chatMenu
             }
-            #else
+        }
+        #else
+        .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 chatMenu
             }
-            #endif
         }
+        #endif
         .sheet(isPresented: $showingSystemPrompt) {
             SystemPromptEditor(
                 draft: $systemPromptDraft,
@@ -252,6 +287,7 @@ struct ChatDetailView: View {
         }
         .onAppear {
             viewModel.checkAvailability()
+            isInputFocused = true
         }
     }
 
@@ -361,22 +397,96 @@ struct ChatDetailView: View {
                             .padding(.vertical, 4)
                         }
 
-                        ForEach(viewModel.messages) { message in
-                            MessageBubble(message: message)
-                                .id(message.id)
-                                .contextMenu {
-                                    Button {
-                                        copyToClipboard(message.content)
-                                    } label: {
-                                        Label("Copy", systemImage: "doc.on.doc")
+                        ForEach(Array(viewModel.messages.enumerated()), id: \.element.id) { index, message in
+                            let isLastAssistant = message.role == .assistant
+                                && index == viewModel.messages.lastIndex(where: { $0.role == .assistant })
+
+                            VStack(spacing: 0) {
+                                // Date separator between messages on different days
+                                if shouldShowDateSeparator(at: index) {
+                                    Text(message.timestamp, format: .dateTime.month(.wide).day().year())
+                                        .font(.caption2)
+                                        .foregroundStyle(.tertiary)
+                                        .padding(.vertical, 8)
+                                }
+
+                                VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 4) {
+                                    MessageBubble(message: message)
+
+                                    // Timestamp
+                                    Text(message.timestamp, format: .dateTime.hour().minute())
+                                        .font(.system(size: 10))
+                                        .foregroundStyle(.quaternary)
+                                        .padding(.horizontal, 4)
+
+                                    // Action row for last assistant message
+                                    if isLastAssistant, !viewModel.isResponding {
+                                        HStack(spacing: 12) {
+                                            // Copy button
+                                            Button {
+                                                copyToClipboard(message.content)
+                                                copiedMessageID = message.id
+                                                DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                                                    if copiedMessageID == message.id {
+                                                        copiedMessageID = nil
+                                                    }
+                                                }
+                                            } label: {
+                                                Label(
+                                                    copiedMessageID == message.id ? "Copied" : "Copy",
+                                                    systemImage: copiedMessageID == message.id ? "checkmark" : "doc.on.doc"
+                                                )
+                                                .font(.caption2)
+                                                .foregroundStyle(copiedMessageID == message.id ? .green : .secondary)
+                                            }
+                                            .buttonStyle(.plain)
+
+                                            // Regenerate button
+                                            Button {
+                                                let task = Task { await viewModel.regenerateLastResponse() }
+                                                viewModel.currentStreamingTask = task
+                                            } label: {
+                                                Label("Regenerate", systemImage: "arrow.trianglehead.2.clockwise")
+                                                    .font(.caption2)
+                                                    .foregroundStyle(.secondary)
+                                            }
+                                            .buttonStyle(.plain)
+                                        }
+                                        .padding(.top, 2)
                                     }
 
-                                    if message.role != .system {
-                                        ShareLink(item: message.content) {
-                                            Label("Share", systemImage: "square.and.arrow.up")
-                                        }
+                                    // RAG indicator
+                                    if isLastAssistant,
+                                       let rag = viewModel.lastRAGContext, !rag.isEmpty {
+                                        RAGIndicatorView(context: rag)
                                     }
                                 }
+                            }
+                            .id(message.id)
+                            .contextMenu {
+                                Button {
+                                    copyToClipboard(message.content)
+                                } label: {
+                                    Label("Copy", systemImage: "doc.on.doc")
+                                }
+
+                                if message.role != .system {
+                                    ShareLink(item: message.content) {
+                                        Label("Share", systemImage: "square.and.arrow.up")
+                                    }
+                                }
+
+                                if message.role == .assistant {
+                                    Divider()
+                                    Button {
+                                        let task = Task { await viewModel.regenerateLastResponse() }
+                                        viewModel.currentStreamingTask = task
+                                    } label: {
+                                        Label("Regenerate", systemImage: "arrow.trianglehead.2.clockwise")
+                                    }
+                                    .disabled(viewModel.isResponding)
+                                }
+                            }
                         }
 
                         if viewModel.isWaitingForFirstToken {
@@ -388,22 +498,66 @@ struct ChatDetailView: View {
                             MessageBubble(message: Message(role: .assistant, content: viewModel.streamingText))
                                 .id("streaming")
                         }
+
+                        // Invisible anchor at the very bottom
+                        Color.clear
+                            .frame(height: 1)
+                            .id("bottom")
                     }
                     .padding()
                 }
             }
             .onChange(of: viewModel.messages.count) {
+                showScrollToBottom = false
                 scrollToBottom(proxy: proxy)
             }
             .onChange(of: viewModel.streamingText) {
-                scrollToBottom(proxy: proxy)
-            }
-            .onChange(of: viewModel.isWaitingForFirstToken) {
-                if viewModel.isWaitingForFirstToken {
+                if !showScrollToBottom {
                     scrollToBottom(proxy: proxy)
                 }
             }
+            .onChange(of: viewModel.isWaitingForFirstToken) {
+                if viewModel.isWaitingForFirstToken {
+                    showScrollToBottom = false
+                    scrollToBottom(proxy: proxy)
+                }
+            }
+            .overlay(alignment: .bottom) {
+                if showScrollToBottom {
+                    Button {
+                        showScrollToBottom = false
+                        scrollToBottom(proxy: proxy)
+                    } label: {
+                        Image(systemName: "arrow.down.circle.fill")
+                            .font(.title2)
+                            .foregroundStyle(.secondary)
+                            .background(.ultraThickMaterial, in: .circle)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.bottom, 8)
+                    .transition(.opacity.combined(with: .scale))
+                }
+            }
+            .onScrollGeometryChange(for: Bool.self) { geo in
+                // true when user has scrolled up significantly
+                let distanceFromBottom = geo.contentSize.height - geo.contentOffset.y - geo.containerSize.height
+                return distanceFromBottom > 100
+            } action: { _, isScrolledUp in
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    showScrollToBottom = isScrolledUp
+                }
+            }
         }
+    }
+
+    private func shouldShowDateSeparator(at index: Int) -> Bool {
+        guard index > 0 else {
+            // Always show for the first message
+            return true
+        }
+        let current = viewModel.messages[index].timestamp
+        let previous = viewModel.messages[index - 1].timestamp
+        return !Calendar.current.isDate(current, inSameDayAs: previous)
     }
 
     private func scrollToBottom(proxy: ScrollViewProxy) {
@@ -458,18 +612,42 @@ struct ChatDetailView: View {
                     .focused($isInputFocused)
                     .disabled(viewModel.isResponding)
                     .onSubmit { sendMessage() }
+                    #if os(macOS)
+                    .onKeyPress(.return, phases: .down) { event in
+                        if event.modifiers.contains(.command) {
+                            sendMessage()
+                            return .handled
+                        }
+                        return .ignored
+                    }
+                    #endif
                     .padding(.horizontal, 12)
                     .padding(.vertical, 8)
 
-                Button {
-                    sendMessage()
-                } label: {
-                    Image(systemName: viewModel.isResponding ? "ellipsis.circle" : "arrow.up.circle.fill")
-                        .font(.title2)
-                        .symbolEffect(.pulse, isActive: viewModel.isResponding)
+                if viewModel.isResponding {
+                    Button {
+                        viewModel.stopGenerating()
+                    } label: {
+                        Image(systemName: "stop.circle.fill")
+                            .font(.title2)
+                            .symbolEffect(.pulse)
+                    }
+                    .glassEffect(.regular.tint(.red).interactive(), in: .circle)
+                    .help("Stop Generating")
+                } else {
+                    Button {
+                        sendMessage()
+                    } label: {
+                        Image(systemName: "arrow.up.circle.fill")
+                            .font(.title2)
+                    }
+                    .glassEffect(.regular.tint(.accentColor).interactive(), in: .circle)
+                    .disabled(inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    #if os(macOS)
+                    .keyboardShortcut(.return, modifiers: .command)
+                    #endif
+                    .help("Send (⌘Return)")
                 }
-                .glassEffect(.regular.tint(.accentColor).interactive(), in: .circle)
-                .disabled(inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || viewModel.isResponding)
             }
             .padding(.horizontal)
             .padding(.vertical, 8)
@@ -483,9 +661,10 @@ struct ChatDetailView: View {
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !viewModel.isResponding else { return }
         inputText = ""
-        Task {
+        let task = Task {
             await viewModel.send(text)
         }
+        viewModel.currentStreamingTask = task
     }
 
     private func copyToClipboard(_ text: String) {
@@ -583,11 +762,39 @@ struct MessageBubble: View {
     }
 
     private var systemBubble: some View {
-        Text(message.content)
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 4)
+        HStack(spacing: 6) {
+            Image(systemName: message.content.contains("Context refreshed")
+                  ? "arrow.triangle.2.circlepath"
+                  : "info.circle")
+                .font(.caption2)
+            Text(message.content)
+                .font(.caption)
+        }
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(.fill.quaternary, in: .capsule)
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 2)
+    }
+}
+
+// MARK: - RAG Indicator
+
+struct RAGIndicatorView: View {
+    let context: RAGContext
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "sparkles")
+                .font(.system(size: 9))
+            Text(context.summary)
+                .font(.system(size: 10))
+        }
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .background(.fill.quaternary, in: .capsule)
     }
 }
 
@@ -632,107 +839,125 @@ struct SystemPromptEditor: View {
 struct SettingsView: View {
     var store: ConversationStore
     @Environment(\.dismiss) private var dismiss
+    @State private var showingDeleteAllConfirmation = false
     @State private var showingMemories = false
     @State private var showingKnowledgeBases = false
-    @State private var showingDeleteAllConfirmation = false
-    @State private var showingAbout = false
     @State private var defaultPromptDraft = ""
 
     var body: some View {
         NavigationStack {
-            List {
-                // MARK: Intelligence Section
+            Form {
+                // MARK: Intelligence
                 Section {
                     Button {
                         showingMemories = true
                     } label: {
-                        Label {
-                            HStack {
-                                Text("Memories")
-                                Spacer()
-                                Text("\(store.memoryStore.memories.count)")
-                                    .foregroundStyle(.secondary)
-                            }
-                        } icon: {
-                            Image(systemName: "brain")
+                        HStack {
+                            Label("Memories", systemImage: "brain")
+                            Spacer()
+                            Text("\(store.memoryStore.memories.count)")
+                                .foregroundStyle(.secondary)
+                            Image(systemName: "chevron.right")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.tertiary)
                         }
+                        .contentShape(Rectangle())
                     }
+                    .buttonStyle(.plain)
 
                     Button {
                         showingKnowledgeBases = true
                     } label: {
-                        Label {
-                            HStack {
-                                Text("Knowledge Bases")
-                                Spacer()
-                                Text("\(store.knowledgeBaseStore.knowledgeBases.count)")
-                                    .foregroundStyle(.secondary)
-                            }
-                        } icon: {
-                            Image(systemName: "books.vertical")
+                        HStack {
+                            Label("Knowledge Bases", systemImage: "books.vertical")
+                            Spacer()
+                            Text("\(store.knowledgeBaseStore.knowledgeBases.count)")
+                                .foregroundStyle(.secondary)
+                            Image(systemName: "chevron.right")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.tertiary)
                         }
+                        .contentShape(Rectangle())
                     }
+                    .buttonStyle(.plain)
                 } header: {
                     Text("Intelligence")
                 } footer: {
-                    Text("Memories are facts extracted from conversations. Knowledge bases are imported documents used for reference.")
+                    Text("Memories are facts extracted from conversations. Knowledge bases are imported documents.")
                 }
 
-                // MARK: Retrieval (RAG) Section
+                // MARK: Retrieval
                 Section {
                     Toggle("Memory Retrieval", isOn: Binding(
                         get: { store.ragSettings.memoryRetrievalEnabled },
-                        set: { store.ragSettings.memoryRetrievalEnabled = $0; store.applyRAGSettings() }
+                        set: { newValue in
+                            store.ragSettings.memoryRetrievalEnabled = newValue
+                            store.applyRAGSettings()
+                        }
                     ))
 
-                    Toggle("Knowledge Base Retrieval", isOn: Binding(
+                    Toggle("Document Retrieval", isOn: Binding(
                         get: { store.ragSettings.knowledgeBaseRetrievalEnabled },
-                        set: { store.ragSettings.knowledgeBaseRetrievalEnabled = $0; store.applyRAGSettings() }
+                        set: { newValue in
+                            store.ragSettings.knowledgeBaseRetrievalEnabled = newValue
+                            store.applyRAGSettings()
+                        }
                     ))
 
                     Toggle("Auto-Extract Memories", isOn: Binding(
                         get: { store.ragSettings.autoExtractMemories },
-                        set: { store.ragSettings.autoExtractMemories = $0; store.applyRAGSettings() }
+                        set: { newValue in
+                            store.ragSettings.autoExtractMemories = newValue
+                            store.applyRAGSettings()
+                        }
                     ))
 
                     Stepper(
-                        "Memory Results: \(store.ragSettings.maxMemoryResults)",
+                        "Memory results: \(store.ragSettings.maxMemoryResults)",
                         value: Binding(
                             get: { store.ragSettings.maxMemoryResults },
-                            set: { store.ragSettings.maxMemoryResults = $0; store.applyRAGSettings() }
+                            set: { newValue in
+                                store.ragSettings.maxMemoryResults = newValue
+                                store.applyRAGSettings()
+                            }
                         ),
                         in: 1...10
                     )
 
                     Stepper(
-                        "Document Chunks: \(store.ragSettings.maxDocumentChunks)",
+                        "Document chunks: \(store.ragSettings.maxDocumentChunks)",
                         value: Binding(
                             get: { store.ragSettings.maxDocumentChunks },
-                            set: { store.ragSettings.maxDocumentChunks = $0; store.applyRAGSettings() }
+                            set: { newValue in
+                                store.ragSettings.maxDocumentChunks = newValue
+                                store.applyRAGSettings()
+                            }
                         ),
                         in: 1...5
                     )
                 } header: {
                     Text("Retrieval")
                 } footer: {
-                    Text("Controls how memories and document excerpts are injected into conversations. More results use more of the limited context window.")
+                    Text("More results use more of the limited context window.")
                 }
 
-                // MARK: Default System Prompt Section
+                // MARK: System Prompt
                 Section {
-                    TextField("Default instructions for new chats", text: $defaultPromptDraft, axis: .vertical)
+                    TextField("e.g. You are a helpful coding assistant...", text: $defaultPromptDraft, axis: .vertical)
                         .lineLimit(2...6)
-                        .onChange(of: defaultPromptDraft) {
-                            store.defaultSystemPrompt = defaultPromptDraft
+                        .onChange(of: defaultPromptDraft) { oldValue, newValue in
+                            // Skip the initial set from onAppear
+                            guard oldValue != newValue, !oldValue.isEmpty || !newValue.isEmpty else { return }
+                            store.defaultSystemPrompt = newValue
                             store.applyDefaultSystemPrompt()
                         }
                 } header: {
                     Text("Default System Prompt")
                 } footer: {
-                    Text("Applied to new conversations. Individual chats can override this with their own system prompt.")
+                    Text("Applied to new conversations. Individual chats can override this.")
                 }
 
-                // MARK: Data Section
+                // MARK: Data
                 Section {
                     Button(role: .destructive) {
                         showingDeleteAllConfirmation = true
@@ -744,24 +969,21 @@ struct SettingsView: View {
                     Text("Data")
                 }
 
-                // MARK: About Section
+                // MARK: About
                 Section {
-                    Button {
-                        showingAbout = true
+                    NavigationLink {
+                        AboutView()
                     } label: {
-                        Label {
-                            HStack {
-                                Text("About \(AppInfo.name)")
-                                Spacer()
-                                Text("v\(AppInfo.version)")
-                                    .foregroundStyle(.secondary)
-                            }
-                        } icon: {
-                            Image(systemName: "info.circle")
+                        HStack {
+                            Label("About \(AppInfo.name)", systemImage: "info.circle")
+                            Spacer()
+                            Text("v\(AppInfo.version)")
+                                .foregroundStyle(.secondary)
                         }
                     }
                 }
             }
+            .formStyle(.grouped)
             .navigationTitle("Settings")
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
@@ -788,109 +1010,100 @@ struct SettingsView: View {
             .sheet(isPresented: $showingKnowledgeBases) {
                 KnowledgeBaseListView(knowledgeBaseStore: store.knowledgeBaseStore)
             }
-            .sheet(isPresented: $showingAbout) {
-                AboutView()
-            }
         }
+        #if os(macOS)
+        .frame(minWidth: 480, idealWidth: 520, minHeight: 540, idealHeight: 600)
+        #endif
     }
 }
 
 // MARK: - About View
 
 struct AboutView: View {
-    @Environment(\.dismiss) private var dismiss
-
     var body: some View {
-        NavigationStack {
-            List {
-                Section {
-                    VStack(spacing: 12) {
-                        Image(systemName: "brain.head.profile")
-                            .font(.system(size: 56))
-                            .foregroundStyle(.tint)
+        List {
+            Section {
+                VStack(spacing: 12) {
+                    Image(systemName: "brain.head.profile")
+                        .font(.system(size: 56))
+                        .foregroundStyle(.tint)
 
-                        Text(AppInfo.name)
-                            .font(.title.bold())
+                    Text(AppInfo.name)
+                        .font(.title.bold())
 
-                        Text("v\(AppInfo.version) (\(AppInfo.build))")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 12)
-                    .listRowBackground(Color.clear)
+                    Text("v\(AppInfo.version) (\(AppInfo.build))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
-
-                Section {
-                    Text("\(AppInfo.name) is an on-device AI assistant powered by Apple Intelligence. All conversations are processed entirely on your device — nothing is sent to external servers.")
-                        .font(.subheadline)
-                } header: {
-                    Text("What is \(AppInfo.name)?")
-                }
-
-                Section {
-                    FeatureRow(icon: "lock.shield", title: "Fully Private", detail: "All AI processing happens on-device using Apple Foundation Models")
-                    FeatureRow(icon: "brain", title: "Persistent Memory", detail: "Remembers key facts across conversations using RAG")
-                    FeatureRow(icon: "books.vertical", title: "Knowledge Bases", detail: "Import PDF and ePUB documents as reference material")
-                    FeatureRow(icon: "bubble.left.and.bubble.right", title: "Multi-Conversation", detail: "Manage multiple independent chat threads")
-                    FeatureRow(icon: "arrow.triangle.2.circlepath", title: "Smart Context", detail: "Automatic context rotation with summarization when nearing limits")
-                    FeatureRow(icon: "person.text.rectangle", title: "Custom Personas", detail: "Set per-conversation or default system prompts")
-                    FeatureRow(icon: "square.and.arrow.up", title: "Share Extension", detail: "Send text from any app directly into a chat or memory")
-                    FeatureRow(icon: "wand.and.stars", title: "Siri Integration", detail: "Ask questions or save memories via Siri Shortcuts")
-                } header: {
-                    Text("Key Features")
-                }
-
-                Section {
-                    ChangelogEntry(version: "1.0.0", date: "February 2026", changes: [
-                        "Initial release",
-                        "On-device AI chat with Apple Foundation Models",
-                        "Multi-conversation management with sidebar",
-                        "RAG memory system with keyword-based retrieval",
-                        "PDF and ePUB document ingestion for knowledge bases",
-                        "iOS 26 Liquid Glass design",
-                        "Share Extension and Siri Shortcuts",
-                        "Cross-platform support (iOS, iPadOS, macOS)"
-                    ])
-                } header: {
-                    Text("Changelog")
-                }
-
-                Section {
-                    HStack {
-                        Text("AI Processing")
-                        Spacer()
-                        Text("On-Device Only")
-                            .foregroundStyle(.secondary)
-                    }
-                    HStack {
-                        Text("Framework")
-                        Spacer()
-                        Text("Apple Foundation Models")
-                            .foregroundStyle(.secondary)
-                    }
-                    HStack {
-                        Text("Platform")
-                        Spacer()
-                        Text(platformName)
-                            .foregroundStyle(.secondary)
-                    }
-                } header: {
-                    Text("Technical")
-                } footer: {
-                    Text("No data ever leaves your device. \(AppInfo.name) requires Apple Intelligence to be enabled.")
-                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 12)
+                .listRowBackground(Color.clear)
             }
-            .navigationTitle("About")
-            #if os(iOS)
-            .navigationBarTitleDisplayMode(.inline)
-            #endif
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { dismiss() }
+
+            Section {
+                Text("\(AppInfo.name) is an on-device AI assistant powered by Apple Intelligence. All conversations are processed entirely on your device — nothing is sent to external servers.")
+                    .font(.subheadline)
+            } header: {
+                Text("What is \(AppInfo.name)?")
+            }
+
+            Section {
+                FeatureRow(icon: "lock.shield", title: "Fully Private", detail: "All AI processing happens on-device using Apple Foundation Models")
+                FeatureRow(icon: "brain", title: "Persistent Memory", detail: "Remembers key facts across conversations using RAG")
+                FeatureRow(icon: "books.vertical", title: "Knowledge Bases", detail: "Import PDF and ePUB documents as reference material")
+                FeatureRow(icon: "bubble.left.and.bubble.right", title: "Multi-Conversation", detail: "Manage multiple independent chat threads")
+                FeatureRow(icon: "arrow.triangle.2.circlepath", title: "Smart Context", detail: "Automatic context rotation with summarization when nearing limits")
+                FeatureRow(icon: "person.text.rectangle", title: "Custom Personas", detail: "Set per-conversation or default system prompts")
+                FeatureRow(icon: "square.and.arrow.up", title: "Share Extension", detail: "Send text from any app directly into a chat or memory")
+                FeatureRow(icon: "wand.and.stars", title: "Siri Integration", detail: "Ask questions or save memories via Siri Shortcuts")
+            } header: {
+                Text("Key Features")
+            }
+
+            Section {
+                ChangelogEntry(version: "1.0.0", date: "February 2026", changes: [
+                    "Initial release",
+                    "On-device AI chat with Apple Foundation Models",
+                    "Multi-conversation management with sidebar",
+                    "RAG memory system with keyword-based retrieval",
+                    "PDF and ePUB document ingestion for knowledge bases",
+                    "iOS 26 Liquid Glass design",
+                    "Share Extension and Siri Shortcuts",
+                    "Cross-platform support (iOS, iPadOS, macOS)"
+                ])
+            } header: {
+                Text("Changelog")
+            }
+
+            Section {
+                HStack {
+                    Text("AI Processing")
+                    Spacer()
+                    Text("On-Device Only")
+                        .foregroundStyle(.secondary)
                 }
+                HStack {
+                    Text("Framework")
+                    Spacer()
+                    Text("Apple Foundation Models")
+                        .foregroundStyle(.secondary)
+                }
+                HStack {
+                    Text("Platform")
+                    Spacer()
+                    Text(platformName)
+                        .foregroundStyle(.secondary)
+                }
+            } header: {
+                Text("Technical")
+            } footer: {
+                Text("No data ever leaves your device. \(AppInfo.name) requires Apple Intelligence to be enabled.")
             }
         }
+        .navigationTitle("About")
+        #if os(iOS)
+        .navigationBarTitleDisplayMode(.inline)
+        #endif
     }
 
     private var platformName: String {
@@ -973,58 +1186,57 @@ struct MemoryEditorView: View {
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 0) {
-                Form {
-                    Section {
-                        TextField("What would you like to remember?", text: $content, axis: .vertical)
-                            .lineLimit(3...10)
-                            .onChange(of: content) {
-                                updateAutoKeywords()
-                            }
-                    } header: {
-                        Text("Content")
-                    }
+            Form {
+                Section {
+                    TextField("What would you like to remember?", text: $content, axis: .vertical)
+                        .lineLimit(3...10)
+                        .onChange(of: content) {
+                            updateAutoKeywords()
+                        }
+                } header: {
+                    Text("Content")
+                }
 
-                    Section {
-                        #if os(iOS) || os(tvOS) || os(visionOS)
-                        TextField("swift, coding, preference", text: $keywordsText)
-                            .textInputAutocapitalization(.never)
-                        #else
-                        TextField("swift, coding, preference", text: $keywordsText)
-                        #endif
-                    } header: {
-                        Text("Keywords")
-                    } footer: {
-                        if keywordsText.trimmingCharacters(in: .whitespaces).isEmpty {
-                            if !autoKeywords.isEmpty {
-                                VStack(alignment: .leading, spacing: 6) {
-                                    Text("Auto-detected keywords:")
-                                    FlowLayout(spacing: 4) {
-                                        ForEach(autoKeywords, id: \.self) { keyword in
-                                            Text(keyword)
-                                                .font(.caption2)
-                                                .padding(.horizontal, 8)
-                                                .padding(.vertical, 3)
-                                                .background(.fill.tertiary, in: .capsule)
-                                        }
+                Section {
+                    #if os(iOS) || os(tvOS) || os(visionOS)
+                    TextField("swift, coding, preference", text: $keywordsText)
+                        .textInputAutocapitalization(.never)
+                    #else
+                    TextField("swift, coding, preference", text: $keywordsText)
+                    #endif
+                } header: {
+                    Text("Keywords")
+                } footer: {
+                    if keywordsText.trimmingCharacters(in: .whitespaces).isEmpty {
+                        if !autoKeywords.isEmpty {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("Auto-detected keywords:")
+                                FlowLayout(spacing: 4) {
+                                    ForEach(autoKeywords, id: \.self) { keyword in
+                                        Text(keyword)
+                                            .font(.caption2)
+                                            .padding(.horizontal, 8)
+                                            .padding(.vertical, 3)
+                                            .background(.fill.tertiary, in: .capsule)
                                     }
                                 }
-                            } else {
-                                Text("Leave blank to auto-detect from content.")
                             }
-                        }
-                    }
-
-                    if isEditing, let entry = existing {
-                        Section {
-                            LabeledContent("Source", value: entry.sourceConversationTitle)
-                            LabeledContent("Created", value: entry.createdAt.formatted(date: .abbreviated, time: .shortened))
-                        } header: {
-                            Text("Info")
+                        } else {
+                            Text("Leave blank to auto-detect from content.")
                         }
                     }
                 }
+
+                if isEditing, let entry = existing {
+                    Section {
+                        LabeledContent("Source", value: entry.sourceConversationTitle)
+                        LabeledContent("Created", value: entry.createdAt.formatted(date: .abbreviated, time: .shortened))
+                    } header: {
+                        Text("Info")
+                    }
+                }
             }
+            .formStyle(.grouped)
             .navigationTitle(title)
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
@@ -1134,131 +1346,122 @@ struct MemoryListView: View {
 
     var body: some View {
         NavigationStack {
-            Group {
-                if memoryStore.memories.isEmpty {
-                    ContentUnavailableView {
-                        Label("No Memories", systemImage: "brain")
-                    } description: {
-                        Text("Memories are automatically created when conversations get long, or you can add them manually.")
-                    } actions: {
-                        Button {
-                            showingAddMemory = true
-                        } label: {
-                            Text("Add Memory")
-                        }
-                    }
-                } else {
-                    List {
-                        ForEach(memoryStore.memories) { memory in
-                            Button {
-                                editingMemory = memory
-                            } label: {
-                                VStack(alignment: .leading, spacing: 6) {
-                                    Text(memory.content)
-                                        .font(.body)
-                                        .foregroundStyle(.primary)
-                                        .lineLimit(3)
-
-                                    if !memory.keywords.isEmpty {
-                                        HStack(spacing: 4) {
-                                            ForEach(memory.keywords.prefix(4), id: \.self) { keyword in
-                                                Text(keyword)
-                                                    .font(.caption2)
-                                                    .padding(.horizontal, 6)
-                                                    .padding(.vertical, 2)
-                                                    .background(.fill.tertiary, in: .capsule)
-                                            }
-                                        }
-                                    }
-
-                                    HStack(spacing: 4) {
-                                        Text(memory.sourceConversationTitle)
-                                        Text("·")
-                                        Text(memory.createdAt, style: .relative)
-                                    }
-                                    .font(.caption2)
-                                    .foregroundStyle(.tertiary)
-                                    .lineLimit(1)
-                                }
-                                .padding(.vertical, 2)
-                            }
-                            .contextMenu {
-                                Button {
-                                    editingMemory = memory
-                                } label: {
-                                    Label("Edit", systemImage: "pencil")
-                                }
-                                Button(role: .destructive) {
-                                    memoryStore.deleteMemory(memory)
-                                } label: {
-                                    Label("Delete", systemImage: "trash")
-                                }
-                            }
-                        }
-                        .onDelete { offsets in
-                            let toDelete = offsets.map { memoryStore.memories[$0] }
-                            for entry in toDelete {
-                                memoryStore.deleteMemory(entry)
-                            }
-                        }
-                    }
-                }
-            }
-            .navigationTitle("Memories")
-            #if os(iOS)
-            .navigationBarTitleDisplayMode(.inline)
-            #endif
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Done") { dismiss() }
-                }
-                #if os(macOS)
-                ToolbarItem(placement: .primaryAction) {
-                    HStack(spacing: 12) {
-                        if !memoryStore.memories.isEmpty {
-                            Button("Clear All", role: .destructive) {
-                                showingDeleteAllConfirmation = true
-                            }
-                            .foregroundStyle(.red)
-                        }
-                        Button {
-                            showingAddMemory = true
-                        } label: {
-                            Image(systemName: "plus")
-                        }
-                    }
-                }
-                #else
-                ToolbarItem(placement: .topBarTrailing) {
-                    HStack(spacing: 12) {
-                        if !memoryStore.memories.isEmpty {
-                            Button("Clear All", role: .destructive) {
-                                showingDeleteAllConfirmation = true
-                            }
-                            .foregroundStyle(.red)
-                        }
-                        Button {
-                            showingAddMemory = true
-                        } label: {
-                            Image(systemName: "plus")
-                        }
-                    }
-                }
+            memoryContent
+                .navigationTitle("Memories")
+                #if os(iOS)
+                .navigationBarTitleDisplayMode(.inline)
                 #endif
-            }
-            .alert("Clear All Memories?", isPresented: $showingDeleteAllConfirmation) {
-                Button("Clear All", role: .destructive) {
-                    memoryStore.deleteAllMemories()
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Done") { dismiss() }
+                    }
+                    ToolbarItem(placement: .primaryAction) {
+                        Button {
+                            showingAddMemory = true
+                        } label: {
+                            Image(systemName: "plus")
+                        }
+                        .help("Add Memory")
+                    }
+                    ToolbarItem(placement: .automatic) {
+                        if !memoryStore.memories.isEmpty {
+                            Button(role: .destructive) {
+                                showingDeleteAllConfirmation = true
+                            } label: {
+                                Image(systemName: "trash")
+                            }
+                            .help("Clear All Memories")
+                        }
+                    }
                 }
-                Button("Cancel", role: .cancel) {}
-            } message: {
-                Text("This will permanently delete all saved memories.")
+                .alert("Clear All Memories?", isPresented: $showingDeleteAllConfirmation) {
+                    Button("Clear All", role: .destructive) {
+                        memoryStore.deleteAllMemories()
+                    }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("This will permanently delete all saved memories.")
+                }
+                .sheet(isPresented: $showingAddMemory) {
+                    MemoryEditorView(memoryStore: memoryStore)
+                }
+                .sheet(item: $editingMemory) { memory in
+                    MemoryEditorView(memoryStore: memoryStore, existing: memory)
+                }
+        }
+        #if os(macOS)
+        .frame(minWidth: 460, idealWidth: 520, minHeight: 400, idealHeight: 560)
+        #endif
+    }
+
+    @ViewBuilder
+    private var memoryContent: some View {
+        if memoryStore.memories.isEmpty {
+            ContentUnavailableView {
+                Label("No Memories", systemImage: "brain")
+            } description: {
+                Text("Memories are automatically created when conversations get long, or you can add them manually.")
+            } actions: {
+                Button {
+                    showingAddMemory = true
+                } label: {
+                    Text("Add Memory")
+                }
             }
-            .sheet(isPresented: $showingAddMemory) {
-                MemoryEditorView(memoryStore: memoryStore)
-            }
-            .sheet(item: $editingMemory) { memory in
-                MemoryEditorView(memoryStore: memoryStore, existing: memory)
+        } else {
+            List {
+                ForEach(memoryStore.memories) { memory in
+                    Button {
+                        editingMemory = memory
+                    } label: {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(memory.content)
+                                .font(.body)
+                                .foregroundStyle(.primary)
+                                .lineLimit(3)
+
+                            if !memory.keywords.isEmpty {
+                                HStack(spacing: 4) {
+                                    ForEach(memory.keywords.prefix(4), id: \.self) { keyword in
+                                        Text(keyword)
+                                            .font(.caption2)
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 2)
+                                            .background(.fill.tertiary, in: .capsule)
+                                    }
+                                }
+                            }
+
+                            HStack(spacing: 4) {
+                                Text(memory.sourceConversationTitle)
+                                Text("·")
+                                Text(memory.createdAt, style: .relative)
+                            }
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+                        }
+                        .padding(.vertical, 2)
+                    }
+                    .contextMenu {
+                        Button {
+                            editingMemory = memory
+                        } label: {
+                            Label("Edit", systemImage: "pencil")
+                        }
+                        Button(role: .destructive) {
+                            memoryStore.deleteMemory(memory)
+                        } label: {
+                            Label("Delete", systemImage: "trash")
+                        }
+                    }
+                }
+                .onDelete { offsets in
+                    let toDelete = offsets.map { memoryStore.memories[$0] }
+                    for entry in toDelete {
+                        memoryStore.deleteMemory(entry)
+                    }
+                }
             }
         }
     }
@@ -1271,156 +1474,141 @@ struct KnowledgeBaseListView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var showingImporter = false
     @State private var showingDeleteAllConfirmation = false
-    @State private var selectedKB: KnowledgeBase?
 
     var body: some View {
         NavigationStack {
-            Group {
-                if knowledgeBaseStore.knowledgeBases.isEmpty && !knowledgeBaseStore.isProcessing {
-                    ContentUnavailableView {
-                        Label("No Knowledge Bases", systemImage: "books.vertical")
-                    } description: {
-                        Text("Import PDF or ePUB documents to give the assistant knowledge about specific topics.")
-                    } actions: {
-                        Button {
-                            showingImporter = true
-                        } label: {
-                            Text("Import Document")
-                        }
-                    }
-                } else {
-                    List {
-                        if knowledgeBaseStore.isProcessing {
-                            Section {
-                                VStack(spacing: 8) {
-                                    ProgressView(value: knowledgeBaseStore.processingProgress)
-                                    Text("Processing document...")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                                .padding(.vertical, 4)
-                            }
-                        }
-
-                        if let error = knowledgeBaseStore.processingError {
-                            Section {
-                                Label(error, systemImage: "exclamationmark.triangle")
-                                    .foregroundStyle(.red)
-                                    .font(.caption)
-                            }
-                        }
-
-                        ForEach(knowledgeBaseStore.knowledgeBases) { kb in
-                            Button {
-                                selectedKB = kb
-                            } label: {
-                                HStack(spacing: 12) {
-                                    Image(systemName: kb.documentType.icon)
-                                        .font(.title2)
-                                        .foregroundStyle(.secondary)
-                                        .frame(width: 32)
-
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        Text(kb.name)
-                                            .font(.body)
-                                            .foregroundStyle(.primary)
-                                            .lineLimit(1)
-
-                                        HStack(spacing: 4) {
-                                            Text(kb.documentType.label)
-                                            Text("·")
-                                            Text("\(kb.chunkCount) chunks")
-                                            Text("·")
-                                            Text(ByteCountFormatter.string(fromByteCount: kb.fileSize, countStyle: .file))
-                                        }
-                                        .font(.caption2)
-                                        .foregroundStyle(.tertiary)
-                                    }
-                                }
-                                .padding(.vertical, 2)
-                            }
-                            .contextMenu {
-                                Button(role: .destructive) {
-                                    knowledgeBaseStore.deleteKnowledgeBase(kb)
-                                } label: {
-                                    Label("Delete", systemImage: "trash")
-                                }
-                            }
-                        }
-                        .onDelete { offsets in
-                            let toDelete = offsets.map { knowledgeBaseStore.knowledgeBases[$0] }
-                            for kb in toDelete {
-                                knowledgeBaseStore.deleteKnowledgeBase(kb)
-                            }
-                        }
-                    }
-                }
-            }
-            .navigationTitle("Knowledge Bases")
-            #if os(iOS)
-            .navigationBarTitleDisplayMode(.inline)
-            #endif
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Done") { dismiss() }
-                }
-                #if os(macOS)
-                ToolbarItem(placement: .primaryAction) {
-                    HStack(spacing: 12) {
-                        if !knowledgeBaseStore.knowledgeBases.isEmpty {
-                            Button("Clear All", role: .destructive) {
-                                showingDeleteAllConfirmation = true
-                            }
-                            .foregroundStyle(.red)
-                        }
-                        Button {
-                            showingImporter = true
-                        } label: {
-                            Image(systemName: "plus")
-                        }
-                        .disabled(knowledgeBaseStore.isProcessing)
-                    }
-                }
-                #else
-                ToolbarItem(placement: .topBarTrailing) {
-                    HStack(spacing: 12) {
-                        if !knowledgeBaseStore.knowledgeBases.isEmpty {
-                            Button("Clear All", role: .destructive) {
-                                showingDeleteAllConfirmation = true
-                            }
-                            .foregroundStyle(.red)
-                        }
-                        Button {
-                            showingImporter = true
-                        } label: {
-                            Image(systemName: "plus")
-                        }
-                        .disabled(knowledgeBaseStore.isProcessing)
-                    }
-                }
+            kbContent
+                .navigationTitle("Knowledge Bases")
+                #if os(iOS)
+                .navigationBarTitleDisplayMode(.inline)
                 #endif
-            }
-            .fileImporter(
-                isPresented: $showingImporter,
-                allowedContentTypes: [.pdf, .epub],
-                allowsMultipleSelection: false
-            ) { result in
-                if case .success(let urls) = result, let url = urls.first {
-                    Task {
-                        await knowledgeBaseStore.ingestDocument(from: url)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Done") { dismiss() }
+                    }
+                    ToolbarItem(placement: .primaryAction) {
+                        Button {
+                            showingImporter = true
+                        } label: {
+                            Image(systemName: "plus")
+                        }
+                        .disabled(knowledgeBaseStore.isProcessing)
+                        .help("Import Document")
+                    }
+                    ToolbarItem(placement: .automatic) {
+                        if !knowledgeBaseStore.knowledgeBases.isEmpty {
+                            Button(role: .destructive) {
+                                showingDeleteAllConfirmation = true
+                            } label: {
+                                Image(systemName: "trash")
+                            }
+                            .help("Delete All Knowledge Bases")
+                        }
                     }
                 }
-            }
-            .alert("Delete All Knowledge Bases?", isPresented: $showingDeleteAllConfirmation) {
-                Button("Delete All", role: .destructive) {
-                    knowledgeBaseStore.deleteAllKnowledgeBases()
+                .fileImporter(
+                    isPresented: $showingImporter,
+                    allowedContentTypes: [.pdf, .epub],
+                    allowsMultipleSelection: false
+                ) { result in
+                    if case .success(let urls) = result, let url = urls.first {
+                        Task {
+                            await knowledgeBaseStore.ingestDocument(from: url)
+                        }
+                    }
                 }
-                Button("Cancel", role: .cancel) {}
-            } message: {
-                Text("This will permanently delete all imported documents and their chunks.")
+                .alert("Delete All Knowledge Bases?", isPresented: $showingDeleteAllConfirmation) {
+                    Button("Delete All", role: .destructive) {
+                        knowledgeBaseStore.deleteAllKnowledgeBases()
+                    }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("This will permanently delete all imported documents and their chunks.")
+                }
+        }
+        #if os(macOS)
+        .frame(minWidth: 460, idealWidth: 520, minHeight: 400, idealHeight: 560)
+        #endif
+    }
+
+    @ViewBuilder
+    private var kbContent: some View {
+        if knowledgeBaseStore.knowledgeBases.isEmpty && !knowledgeBaseStore.isProcessing {
+            ContentUnavailableView {
+                Label("No Knowledge Bases", systemImage: "books.vertical")
+            } description: {
+                Text("Import PDF or ePUB documents to give the assistant knowledge about specific topics.")
+            } actions: {
+                Button {
+                    showingImporter = true
+                } label: {
+                    Text("Import Document")
+                }
             }
-            .sheet(item: $selectedKB) { kb in
-                KnowledgeBaseDetailView(kb: kb, store: knowledgeBaseStore)
+        } else {
+            List {
+                if knowledgeBaseStore.isProcessing {
+                    Section {
+                        VStack(spacing: 8) {
+                            ProgressView(value: knowledgeBaseStore.processingProgress)
+                            Text("Processing document…")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+
+                if let error = knowledgeBaseStore.processingError {
+                    Section {
+                        Label(error, systemImage: "exclamationmark.triangle")
+                            .foregroundStyle(.red)
+                            .font(.caption)
+                    }
+                }
+
+                ForEach(knowledgeBaseStore.knowledgeBases) { kb in
+                    NavigationLink {
+                        KnowledgeBaseDetailView(kb: kb, store: knowledgeBaseStore)
+                    } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: kb.documentType.icon)
+                                .font(.title2)
+                                .foregroundStyle(.secondary)
+                                .frame(width: 32)
+
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(kb.name)
+                                    .font(.body)
+                                    .lineLimit(1)
+
+                                HStack(spacing: 4) {
+                                    Text(kb.documentType.label)
+                                    Text("·")
+                                    Text("\(kb.chunkCount) chunks")
+                                    Text("·")
+                                    Text(ByteCountFormatter.string(fromByteCount: kb.fileSize, countStyle: .file))
+                                }
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                            }
+                        }
+                        .padding(.vertical, 2)
+                    }
+                    .contextMenu {
+                        Button(role: .destructive) {
+                            knowledgeBaseStore.deleteKnowledgeBase(kb)
+                        } label: {
+                            Label("Delete", systemImage: "trash")
+                        }
+                    }
+                }
+                .onDelete { offsets in
+                    let toDelete = offsets.map { knowledgeBaseStore.knowledgeBases[$0] }
+                    for kb in toDelete {
+                        knowledgeBaseStore.deleteKnowledgeBase(kb)
+                    }
+                }
             }
         }
     }
@@ -1431,64 +1619,55 @@ struct KnowledgeBaseListView: View {
 struct KnowledgeBaseDetailView: View {
     let kb: KnowledgeBase
     var store: KnowledgeBaseStore
-    @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        NavigationStack {
-            List {
-                Section {
-                    LabeledContent("Type", value: kb.documentType.label)
-                    LabeledContent("Chunks", value: "\(kb.chunkCount)")
-                    LabeledContent("Size", value: ByteCountFormatter.string(fromByteCount: kb.fileSize, countStyle: .file))
-                    LabeledContent("Imported", value: kb.createdAt.formatted(date: .abbreviated, time: .shortened))
-                } header: {
-                    Text("Details")
-                }
+        List {
+            Section {
+                LabeledContent("Type", value: kb.documentType.label)
+                LabeledContent("Chunks", value: "\(kb.chunkCount)")
+                LabeledContent("Size", value: ByteCountFormatter.string(fromByteCount: kb.fileSize, countStyle: .file))
+                LabeledContent("Imported", value: kb.createdAt.formatted(date: .abbreviated, time: .shortened))
+            } header: {
+                Text("Details")
+            }
 
-                Section {
-                    let chunks = store.previewChunks(for: kb.id, limit: 5)
-                    if chunks.isEmpty {
-                        Text("No chunks available.")
-                            .foregroundStyle(.secondary)
-                    } else {
-                        ForEach(chunks) { chunk in
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(chunk.locationLabel)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                Text(chunk.content)
-                                    .font(.caption2)
-                                    .lineLimit(4)
-                                if !chunk.keywords.isEmpty {
-                                    HStack(spacing: 4) {
-                                        ForEach(chunk.keywords.prefix(4), id: \.self) { kw in
-                                            Text(kw)
-                                                .font(.system(size: 9))
-                                                .padding(.horizontal, 5)
-                                                .padding(.vertical, 2)
-                                                .background(.fill.tertiary, in: .capsule)
-                                        }
+            Section {
+                let chunks = store.previewChunks(for: kb.id, limit: 5)
+                if chunks.isEmpty {
+                    Text("No chunks available.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(chunks) { chunk in
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(chunk.locationLabel)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Text(chunk.content)
+                                .font(.caption2)
+                                .lineLimit(4)
+                            if !chunk.keywords.isEmpty {
+                                HStack(spacing: 4) {
+                                    ForEach(chunk.keywords.prefix(4), id: \.self) { kw in
+                                        Text(kw)
+                                            .font(.system(size: 9))
+                                            .padding(.horizontal, 5)
+                                            .padding(.vertical, 2)
+                                            .background(.fill.tertiary, in: .capsule)
                                     }
                                 }
                             }
-                            .padding(.vertical, 2)
                         }
+                        .padding(.vertical, 2)
                     }
-                } header: {
-                    Text("Content Preview")
                 }
-            }
-            .navigationTitle(kb.name)
-            #if os(iOS)
-            .navigationBarTitleDisplayMode(.inline)
-            #endif
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { dismiss() }
-                }
+            } header: {
+                Text("Content Preview")
             }
         }
-        .presentationDetents([.medium, .large])
+        .navigationTitle(kb.name)
+        #if os(iOS)
+        .navigationBarTitleDisplayMode(.inline)
+        #endif
     }
 }
 

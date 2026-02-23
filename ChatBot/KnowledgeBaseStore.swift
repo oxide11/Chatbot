@@ -4,7 +4,7 @@ import Compression
 
 // MARK: - Data Models
 
-enum DocumentType: String, Codable, CaseIterable {
+enum DocumentType: String, Codable, CaseIterable, Sendable {
     case pdf
     case epub
 
@@ -23,7 +23,7 @@ enum DocumentType: String, Codable, CaseIterable {
     }
 }
 
-struct KnowledgeBase: Identifiable, Codable {
+struct KnowledgeBase: Identifiable, Codable, Sendable {
     let id: UUID
     var name: String
     let documentType: DocumentType
@@ -41,7 +41,7 @@ struct KnowledgeBase: Identifiable, Codable {
     }
 }
 
-struct DocumentChunk: Identifiable, Codable {
+struct DocumentChunk: Identifiable, Codable, Sendable {
     let id: UUID
     let knowledgeBaseID: UUID
     let content: String
@@ -341,6 +341,9 @@ final class KnowledgeBaseStore {
             let nameLength = Int(fileData.subdata(in: offset + 26..<offset + 28).withUnsafeBytes { $0.load(as: UInt16.self) })
             let extraLength = Int(fileData.subdata(in: offset + 28..<offset + 30).withUnsafeBytes { $0.load(as: UInt16.self) })
 
+            // Guard against malformed entries with nonsensical sizes
+            guard compressedSize >= 0, uncompressedSize >= 0, nameLength > 0 else { break }
+
             let nameStart = offset + 30
             let nameEnd = nameStart + nameLength
             guard nameEnd <= fileData.count else { break }
@@ -388,8 +391,11 @@ final class KnowledgeBaseStore {
 
     /// Decompress deflate data using the Compression framework
     private func decompress(_ data: Data, expectedSize: Int) -> Data? {
-        // Raw deflate (no zlib header) — use COMPRESSION_ZLIB with raw flag
-        let bufferSize = max(expectedSize, 1024)
+        // Sanity limit: refuse to allocate more than 100 MB for a single entry
+        let maxAllowedSize = 100 * 1024 * 1024
+        let bufferSize = min(max(expectedSize, 1024), maxAllowedSize)
+        guard bufferSize > 0 else { return nil }
+
         let destinationBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: bufferSize)
         defer { destinationBuffer.deallocate() }
 
@@ -483,6 +489,9 @@ final class KnowledgeBaseStore {
 
     // MARK: - Retrieval
 
+    /// Pre-computed keyword sets for each chunk, avoiding repeated tokenization of full content.
+    private var chunkKeywordCache: [UUID: Set<String>] = [:]
+
     func retrieve(for query: String, limit: Int = 2) -> [DocumentChunk] {
         let queryWords = SharedDataManager.tokenize(query)
         guard !queryWords.isEmpty else { return [] }
@@ -493,9 +502,15 @@ final class KnowledgeBaseStore {
 
         for (_, chunks) in chunkCache {
             for chunk in chunks {
-                let entryWords = Set(chunk.keywords)
-                let contentWords = SharedDataManager.tokenize(chunk.content)
-                let allWords = entryWords.union(contentWords)
+                // Use cached keyword set, or compute and cache once
+                let allWords: Set<String>
+                if let cached = chunkKeywordCache[chunk.id] {
+                    allWords = cached
+                } else {
+                    let computed = Set(chunk.keywords).union(SharedDataManager.tokenize(chunk.content))
+                    chunkKeywordCache[chunk.id] = computed
+                    allWords = computed
+                }
 
                 var score = 0.0
                 for word in queryWords {
@@ -529,6 +544,12 @@ final class KnowledgeBaseStore {
     // MARK: - Management
 
     func deleteKnowledgeBase(_ kb: KnowledgeBase) {
+        // Invalidate keyword caches for deleted chunks
+        if let chunks = chunkCache[kb.id] {
+            for chunk in chunks {
+                chunkKeywordCache.removeValue(forKey: chunk.id)
+            }
+        }
         knowledgeBases.removeAll { $0.id == kb.id }
         chunkCache.removeValue(forKey: kb.id)
         if let dir = SharedDataManager.chunksDirectoryURL {
@@ -545,6 +566,7 @@ final class KnowledgeBaseStore {
         }
         knowledgeBases.removeAll()
         chunkCache.removeAll()
+        chunkKeywordCache.removeAll()
         saveMetadata()
     }
 

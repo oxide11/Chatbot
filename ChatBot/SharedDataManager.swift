@@ -118,9 +118,23 @@ enum SharedDataManager {
         return Set(words)
     }
 
-    /// Extract keywords from text, filtering stop words.
+    /// Extract keywords from text, ranked by frequency.
+    /// Returns a deterministic, frequency-sorted list of the most significant words.
     static func extractKeywords(from text: String, limit: Int = 5) -> [String] {
-        Array(tokenize(text).prefix(limit))
+        let words = text.lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { $0.count > 2 && !stopWords.contains($0) }
+
+        // Count frequency for ranking
+        var frequency: [String: Int] = [:]
+        for word in words {
+            frequency[word, default: 0] += 1
+        }
+
+        return frequency
+            .sorted { $0.value > $1.value || ($0.value == $1.value && $0.key < $1.key) }
+            .prefix(limit)
+            .map(\.key)
     }
 
     // MARK: - App Group Container (file-based storage)
