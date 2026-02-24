@@ -1075,7 +1075,7 @@ struct SettingsView: View {
                             Text("None")
                                 .foregroundStyle(.secondary)
                         } else {
-                            Text("\(store.knowledgeBaseStore.knowledgeBases.count) docs · \(store.knowledgeBaseStore.totalChunkCount) chunks")
+                            Text("\(store.knowledgeBaseStore.knowledgeBases.count) docs \u{00B7} \(store.knowledgeBaseStore.totalChunkCount) chunks \u{00B7} \(ByteCountFormatter.string(fromByteCount: store.knowledgeBaseStore.totalChunkStorageSize, countStyle: .file))")
                                 .foregroundStyle(.secondary)
                         }
                     }
@@ -1637,6 +1637,9 @@ struct KnowledgeBaseListView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var showingImporter = false
     @State private var showingDeleteAllConfirmation = false
+    @State private var showingTextInput = false
+    @State private var renamingKB: KnowledgeBase?
+    @State private var renameDraft = ""
 
     var body: some View {
         NavigationStack {
@@ -1650,12 +1653,21 @@ struct KnowledgeBaseListView: View {
                         Button("Done") { dismiss() }
                     }
                     ToolbarItem(placement: .primaryAction) {
-                        Button {
-                            showingImporter = true
+                        Menu {
+                            Button {
+                                showingImporter = true
+                            } label: {
+                                Label("Import Document", systemImage: "doc.badge.plus")
+                            }
+                            Button {
+                                showingTextInput = true
+                            } label: {
+                                Label("Paste Text", systemImage: "doc.text")
+                            }
                         } label: {
                             Image(systemName: "plus")
                         }
-                        .help("Import Documents")
+                        .help("Add Knowledge Base")
                     }
                     ToolbarItem(placement: .automatic) {
                         if !knowledgeBaseStore.knowledgeBases.isEmpty {
@@ -1670,7 +1682,7 @@ struct KnowledgeBaseListView: View {
                 }
                 .fileImporter(
                     isPresented: $showingImporter,
-                    allowedContentTypes: [.pdf, .epub],
+                    allowedContentTypes: [.pdf, .epub, .plainText],
                     allowsMultipleSelection: true
                 ) { result in
                     if case .success(let urls) = result, !urls.isEmpty {
@@ -1685,6 +1697,26 @@ struct KnowledgeBaseListView: View {
                 } message: {
                     Text("This will permanently delete all imported documents and their chunks.")
                 }
+                .alert("Rename Knowledge Base", isPresented: Binding(
+                    get: { renamingKB != nil },
+                    set: { if !$0 { renamingKB = nil } }
+                )) {
+                    TextField("Name", text: $renameDraft)
+                    Button("Rename") {
+                        if let kb = renamingKB {
+                            knowledgeBaseStore.renameKnowledgeBase(kb, to: renameDraft)
+                        }
+                        renamingKB = nil
+                    }
+                    Button("Cancel", role: .cancel) {
+                        renamingKB = nil
+                    }
+                } message: {
+                    Text("Enter a new name for this knowledge base.")
+                }
+                .sheet(isPresented: $showingTextInput) {
+                    TextInputSheet(knowledgeBaseStore: knowledgeBaseStore)
+                }
         }
         #if os(macOS)
         .frame(minWidth: 460, idealWidth: 520, minHeight: 400, idealHeight: 560)
@@ -1697,7 +1729,7 @@ struct KnowledgeBaseListView: View {
             ContentUnavailableView {
                 Label("No Knowledge Bases", systemImage: "books.vertical")
             } description: {
-                Text("Import PDF or ePUB documents to give the assistant knowledge about specific topics. You can select multiple files at once.")
+                Text("Import PDF, ePUB, or text documents to give the assistant knowledge about specific topics. You can also paste text directly.")
             } actions: {
                 Button {
                     showingImporter = true
@@ -1813,10 +1845,13 @@ struct KnowledgeBaseListView: View {
 
                                         HStack(spacing: 4) {
                                             Text(kb.documentType.label)
-                                            Text("·")
+                                            Text("\u{00B7}")
                                             Text("\(kb.chunkCount) chunks")
-                                            Text("·")
-                                            Text(ByteCountFormatter.string(fromByteCount: kb.fileSize, countStyle: .file))
+                                            Text("\u{00B7}")
+                                            Text(ByteCountFormatter.string(
+                                                fromByteCount: knowledgeBaseStore.storageSize(for: kb),
+                                                countStyle: .file
+                                            ))
                                         }
                                         .font(.caption2)
                                         .foregroundStyle(.tertiary)
@@ -1825,6 +1860,13 @@ struct KnowledgeBaseListView: View {
                                 .padding(.vertical, 2)
                             }
                             .contextMenu {
+                                Button {
+                                    renameDraft = kb.name
+                                    renamingKB = kb
+                                } label: {
+                                    Label("Rename", systemImage: "pencil")
+                                }
+                                Divider()
                                 Button(role: .destructive) {
                                     knowledgeBaseStore.deleteKnowledgeBase(kb)
                                 } label: {
@@ -1847,34 +1889,131 @@ struct KnowledgeBaseListView: View {
     }
 }
 
+// MARK: - Text Input Sheet
+
+struct TextInputSheet: View {
+    var knowledgeBaseStore: KnowledgeBaseStore
+    @Environment(\.dismiss) private var dismiss
+    @State private var name = ""
+    @State private var text = ""
+
+    private var canImport: Bool {
+        !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    TextField("Knowledge base name", text: $name)
+                } header: {
+                    Text("Name")
+                }
+
+                Section {
+                    TextEditor(text: $text)
+                        .frame(minHeight: 200)
+                        .font(.body)
+                } header: {
+                    Text("Content")
+                } footer: {
+                    if !text.isEmpty {
+                        Text("\(text.count) characters")
+                    }
+                }
+            }
+            .formStyle(.grouped)
+            .navigationTitle("Paste Text")
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            #endif
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Import") {
+                        knowledgeBaseStore.ingestText(name: name, text: text)
+                        dismiss()
+                    }
+                    .bold()
+                    .disabled(!canImport)
+                }
+            }
+        }
+        .presentationDetents([.large])
+    }
+}
+
 // MARK: - Knowledge Base Detail View
 
 struct KnowledgeBaseDetailView: View {
     let kb: KnowledgeBase
     var store: KnowledgeBaseStore
+    @Environment(\.dismiss) private var dismiss
+    @State private var showingDeleteConfirmation = false
+    @State private var showingReimporter = false
+    @State private var showingRenameAlert = false
+    @State private var renameDraft = ""
 
     var body: some View {
         List {
+            // MARK: Metadata
             Section {
                 LabeledContent("Type", value: kb.documentType.label)
                 LabeledContent("Chunks", value: "\(kb.chunkCount)")
-                LabeledContent("Size", value: ByteCountFormatter.string(fromByteCount: kb.fileSize, countStyle: .file))
-                LabeledContent("Imported", value: kb.createdAt.formatted(date: .abbreviated, time: .shortened))
+                LabeledContent("Original Size", value: ByteCountFormatter.string(
+                    fromByteCount: kb.fileSize, countStyle: .file
+                ))
+                LabeledContent("Storage Used", value: ByteCountFormatter.string(
+                    fromByteCount: store.storageSize(for: kb), countStyle: .file
+                ))
+                LabeledContent("Imported", value: kb.createdAt.formatted(
+                    date: .abbreviated, time: .shortened
+                ))
+                if kb.updatedAt.timeIntervalSince(kb.createdAt) > 1 {
+                    LabeledContent("Updated", value: kb.updatedAt.formatted(
+                        date: .abbreviated, time: .shortened
+                    ))
+                }
+
+                // Embedding status
+                HStack {
+                    Text("Embeddings")
+                    Spacer()
+                    if let modelID = kb.embeddingModelID, !modelID.isEmpty {
+                        Label("Active", systemImage: "checkmark.circle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.green)
+                    } else {
+                        Label("None", systemImage: "xmark.circle")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
             } header: {
                 Text("Details")
             }
 
+            // MARK: All Chunks
             Section {
-                let chunks = store.previewChunks(for: kb.id, limit: 5)
+                let chunks = store.allChunks(for: kb.id)
                 if chunks.isEmpty {
                     Text("No chunks available.")
                         .foregroundStyle(.secondary)
                 } else {
                     ForEach(chunks) { chunk in
                         VStack(alignment: .leading, spacing: 4) {
-                            Text(chunk.locationLabel)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                            HStack {
+                                Text(chunk.locationLabel)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                                Text("#\(chunk.index)")
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                            }
                             Text(chunk.content)
                                 .font(.caption2)
                                 .lineLimit(4)
@@ -1889,18 +2028,93 @@ struct KnowledgeBaseDetailView: View {
                                     }
                                 }
                             }
+                            if chunk.embedding != nil {
+                                HStack(spacing: 2) {
+                                    Image(systemName: "sparkles")
+                                        .font(.system(size: 8))
+                                    Text("Embedded")
+                                        .font(.system(size: 9))
+                                }
+                                .foregroundStyle(.green)
+                            }
                         }
                         .padding(.vertical, 2)
                     }
+                    .onDelete { offsets in
+                        let chunks = store.allChunks(for: kb.id)
+                        for index in offsets {
+                            store.deleteChunk(chunkID: chunks[index].id, from: kb.id)
+                        }
+                    }
                 }
             } header: {
-                Text("Content Preview")
+                HStack {
+                    Text("Chunks")
+                    Spacer()
+                    Text("\(store.allChunks(for: kb.id).count)")
+                        .foregroundStyle(.secondary)
+                }
             }
         }
         .navigationTitle(kb.name)
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
         #endif
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Menu {
+                    Button {
+                        renameDraft = kb.name
+                        showingRenameAlert = true
+                    } label: {
+                        Label("Rename", systemImage: "pencil")
+                    }
+
+                    Button {
+                        showingReimporter = true
+                    } label: {
+                        Label("Re-import Document", systemImage: "arrow.triangle.2.circlepath")
+                    }
+
+                    Divider()
+
+                    Button(role: .destructive) {
+                        showingDeleteConfirmation = true
+                    } label: {
+                        Label("Delete", systemImage: "trash")
+                    }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                }
+            }
+        }
+        .alert("Rename Knowledge Base", isPresented: $showingRenameAlert) {
+            TextField("Name", text: $renameDraft)
+            Button("Rename") {
+                store.renameKnowledgeBase(kb, to: renameDraft)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Enter a new name for this knowledge base.")
+        }
+        .alert("Delete Knowledge Base?", isPresented: $showingDeleteConfirmation) {
+            Button("Delete", role: .destructive) {
+                store.deleteKnowledgeBase(kb)
+                dismiss()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This will permanently delete '\(kb.name)' and all its chunks.")
+        }
+        .fileImporter(
+            isPresented: $showingReimporter,
+            allowedContentTypes: [.pdf, .epub, .plainText],
+            allowsMultipleSelection: false
+        ) { result in
+            if case .success(let urls) = result, let url = urls.first {
+                store.updateDocument(for: kb, from: url)
+            }
+        }
     }
 }
 

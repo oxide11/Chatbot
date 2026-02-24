@@ -7,11 +7,13 @@ import Compression
 enum DocumentType: String, Codable, CaseIterable, Sendable {
     case pdf
     case epub
+    case text
 
     var icon: String {
         switch self {
         case .pdf: return "doc.richtext"
         case .epub: return "book"
+        case .text: return "doc.text"
         }
     }
 
@@ -19,6 +21,7 @@ enum DocumentType: String, Codable, CaseIterable, Sendable {
         switch self {
         case .pdf: return "PDF"
         case .epub: return "ePUB"
+        case .text: return "Text"
         }
     }
 }
@@ -28,6 +31,7 @@ struct KnowledgeBase: Identifiable, Codable, Sendable {
     var name: String
     let documentType: DocumentType
     let createdAt: Date
+    var updatedAt: Date
     var chunkCount: Int
     let fileSize: Int64
 
@@ -40,9 +44,23 @@ struct KnowledgeBase: Identifiable, Codable, Sendable {
         self.name = name
         self.documentType = documentType
         self.createdAt = Date()
+        self.updatedAt = Date()
         self.chunkCount = chunkCount
         self.fileSize = fileSize
         self.embeddingModelID = embeddingModelID
+    }
+
+    /// Backward-compatible decoding: old data without `updatedAt` falls back to `createdAt`.
+    nonisolated init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        documentType = try container.decode(DocumentType.self, forKey: .documentType)
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        updatedAt = try container.decodeIfPresent(Date.self, forKey: .updatedAt) ?? createdAt
+        chunkCount = try container.decode(Int.self, forKey: .chunkCount)
+        fileSize = try container.decode(Int64.self, forKey: .fileSize)
+        embeddingModelID = try container.decodeIfPresent(String.self, forKey: .embeddingModelID)
     }
 }
 
@@ -143,6 +161,7 @@ final class KnowledgeBaseStore {
 
     init() {
         loadMetadata()
+        verifyDataIntegrity()
         reembedStaleKnowledgeBasesIfNeeded()
     }
 
@@ -315,11 +334,15 @@ final class KnowledgeBaseStore {
         url: URL
     ) async -> IngestionOutcome {
         let ext = url.pathExtension.lowercased()
-        guard ext == "pdf" || ext == "epub" else {
+        guard ext == "pdf" || ext == "epub" || ext == "txt" else {
             return .failure("Unsupported: .\(ext)")
         }
 
-        let docType: DocumentType = ext == "pdf" ? .pdf : .epub
+        let docType: DocumentType
+        if ext == "pdf" { docType = .pdf }
+        else if ext == "epub" { docType = .epub }
+        else { docType = .text }
+
         let fileSize = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int64) ?? 0
         let kbID = UUID()
 
@@ -327,8 +350,16 @@ final class KnowledgeBaseStore {
         let sections: [(label: String, text: String)]
         if docType == .pdf {
             sections = extractTextFromPDFBackground(at: url)
-        } else {
+        } else if docType == .epub {
             sections = (try? extractTextFromEPUBBackground(at: url)) ?? []
+        } else {
+            // Plain text file
+            if let textContent = try? String(contentsOf: url, encoding: .utf8),
+               !textContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                sections = [("Full Text", textContent)]
+            } else {
+                sections = []
+            }
         }
 
         guard !sections.isEmpty else {
@@ -372,9 +403,18 @@ final class KnowledgeBaseStore {
         )
 
         SharedDataManager.ensureDirectoriesExist()
-        if let dir = SharedDataManager.chunksDirectoryURL {
-            let fileURL = dir.appendingPathComponent("\(kbID.uuidString).json")
-            try? JSONEncoder().encode(allChunks).write(to: fileURL)
+        guard let dir = SharedDataManager.chunksDirectoryURL else {
+            print("[KBStore] ERROR: Storage directory unavailable during ingestion")
+            return .failure("Storage directory unavailable")
+        }
+        let fileURL = dir.appendingPathComponent("\(kbID.uuidString).json")
+        do {
+            let data = try JSONEncoder().encode(allChunks)
+            try data.write(to: fileURL, options: .atomic)
+            print("[KBStore] Saved \(allChunks.count) chunks for '\(kb.name)' (\(data.count) bytes)")
+        } catch {
+            print("[KBStore] ERROR writing chunks during ingestion: \(error.localizedDescription)")
+            return .failure("Failed to save chunks: \(error.localizedDescription)")
         }
 
         return .success(IngestionResult(kb: kb, chunks: allChunks))
@@ -1096,34 +1136,307 @@ final class KnowledgeBaseStore {
         saveMetadata()
     }
 
-    // MARK: - Persistence (file-based)
+    func renameKnowledgeBase(_ kb: KnowledgeBase, to newName: String) {
+        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        guard let index = knowledgeBases.firstIndex(where: { $0.id == kb.id }) else { return }
+        knowledgeBases[index].name = trimmed
+        knowledgeBases[index].updatedAt = Date()
+        saveMetadata()
+    }
+
+    func deleteChunk(chunkID: UUID, from kbID: UUID) {
+        // Update in-memory cache
+        guard var chunks = chunkCache[kbID] else { return }
+        chunkKeywordCache.removeValue(forKey: chunkID)
+        chunks.removeAll { $0.id == chunkID }
+        chunkCache[kbID] = chunks
+
+        // Update KB metadata
+        if let index = knowledgeBases.firstIndex(where: { $0.id == kbID }) {
+            knowledgeBases[index].chunkCount = chunks.count
+            knowledgeBases[index].updatedAt = Date()
+        }
+
+        // Invalidate matrices
+        invalidateEmbeddingMatrix()
+        invertedKeywordIndex.removeAll()
+
+        // Persist changes
+        saveChunks(chunks, for: kbID)
+        saveMetadata()
+    }
+
+    /// Re-import a document for an existing KB, replacing all chunks but keeping the same KB identity.
+    func updateDocument(for kb: KnowledgeBase, from url: URL) {
+        let job = IngestionJob(
+            id: UUID(),
+            url: url,
+            fileName: "\(kb.name) (Update)",
+            status: .queued
+        )
+        ingestionQueue.append(job)
+
+        Task {
+            guard let jobIndex = ingestionQueue.firstIndex(where: { $0.id == job.id }) else { return }
+            ingestionQueue[jobIndex].status = .processing
+            isProcessing = true
+
+            let accessing = job.url.startAccessingSecurityScopedResource()
+
+            let outcome = await Task.detached(priority: .userInitiated) {
+                await Self.ingestSingleDocument(url: job.url)
+            }.value
+
+            if accessing { job.url.stopAccessingSecurityScopedResource() }
+
+            if let idx = ingestionQueue.firstIndex(where: { $0.id == job.id }) {
+                switch outcome {
+                case .success(let result):
+                    ingestionQueue[idx].status = .completed
+
+                    // Replace chunks for existing KB
+                    if let kbIndex = knowledgeBases.firstIndex(where: { $0.id == kb.id }) {
+                        // Clean old keyword caches
+                        if let oldChunks = chunkCache[kb.id] {
+                            for chunk in oldChunks {
+                                chunkKeywordCache.removeValue(forKey: chunk.id)
+                            }
+                        }
+
+                        // Re-key chunks to use the existing KB ID
+                        let rekeyedChunks = result.chunks.map { original in
+                            DocumentChunk(
+                                knowledgeBaseID: kb.id,
+                                content: original.content,
+                                keywords: original.keywords,
+                                locationLabel: original.locationLabel,
+                                index: original.index,
+                                embedding: original.embedding
+                            )
+                        }
+
+                        chunkCache[kb.id] = rekeyedChunks
+                        knowledgeBases[kbIndex].chunkCount = rekeyedChunks.count
+                        knowledgeBases[kbIndex].updatedAt = Date()
+                        knowledgeBases[kbIndex].embeddingModelID = result.kb.embeddingModelID
+
+                        invalidateEmbeddingMatrix()
+                        invertedKeywordIndex.removeAll()
+                        saveChunks(rekeyedChunks, for: kb.id)
+                        saveMetadata()
+                    }
+
+                case .failure(let reason):
+                    ingestionQueue[idx].status = .failed(reason)
+                }
+            }
+            isProcessing = false
+        }
+    }
+
+    /// Ingest plain text directly (no file needed) — creates a new KB from pasted text.
+    func ingestText(name: String, text: String) {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty, !trimmedText.isEmpty else { return }
+
+        isProcessing = true
+        processingError = nil
+
+        let kbID = UUID()
+
+        Task.detached(priority: .userInitiated) { [trimmedName, trimmedText] in
+            let result = await Self.ingestPlainText(
+                kbID: kbID,
+                name: trimmedName,
+                text: trimmedText
+            )
+
+            await MainActor.run {
+                switch result {
+                case .success(let ingestionResult):
+                    self.knowledgeBases.insert(ingestionResult.kb, at: 0)
+                    self.chunkCache[ingestionResult.kb.id] = ingestionResult.chunks
+                    self.invalidateEmbeddingMatrix()
+                    self.invertedKeywordIndex.removeAll()
+                    self.saveMetadata()
+                    print("[KBStore] Ingested text '\(trimmedName)' — \(ingestionResult.chunks.count) chunks")
+                case .failure(let reason):
+                    self.processingError = reason
+                    print("[KBStore] Text ingestion failed: \(reason)")
+                }
+                self.isProcessing = false
+            }
+        }
+    }
+
+    /// Background-safe plain text ingestion pipeline.
+    nonisolated private static func ingestPlainText(
+        kbID: UUID,
+        name: String,
+        text: String
+    ) async -> IngestionOutcome {
+        let sections = [("Full Text", text)]
+
+        var allChunks: [DocumentChunk] = []
+        var chunkIndex = 0
+
+        for section in sections {
+            let sectionChunks = chunkTextBackground(
+                section.1,
+                locationLabel: section.0,
+                knowledgeBaseID: kbID,
+                startIndex: &chunkIndex
+            )
+            allChunks.append(contentsOf: sectionChunks)
+        }
+
+        guard !allChunks.isEmpty else {
+            return .failure("Text too short to create chunks")
+        }
+
+        let embeddingService = EmbeddingService.shared
+        if embeddingService.isAvailable {
+            for i in allChunks.indices {
+                allChunks[i].embedding = embeddingService.embed(allChunks[i].content)
+            }
+        }
+
+        let fileSize = Int64(text.utf8.count)
+        let kb = KnowledgeBase(
+            id: kbID,
+            name: name,
+            documentType: .text,
+            chunkCount: allChunks.count,
+            fileSize: fileSize,
+            embeddingModelID: embeddingService.isAvailable ? embeddingService.modelIdentifier : nil
+        )
+
+        SharedDataManager.ensureDirectoriesExist()
+        guard let dir = SharedDataManager.chunksDirectoryURL else {
+            return .failure("Storage directory unavailable")
+        }
+        let fileURL = dir.appendingPathComponent("\(kbID.uuidString).json")
+        do {
+            let data = try JSONEncoder().encode(allChunks)
+            try data.write(to: fileURL, options: .atomic)
+        } catch {
+            return .failure("Failed to save: \(error.localizedDescription)")
+        }
+
+        return .success(IngestionResult(kb: kb, chunks: allChunks))
+    }
+
+    /// Load all chunks for a knowledge base (full set, not just preview).
+    func allChunks(for kbID: UUID) -> [DocumentChunk] {
+        if let cached = chunkCache[kbID] {
+            return cached
+        }
+        let loaded = loadChunks(for: kbID)
+        chunkCache[kbID] = loaded
+        return loaded
+    }
+
+    /// Calculate actual disk usage for a single knowledge base's chunk file.
+    func storageSize(for kb: KnowledgeBase) -> Int64 {
+        guard let dir = SharedDataManager.chunksDirectoryURL else { return 0 }
+        let fileURL = dir.appendingPathComponent("\(kb.id.uuidString).json")
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+              let size = attrs[.size] as? Int64 else { return 0 }
+        return size
+    }
+
+    // MARK: - Persistence (file-based, hardened)
 
     private func saveMetadata() {
         SharedDataManager.ensureDirectoriesExist()
-        guard let url = SharedDataManager.documentsURL?.appendingPathComponent(Self.metadataFilename) else { return }
-        try? JSONEncoder().encode(knowledgeBases).write(to: url)
+        guard let url = SharedDataManager.documentsURL?.appendingPathComponent(Self.metadataFilename) else {
+            print("[KBStore] ERROR: Cannot resolve metadata file URL for save")
+            return
+        }
+        do {
+            let data = try JSONEncoder().encode(knowledgeBases)
+            try data.write(to: url, options: .atomic)
+            print("[KBStore] Saved \(knowledgeBases.count) knowledge bases (\(data.count) bytes)")
+        } catch {
+            print("[KBStore] ERROR saving metadata: \(error.localizedDescription)")
+        }
     }
 
     private func loadMetadata() {
-        guard let url = SharedDataManager.documentsURL?.appendingPathComponent(Self.metadataFilename),
-              let data = try? Data(contentsOf: url),
-              let decoded = try? JSONDecoder().decode([KnowledgeBase].self, from: data) else { return }
-        knowledgeBases = decoded
+        guard let url = SharedDataManager.documentsURL?.appendingPathComponent(Self.metadataFilename) else {
+            print("[KBStore] WARNING: Cannot resolve metadata file URL during load")
+            return
+        }
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            print("[KBStore] No metadata file found — starting fresh")
+            return
+        }
+        do {
+            let data = try Data(contentsOf: url)
+            let decoded = try JSONDecoder().decode([KnowledgeBase].self, from: data)
+            knowledgeBases = decoded
+            print("[KBStore] Loaded \(decoded.count) knowledge bases from disk")
+        } catch {
+            print("[KBStore] ERROR loading metadata: \(error.localizedDescription)")
+            knowledgeBases = []
+        }
+    }
+
+    /// Verify that chunk files exist for all metadata entries.
+    /// Removes orphaned metadata entries that have no chunk file on disk.
+    private func verifyDataIntegrity() {
+        guard let dir = SharedDataManager.chunksDirectoryURL else { return }
+        var orphaned: [UUID] = []
+        for kb in knowledgeBases {
+            let fileURL = dir.appendingPathComponent("\(kb.id.uuidString).json")
+            if !FileManager.default.fileExists(atPath: fileURL.path) {
+                print("[KBStore] INTEGRITY: Chunk file missing for '\(kb.name)' (\(kb.id)) — removing entry")
+                orphaned.append(kb.id)
+            }
+        }
+        if !orphaned.isEmpty {
+            knowledgeBases.removeAll { orphaned.contains($0.id) }
+            saveMetadata()
+            print("[KBStore] Removed \(orphaned.count) orphaned metadata entries")
+        }
     }
 
     private func saveChunks(_ chunks: [DocumentChunk], for kbID: UUID) {
         SharedDataManager.ensureDirectoriesExist()
-        guard let dir = SharedDataManager.chunksDirectoryURL else { return }
+        guard let dir = SharedDataManager.chunksDirectoryURL else {
+            print("[KBStore] ERROR: Cannot resolve chunks directory for save")
+            return
+        }
         let fileURL = dir.appendingPathComponent("\(kbID.uuidString).json")
-        try? JSONEncoder().encode(chunks).write(to: fileURL)
+        do {
+            let data = try JSONEncoder().encode(chunks)
+            try data.write(to: fileURL, options: .atomic)
+            print("[KBStore] Saved \(chunks.count) chunks for KB \(kbID) (\(data.count) bytes)")
+        } catch {
+            print("[KBStore] ERROR saving chunks for \(kbID): \(error.localizedDescription)")
+        }
     }
 
     private func loadChunks(for kbID: UUID) -> [DocumentChunk] {
-        guard let dir = SharedDataManager.chunksDirectoryURL else { return [] }
+        guard let dir = SharedDataManager.chunksDirectoryURL else {
+            print("[KBStore] WARNING: Cannot resolve chunks directory for load")
+            return []
+        }
         let fileURL = dir.appendingPathComponent("\(kbID.uuidString).json")
-        guard let data = try? Data(contentsOf: fileURL),
-              let decoded = try? JSONDecoder().decode([DocumentChunk].self, from: data) else { return [] }
-        return decoded
+        guard FileManager.default.fileExists(atPath: fileURL.path) else {
+            print("[KBStore] WARNING: No chunk file found for KB \(kbID)")
+            return []
+        }
+        do {
+            let data = try Data(contentsOf: fileURL)
+            let decoded = try JSONDecoder().decode([DocumentChunk].self, from: data)
+            return decoded
+        } catch {
+            print("[KBStore] ERROR loading chunks for \(kbID): \(error.localizedDescription)")
+            return []
+        }
     }
 
     private func ensureAllChunksLoaded() {
