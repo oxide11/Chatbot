@@ -41,20 +41,25 @@ struct MemoryEntry: Identifiable, Codable, Hashable, Sendable {
     let sourceConversationTitle: String
     let createdAt: Date
 
+    /// Semantic embedding vector (512-dim from NLContextualEmbedding).
+    var embedding: [Double]?
+
     init(content: String, keywords: [String], sourceConversationTitle: String) {
         self.id = UUID()
         self.content = content
         self.keywords = keywords.map { $0.lowercased() }
         self.sourceConversationTitle = sourceConversationTitle
         self.createdAt = Date()
+        self.embedding = EmbeddingService.shared.embed(content)
     }
 
-    init(id: UUID = UUID(), content: String, keywords: [String], sourceConversationTitle: String, createdAt: Date = Date()) {
+    init(id: UUID = UUID(), content: String, keywords: [String], sourceConversationTitle: String, createdAt: Date = Date(), embedding: [Double]? = nil) {
         self.id = id
         self.content = content
         self.keywords = keywords.map { $0.lowercased() }
         self.sourceConversationTitle = sourceConversationTitle
         self.createdAt = createdAt
+        self.embedding = embedding
     }
 }
 
@@ -89,40 +94,63 @@ final class MemoryStore {
         saveToDisk()
     }
 
-    /// Retrieve memories relevant to a query using keyword matching
+    /// Retrieve memories relevant to a query.
+    ///
+    /// **Primary path:** Embed the query and rank by cosine similarity.
+    /// **Fallback:** Keyword overlap (for old memories without embeddings or when assets unavailable).
     func retrieve(for query: String, limit: Int = 5) -> [MemoryEntry] {
+        // Try semantic retrieval first
+        if let queryVector = EmbeddingService.shared.embed(query) {
+            let scored = memories.compactMap { entry -> (MemoryEntry, Double)? in
+                guard let memVector = entry.embedding else { return nil }
+                let similarity = EmbeddingService.cosineSimilarity(queryVector, memVector)
+                guard similarity > 0.3 else { return nil }
+
+                // Small recency tiebreaker
+                let ageInDays = max(1, -entry.createdAt.timeIntervalSinceNow / 86400)
+                let recencyBonus = 1.0 / log2(ageInDays + 1)
+                return (entry, similarity + recencyBonus * 0.02)
+            }
+
+            let results = scored.sorted { $0.1 > $1.1 }.prefix(limit).map { $0.0 }
+            if !results.isEmpty { return results }
+        }
+
+        // Fallback: keyword matching
+        return retrieveByKeywords(query: query, limit: limit)
+    }
+
+    /// Keyword-based fallback retrieval for memories without embeddings.
+    private func retrieveByKeywords(query: String, limit: Int) -> [MemoryEntry] {
         let queryWords = tokenize(query)
         guard !queryWords.isEmpty else { return [] }
+        let queryCount = Double(queryWords.count)
 
-        // Score each memory by keyword overlap
-        let scored = memories.map { entry -> (MemoryEntry, Double) in
-            let entryWords = Set(entry.keywords)
-            let contentWords = tokenize(entry.content)
-            let allEntryWords = entryWords.union(contentWords)
+        let scored = memories.compactMap { entry -> (MemoryEntry, Double)? in
+            let allEntryWords = Set(entry.keywords).union(tokenize(entry.content))
 
-            var score = 0.0
+            var matchedWords = 0.0
             for word in queryWords {
                 if allEntryWords.contains(word) {
-                    score += 1.0
-                } else {
-                    // Partial prefix match (e.g. "python" matches "pythonic")
-                    for entryWord in allEntryWords where entryWord.hasPrefix(word) || word.hasPrefix(entryWord) {
-                        score += 0.5
+                    matchedWords += 1.0
+                } else if word.count >= 5 {
+                    for entryWord in allEntryWords where entryWord.count >= 5
+                        && (entryWord.hasPrefix(word) || word.hasPrefix(entryWord)) {
+                        matchedWords += 0.5
                         break
                     }
                 }
             }
 
-            // Boost by recency: newer memories get a small bonus
+            let normalizedScore = matchedWords / queryCount
+            guard normalizedScore >= 0.25 else { return nil }
+
             let ageInDays = max(1, -entry.createdAt.timeIntervalSinceNow / 86400)
             let recencyBonus = 1.0 / log2(ageInDays + 1)
-            score += recencyBonus * 0.2
-
-            return (entry, score)
+            return (entry, normalizedScore + recencyBonus * 0.05)
         }
 
         return scored
-            .filter { $0.1 > 0.3 }
             .sorted { $0.1 > $1.1 }
             .prefix(limit)
             .map { $0.0 }
@@ -154,15 +182,19 @@ final class MemoryStore {
     func extractMemories(from transcript: String, conversationTitle: String) async {
         let extractionSession = LanguageModelSession {
             """
-            Extract 1-3 important facts, preferences, or decisions from this conversation.
-            Format each fact on its own line, prefixed with keywords in brackets.
-            Example: [python, coding, preference] User prefers Python for scripting tasks.
-            Only extract genuinely useful information. If nothing notable, respond with NONE.
+            Extract 1-3 key facts or decisions from this conversation.
+            Format: [keyword1, keyword2] Fact text.
+            If nothing notable, respond: NONE
             """
         }
 
+        let extractionOptions = GenerationOptions(
+            sampling: .greedy,
+            maximumResponseTokens: 200
+        )
+
         do {
-            let response = try await extractionSession.respond(to: transcript)
+            let response = try await extractionSession.respond(to: transcript, options: extractionOptions)
             let lines = response.content.components(separatedBy: "\n").filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
 
             for line in lines {
@@ -205,11 +237,21 @@ final class MemoryStore {
     }
 
     private func saveToDisk() {
-        SharedDataManager.saveMemories(memories)
+        SharedDataManager.saveMemoriesToFile(memories)
     }
 
     private func loadFromDisk() {
-        memories = SharedDataManager.loadMemories()
+        memories = SharedDataManager.loadMemoriesFromFile()
+
+        // Recompute embeddings for any memories that don't have them
+        let service = EmbeddingService.shared
+        guard service.isAvailable else { return }
+        var changed = false
+        for i in memories.indices where memories[i].embedding == nil {
+            memories[i].embedding = service.embed(memories[i].content)
+            changed = true
+        }
+        if changed { saveToDisk() }
     }
 }
 
@@ -260,7 +302,10 @@ final class ChatViewModel: Identifiable {
     private static let maxTurnsBeforeRotation = 6
     private static let estimatedMaxTokens = 4096.0
     private static let charsPerToken = 3.5
-    static let defaultInstructions = "You are a helpful, friendly assistant. Be concise."
+
+    /// Concise system prompt optimised for the small on-device model.
+    /// Shorter instructions leave more context for the actual conversation.
+    static let defaultInstructions = "Be helpful, friendly, and concise. Answer directly."
 
     var activeInstructions: String {
         customSystemPrompt?.isEmpty == false
@@ -283,15 +328,10 @@ final class ChatViewModel: Identifiable {
                 baseInstructions: instructions,
                 conversationSummary: conversationSummary
             )
-        } else if let summary = conversationSummary {
+        } else if let summary = conversationSummary, !summary.isEmpty {
             let inst = instructions
             return LanguageModelSession {
-                """
-                \(inst)
-
-                Previous conversation context: \(summary)
-                Continue the conversation naturally.
-                """
+                "\(inst)\nContext: \(summary)"
             }
         } else {
             let inst = instructions
@@ -310,6 +350,8 @@ final class ChatViewModel: Identifiable {
         session = LanguageModelSession {
             Self.defaultInstructions
         }
+        // Eagerly load model weights + cache the system prompt prefix to reduce first-token latency
+        session.prewarm()
     }
 
     /// Rebuild the session with current orchestrator tools.
@@ -320,6 +362,12 @@ final class ChatViewModel: Identifiable {
             instructions: activeInstructions,
             conversationSummary: conversationSummary
         )
+        session.prewarm()
+    }
+
+    /// Eagerly load model weights + cache the prompt prefix to reduce first-token latency.
+    func prewarmSession() {
+        session.prewarm()
     }
 
     /// Restore from persisted data
@@ -338,6 +386,8 @@ final class ChatViewModel: Identifiable {
         session = LanguageModelSession {
             instructions
         }
+        // Only prewarm the selected/most-recent conversation to avoid loading model N times
+        // The caller (ConversationStore) will prewarm the active conversation explicitly
 
         turnCount = min(data.messages.filter { $0.role != .system }.count / 2, Self.maxTurnsBeforeRotation)
         updateContextEstimate()
@@ -454,12 +504,14 @@ final class ChatViewModel: Identifiable {
         title = "New Chat"
         contextUsage = 0
         session = createSession(instructions: activeInstructions)
+        session.prewarm()
         notifyChanged()
     }
 
     func updateSystemPrompt(_ prompt: String?) {
         customSystemPrompt = prompt
         session = createSession(instructions: activeInstructions)
+        session.prewarm()
         turnCount = 0
         contextUsage = 0
         notifyChanged()
@@ -591,10 +643,18 @@ final class ChatViewModel: Identifiable {
             return (userText, ragContext)
         }
 
+        // Format: user question FIRST, then supplementary context AFTER.
+        // This ensures the model prioritises the question and its own knowledge,
+        // treating the retrieved context as optional reference material only.
         let enriched = """
-        [\(contextBlocks.joined(separator: "\n\n"))]
-
         \(userText)
+
+        ---
+        Note: The following is supplementary reference material that MAY be relevant. \
+        Only use it if it directly relates to the question above. \
+        Otherwise rely on your own knowledge.
+
+        \(contextBlocks.joined(separator: "\n\n"))
         """
         return (enriched, ragContext)
     }
@@ -637,7 +697,8 @@ final class ChatViewModel: Identifiable {
     }
 
     private func rotateSession() async {
-        let recentMessages = messages.suffix(8)
+        // Only summarise the most recent turns — keeps the summary focused
+        let recentMessages = messages.suffix(6)
         let transcript = recentMessages.map { msg in
             let label = msg.role == .user ? "User" : "Assistant"
             return "\(label): \(msg.content)"
@@ -648,17 +709,22 @@ final class ChatViewModel: Identifiable {
             await store.extractMemories(from: transcript, conversationTitle: title)
         }
 
-        // Summarize for the new session
+        // Summarise for the new session — use greedy sampling for a deterministic, focused summary
         let summarySession = LanguageModelSession {
-            "Summarize the following conversation in 2-3 short sentences. Capture key topics and decisions."
+            "Summarize this conversation in 2 concise sentences. State only topics discussed and decisions made."
         }
+
+        let greedyOptions = GenerationOptions(
+            sampling: .greedy,
+            maximumResponseTokens: 150
+        )
 
         let summary: String
         do {
-            let response = try await summarySession.respond(to: transcript)
+            let response = try await summarySession.respond(to: transcript, options: greedyOptions)
             summary = response.content
         } catch {
-            summary = conversationSummary ?? "Previous conversation context unavailable."
+            summary = conversationSummary ?? ""
         }
 
         conversationSummary = summary
@@ -667,6 +733,7 @@ final class ChatViewModel: Identifiable {
             instructions: activeInstructions,
             conversationSummary: summary
         )
+        session.prewarm()
         turnCount = 0
 
         messages.append(Message(role: .system, content: "Context refreshed — I still remember the key points."))
@@ -728,9 +795,9 @@ struct RAGContext {
 struct RAGSettings: Codable, Sendable {
     var memoryRetrievalEnabled: Bool = true
     var knowledgeBaseRetrievalEnabled: Bool = true
-    var maxMemoryResults: Int = 3
-    var maxDocumentChunks: Int = 2
-    var contextBudgetCharacters: Int = 3500
+    var maxMemoryResults: Int = 2
+    var maxDocumentChunks: Int = 3
+    var contextBudgetCharacters: Int = 1500
     var autoExtractMemories: Bool = true
 
     static let `default` = RAGSettings()
@@ -766,6 +833,8 @@ final class ConversationStore {
                 conversation.orchestrator = orchestrator
                 conversation.onChange { [weak self] in self?.saveToDisk() }
             }
+            // Prewarm only the selected conversation for fast first response
+            selectedConversation()?.prewarmSession()
         }
     }
 
@@ -853,6 +922,25 @@ final class ConversationStore {
                 await conversation.send(text)
             }
         }
+    }
+
+    // MARK: - Storage Statistics
+
+    /// Estimated byte size of persisted conversation data.
+    var conversationDataSize: Int {
+        let data = try? JSONEncoder().encode(conversations.map { $0.conversationData })
+        return data?.count ?? 0
+    }
+
+    /// Estimated byte size of persisted memory data.
+    var memoryDataSize: Int {
+        let data = try? JSONEncoder().encode(memoryStore.memories)
+        return data?.count ?? 0
+    }
+
+    /// Total approximate on-disk footprint (conversations + memories + knowledge bases).
+    var totalStorageBytes: Int64 {
+        Int64(conversationDataSize) + Int64(memoryDataSize) + knowledgeBaseStore.totalChunkStorageSize
     }
 
     // MARK: - Persistence

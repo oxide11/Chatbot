@@ -31,13 +31,18 @@ struct KnowledgeBase: Identifiable, Codable, Sendable {
     var chunkCount: Int
     let fileSize: Int64
 
-    init(id: UUID = UUID(), name: String, documentType: DocumentType, chunkCount: Int, fileSize: Int64) {
+    /// The model identifier that produced the stored embeddings.
+    /// Used to detect when re-embedding is needed (e.g. after an OS update).
+    var embeddingModelID: String?
+
+    nonisolated init(id: UUID = UUID(), name: String, documentType: DocumentType, chunkCount: Int, fileSize: Int64, embeddingModelID: String? = nil) {
         self.id = id
         self.name = name
         self.documentType = documentType
         self.createdAt = Date()
         self.chunkCount = chunkCount
         self.fileSize = fileSize
+        self.embeddingModelID = embeddingModelID
     }
 }
 
@@ -49,13 +54,69 @@ struct DocumentChunk: Identifiable, Codable, Sendable {
     let locationLabel: String
     let index: Int
 
-    init(knowledgeBaseID: UUID, content: String, keywords: [String], locationLabel: String, index: Int) {
+    /// Semantic embedding vector (512-dim from NLContextualEmbedding).
+    /// Optional for backward compatibility with chunks created before embeddings.
+    var embedding: [Double]?
+
+    nonisolated init(knowledgeBaseID: UUID, content: String, keywords: [String], locationLabel: String, index: Int, embedding: [Double]? = nil) {
         self.id = UUID()
         self.knowledgeBaseID = knowledgeBaseID
         self.content = content
         self.keywords = keywords.map { $0.lowercased() }
         self.locationLabel = locationLabel
         self.index = index
+        self.embedding = embedding
+    }
+}
+
+// MARK: - Ingestion Job
+
+struct IngestionJob: Identifiable {
+    let id: UUID
+    let url: URL
+    let fileName: String
+    var status: IngestionStatus
+
+    /// Whether this job has finished (completed or failed).
+    var isFinished: Bool {
+        switch status {
+        case .completed, .failed: return true
+        case .queued, .processing: return false
+        }
+    }
+
+    enum IngestionStatus: Equatable {
+        case queued
+        case processing
+        case completed
+        case failed(String)
+
+        var label: String {
+            switch self {
+            case .queued: return "Queued"
+            case .processing: return "Processing…"
+            case .completed: return "Done"
+            case .failed(let msg): return msg
+            }
+        }
+
+        var icon: String {
+            switch self {
+            case .queued: return "clock"
+            case .processing: return "arrow.trianglehead.2.clockwise"
+            case .completed: return "checkmark.circle.fill"
+            case .failed: return "exclamationmark.triangle.fill"
+            }
+        }
+
+        var iconColor: String {
+            switch self {
+            case .queued: return "secondary"
+            case .processing: return "blue"
+            case .completed: return "green"
+            case .failed: return "red"
+            }
+        }
     }
 }
 
@@ -68,110 +129,263 @@ final class KnowledgeBaseStore {
     private(set) var processingProgress: Double = 0
     private(set) var processingError: String?
 
+    /// Batch ingestion queue
+    private(set) var ingestionQueue: [IngestionJob] = []
+    private var isQueueRunning = false
+
     private var chunkCache: [UUID: [DocumentChunk]] = [:]
+
+    /// Pre-computed embedding matrix for fast batch similarity scoring.
+    /// Invalidated whenever chunks are added, removed, or re-embedded.
+    private var embeddingMatrix: EmbeddingMatrix?
 
     private static let metadataFilename = "knowledge_bases.json"
 
     init() {
         loadMetadata()
+        reembedStaleKnowledgeBasesIfNeeded()
+    }
+
+    // MARK: - Embedding Maintenance
+
+    /// Re-embed any knowledge bases whose stored model ID doesn't match
+    /// the current device's embedding model (e.g. after an OS update).
+    /// Also embeds chunks that were imported before embeddings were available.
+    /// Runs synchronously on init but the actual embedding is fast (~ms per chunk).
+    private func reembedStaleKnowledgeBasesIfNeeded() {
+        let service = EmbeddingService.shared
+        guard service.isAvailable else { return }
+        let currentModelID = service.modelIdentifier
+
+        for i in knowledgeBases.indices {
+            let kb = knowledgeBases[i]
+
+            // Skip if already embedded with the current model
+            if kb.embeddingModelID == currentModelID { continue }
+
+            // Load chunks, re-embed, and save
+            var chunks = loadChunks(for: kb.id)
+            guard !chunks.isEmpty else { continue }
+
+            for j in chunks.indices {
+                chunks[j].embedding = service.embed(chunks[j].content)
+            }
+
+            saveChunks(chunks, for: kb.id)
+            chunkCache[kb.id] = chunks
+            invalidateEmbeddingMatrix()
+            invertedKeywordIndex.removeAll()
+
+            // Update the model stamp
+            knowledgeBases[i].embeddingModelID = currentModelID
+        }
+
+        saveMetadata()
     }
 
     // MARK: - Ingestion Pipeline
 
-    func ingestDocument(from url: URL) async {
-        await MainActor.run {
-            isProcessing = true
-            processingProgress = 0
-            processingError = nil
+    /// Queue one or more documents for ingestion. Processing runs sequentially.
+    func queueDocuments(from urls: [URL]) {
+        for url in urls {
+            let job = IngestionJob(
+                id: UUID(),
+                url: url,
+                fileName: url.deletingPathExtension().lastPathComponent,
+                status: .queued
+            )
+            ingestionQueue.append(job)
         }
 
-        let accessing = url.startAccessingSecurityScopedResource()
-        defer { if accessing { url.stopAccessingSecurityScopedResource() } }
+        if !isQueueRunning {
+            Task { await processQueue() }
+        }
+    }
 
+    /// Legacy single-file entry point (kept for Share Extension / programmatic use).
+    func ingestDocument(from url: URL) async {
+        queueDocuments(from: [url])
+        // Wait for queue to finish so callers that `await` still work
+        while isQueueRunning || ingestionQueue.contains(where: { $0.status == .queued }) {
+            try? await Task.sleep(for: .milliseconds(200))
+        }
+    }
+
+    /// Cancel all remaining queued (not yet started) jobs.
+    func cancelQueue() {
+        for i in ingestionQueue.indices {
+            if ingestionQueue[i].status == .queued {
+                ingestionQueue[i].status = .failed("Cancelled")
+            }
+        }
+    }
+
+    /// Remove a completed or failed job from the queue display.
+    func removeJob(_ job: IngestionJob) {
+        ingestionQueue.removeAll { $0.id == job.id }
+    }
+
+    /// Clear all completed/failed jobs from the queue.
+    func clearFinishedJobs() {
+        ingestionQueue.removeAll { job in
+            job.isFinished
+        }
+    }
+
+    // MARK: - Queue Processor
+
+    private func processQueue() async {
+        isQueueRunning = true
+        isProcessing = true
+        processingError = nil
+
+        while let nextIndex = ingestionQueue.firstIndex(where: { $0.status == .queued }) {
+            ingestionQueue[nextIndex].status = .processing
+            updateOverallProgress()
+
+            let job = ingestionQueue[nextIndex]
+
+            // Security-scoped access must start on the calling thread
+            let accessing = job.url.startAccessingSecurityScopedResource()
+
+            // Run all heavy work (extraction, chunking, embedding, file I/O) off the main actor
+            let outcome = await Task.detached(priority: .userInitiated) {
+                await Self.ingestSingleDocument(url: job.url)
+            }.value
+
+            if accessing { job.url.stopAccessingSecurityScopedResource() }
+
+            // Update UI state back on MainActor
+            if let idx = ingestionQueue.firstIndex(where: { $0.id == job.id }) {
+                switch outcome {
+                case .success(let result):
+                    ingestionQueue[idx].status = .completed
+                    knowledgeBases.insert(result.kb, at: 0)
+                    chunkCache[result.kb.id] = result.chunks
+                    invalidateEmbeddingMatrix()
+                    invertedKeywordIndex.removeAll()
+                    saveMetadata()
+                case .failure(let reason):
+                    ingestionQueue[idx].status = .failed(reason)
+                }
+            }
+            updateOverallProgress()
+        }
+
+        isQueueRunning = false
+        isProcessing = false
+        processingProgress = ingestionQueue.isEmpty ? 0 : 1.0
+    }
+
+    /// Compute overall progress across all jobs in the queue.
+    private func updateOverallProgress() {
+        guard !ingestionQueue.isEmpty else {
+            processingProgress = 0
+            return
+        }
+        let total = Double(ingestionQueue.count)
+        var completed = 0.0
+        for job in ingestionQueue {
+            switch job.status {
+            case .completed, .failed: completed += 1.0
+            case .processing: completed += 0.5
+            case .queued: break
+            }
+        }
+        processingProgress = completed / total
+    }
+
+    // MARK: - Background Ingestion (off main actor)
+
+    /// Result of a successful ingestion, ready to merge into the store.
+    private struct IngestionResult: Sendable {
+        let kb: KnowledgeBase
+        let chunks: [DocumentChunk]
+    }
+
+    /// Outcome of a background ingestion job.
+    private enum IngestionOutcome: Sendable {
+        case success(IngestionResult)
+        case failure(String)
+    }
+
+    /// Perform the entire document ingestion pipeline off the main actor.
+    /// This is a static nonisolated method so it runs on a background thread.
+    nonisolated private static func ingestSingleDocument(
+        url: URL
+    ) async -> IngestionOutcome {
         let ext = url.pathExtension.lowercased()
         guard ext == "pdf" || ext == "epub" else {
-            await MainActor.run {
-                processingError = "Unsupported file type: .\(ext)"
-                isProcessing = false
-            }
-            return
+            return .failure("Unsupported: .\(ext)")
         }
 
         let docType: DocumentType = ext == "pdf" ? .pdf : .epub
         let fileSize = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int64) ?? 0
         let kbID = UUID()
 
-        await MainActor.run { processingProgress = 0.05 }
-
-        // Extract text
+        // Extract text (CPU-heavy)
         let sections: [(label: String, text: String)]
         if docType == .pdf {
-            sections = extractTextFromPDF(at: url)
+            sections = extractTextFromPDFBackground(at: url)
         } else {
-            sections = (try? extractTextFromEPUB(at: url)) ?? []
+            sections = (try? extractTextFromEPUBBackground(at: url)) ?? []
         }
 
         guard !sections.isEmpty else {
-            await MainActor.run {
-                processingError = "No text content found in this document."
-                isProcessing = false
-            }
-            return
+            return .failure("No text content found")
         }
 
-        await MainActor.run { processingProgress = 0.2 }
-
-        // Chunk all sections
+        // Chunk all sections (CPU-heavy)
         var allChunks: [DocumentChunk] = []
         var chunkIndex = 0
-        let totalSections = Double(sections.count)
 
-        for (i, section) in sections.enumerated() {
-            let sectionChunks = chunkText(
+        for section in sections {
+            let sectionChunks = chunkTextBackground(
                 section.text,
                 locationLabel: section.label,
                 knowledgeBaseID: kbID,
                 startIndex: &chunkIndex
             )
             allChunks.append(contentsOf: sectionChunks)
-
-            await MainActor.run {
-                processingProgress = 0.2 + (Double(i + 1) / totalSections) * 0.6
-            }
         }
 
         guard !allChunks.isEmpty else {
-            await MainActor.run {
-                processingError = "Could not create any chunks from this document."
-                isProcessing = false
-            }
-            return
+            return .failure("No chunks created")
         }
 
-        // Save
+        // Compute semantic embeddings (CPU-heavy — BERT inference)
+        let embeddingService = EmbeddingService.shared
+        if embeddingService.isAvailable {
+            for i in allChunks.indices {
+                allChunks[i].embedding = embeddingService.embed(allChunks[i].content)
+            }
+        }
+
+        // Write chunk file to disk (I/O)
         let kb = KnowledgeBase(
             id: kbID,
             name: url.deletingPathExtension().lastPathComponent,
             documentType: docType,
             chunkCount: allChunks.count,
-            fileSize: fileSize
+            fileSize: fileSize,
+            embeddingModelID: embeddingService.isAvailable ? embeddingService.modelIdentifier : nil
         )
 
-        saveChunks(allChunks, for: kbID)
-
-        await MainActor.run {
-            processingProgress = 0.95
-            knowledgeBases.insert(kb, at: 0)
-            chunkCache[kbID] = allChunks
-            saveMetadata()
-            processingProgress = 1.0
-            isProcessing = false
+        SharedDataManager.ensureDirectoriesExist()
+        if let dir = SharedDataManager.chunksDirectoryURL {
+            let fileURL = dir.appendingPathComponent("\(kbID.uuidString).json")
+            try? JSONEncoder().encode(allChunks).write(to: fileURL)
         }
+
+        return .success(IngestionResult(kb: kb, chunks: allChunks))
     }
 
-    // MARK: - PDF Extraction
+    // MARK: - Background-safe Extraction & Chunking (nonisolated static)
+    //
+    // These are pure functions with no instance state access, safe to call from
+    // any thread via Task.detached. The instance methods above delegate to these.
 
-    private func extractTextFromPDF(at url: URL) -> [(label: String, text: String)] {
+    nonisolated private static func extractTextFromPDFBackground(at url: URL) -> [(label: String, text: String)] {
         guard let document = PDFDocument(url: url) else { return [] }
         var pages: [(String, String)] = []
         for i in 0..<document.pageCount {
@@ -184,56 +398,48 @@ final class KnowledgeBaseStore {
         return pages
     }
 
-    // MARK: - ePUB Extraction
-
-    private func extractTextFromEPUB(at url: URL) throws -> [(label: String, text: String)] {
-        // Copy to temp to ensure file access
+    nonisolated private static func extractTextFromEPUBBackground(at url: URL) throws -> [(label: String, text: String)] {
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
-        // Extract ZIP contents
-        let entries = try extractZIP(at: url, to: tempDir)
+        let entries = try extractZIPBackground(at: url, to: tempDir)
         guard !entries.isEmpty else { return [] }
 
-        // Find container.xml → OPF path
         let containerURL = tempDir.appendingPathComponent("META-INF/container.xml")
         guard let containerData = try? Data(contentsOf: containerURL),
               let containerStr = String(data: containerData, encoding: .utf8),
-              let opfPath = parseOPFPath(from: containerStr) else {
-            // Fallback: find all .xhtml/.html files
-            return extractTextFromAllHTML(in: tempDir, entries: entries)
+              let opfPath = parseOPFPathBackground(from: containerStr) else {
+            return extractTextFromAllHTMLBackground(in: tempDir, entries: entries)
         }
 
-        // Parse OPF manifest for spine order
         let opfURL = tempDir.appendingPathComponent(opfPath)
         let opfDir = opfURL.deletingLastPathComponent()
         guard let opfData = try? Data(contentsOf: opfURL),
               let opfStr = String(data: opfData, encoding: .utf8) else {
-            return extractTextFromAllHTML(in: tempDir, entries: entries)
+            return extractTextFromAllHTMLBackground(in: tempDir, entries: entries)
         }
 
-        let spineFiles = parseSpineFiles(from: opfStr)
+        let spineFiles = parseSpineFilesBackground(from: opfStr)
         guard !spineFiles.isEmpty else {
-            return extractTextFromAllHTML(in: tempDir, entries: entries)
+            return extractTextFromAllHTMLBackground(in: tempDir, entries: entries)
         }
 
-        // Extract text from spine-ordered XHTML files
         var chapters: [(String, String)] = []
         for (i, filename) in spineFiles.enumerated() {
             let fileURL = opfDir.appendingPathComponent(filename)
             guard let htmlData = try? Data(contentsOf: fileURL),
                   let html = String(data: htmlData, encoding: .utf8) else { continue }
-            let text = stripHTMLTags(html)
+            let text = stripHTMLTagsBackground(html)
             if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 chapters.append(("Chapter \(i + 1)", text))
             }
         }
 
-        return chapters.isEmpty ? extractTextFromAllHTML(in: tempDir, entries: entries) : chapters
+        return chapters.isEmpty ? extractTextFromAllHTMLBackground(in: tempDir, entries: entries) : chapters
     }
 
-    private func extractTextFromAllHTML(in directory: URL, entries: [String]) -> [(label: String, text: String)] {
+    nonisolated private static func extractTextFromAllHTMLBackground(in directory: URL, entries: [String]) -> [(label: String, text: String)] {
         var results: [(String, String)] = []
         let htmlEntries = entries.filter { $0.hasSuffix(".xhtml") || $0.hasSuffix(".html") || $0.hasSuffix(".htm") }
             .sorted()
@@ -242,7 +448,7 @@ final class KnowledgeBaseStore {
             let fileURL = directory.appendingPathComponent(entry)
             guard let data = try? Data(contentsOf: fileURL),
                   let html = String(data: data, encoding: .utf8) else { continue }
-            let text = stripHTMLTags(html)
+            let text = stripHTMLTagsBackground(html)
             if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 results.append(("Section \(i + 1)", text))
             }
@@ -250,18 +456,14 @@ final class KnowledgeBaseStore {
         return results
     }
 
-    /// Parse the OPF file path from container.xml
-    private func parseOPFPath(from xml: String) -> String? {
-        // Look for: <rootfile ... full-path="OEBPS/content.opf" .../>
+    nonisolated private static func parseOPFPathBackground(from xml: String) -> String? {
         guard let range = xml.range(of: "full-path=\"[^\"]+\"", options: .regularExpression) else { return nil }
         let match = String(xml[range])
         return match.replacingOccurrences(of: "full-path=\"", with: "")
             .replacingOccurrences(of: "\"", with: "")
     }
 
-    /// Parse the spine-ordered content file list from OPF
-    private func parseSpineFiles(from opf: String) -> [String] {
-        // 1. Build manifest id → href map
+    nonisolated private static func parseSpineFilesBackground(from opf: String) -> [String] {
         var manifest: [String: String] = [:]
         let itemPattern = "<item[^>]*>"
         if let itemRegex = try? NSRegularExpression(pattern: itemPattern) {
@@ -269,16 +471,14 @@ final class KnowledgeBaseStore {
             for match in matches {
                 guard let range = Range(match.range, in: opf) else { continue }
                 let tag = String(opf[range])
-
-                let idValue = extractAttribute("id", from: tag)
-                let hrefValue = extractAttribute("href", from: tag)
+                let idValue = extractAttributeBackground("id", from: tag)
+                let hrefValue = extractAttributeBackground("href", from: tag)
                 if let id = idValue, let href = hrefValue {
                     manifest[id] = href
                 }
             }
         }
 
-        // 2. Parse spine order
         var spineIDs: [String] = []
         let itemrefPattern = "<itemref[^>]*>"
         if let itemrefRegex = try? NSRegularExpression(pattern: itemrefPattern) {
@@ -286,17 +486,16 @@ final class KnowledgeBaseStore {
             for match in matches {
                 guard let range = Range(match.range, in: opf) else { continue }
                 let tag = String(opf[range])
-                if let idref = extractAttribute("idref", from: tag) {
+                if let idref = extractAttributeBackground("idref", from: tag) {
                     spineIDs.append(idref)
                 }
             }
         }
 
-        // 3. Resolve to file paths
         return spineIDs.compactMap { manifest[$0] }
     }
 
-    private func extractAttribute(_ name: String, from tag: String) -> String? {
+    nonisolated private static func extractAttributeBackground(_ name: String, from tag: String) -> String? {
         let pattern = "\(name)=\"([^\"]*)\""
         guard let regex = try? NSRegularExpression(pattern: pattern),
               let match = regex.firstMatch(in: tag, range: NSRange(tag.startIndex..., in: tag)),
@@ -304,8 +503,7 @@ final class KnowledgeBaseStore {
         return String(tag[range])
     }
 
-    /// Strip HTML tags using regex (safe for background threads, unlike NSAttributedString)
-    private func stripHTMLTags(_ html: String) -> String {
+    nonisolated private static func stripHTMLTagsBackground(_ html: String) -> String {
         html
             .replacingOccurrences(of: "<style[^>]*>[\\s\\S]*?</style>", with: " ", options: .regularExpression)
             .replacingOccurrences(of: "<script[^>]*>[\\s\\S]*?</script>", with: " ", options: .regularExpression)
@@ -323,15 +521,12 @@ final class KnowledgeBaseStore {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    // MARK: - Minimal ZIP Extractor
-
-    private func extractZIP(at url: URL, to destination: URL) throws -> [String] {
+    nonisolated private static func extractZIPBackground(at url: URL, to destination: URL) throws -> [String] {
         let fileData = try Data(contentsOf: url)
         var extractedPaths: [String] = []
         var offset = 0
 
         while offset + 30 <= fileData.count {
-            // Local file header signature: 0x04034b50
             let sig = fileData.subdata(in: offset..<offset + 4)
             guard sig == Data([0x50, 0x4B, 0x03, 0x04]) else { break }
 
@@ -341,7 +536,6 @@ final class KnowledgeBaseStore {
             let nameLength = Int(fileData.subdata(in: offset + 26..<offset + 28).withUnsafeBytes { $0.load(as: UInt16.self) })
             let extraLength = Int(fileData.subdata(in: offset + 28..<offset + 30).withUnsafeBytes { $0.load(as: UInt16.self) })
 
-            // Guard against malformed entries with nonsensical sizes
             guard compressedSize >= 0, uncompressedSize >= 0, nameLength > 0 else { break }
 
             let nameStart = offset + 30
@@ -357,16 +551,13 @@ final class KnowledgeBaseStore {
             let dataEnd = dataStart + compressedSize
             guard dataEnd <= fileData.count else { break }
 
-            // Skip directories
             if !name.hasSuffix("/") {
                 let entryData: Data
                 if compressionMethod == 0 {
-                    // Stored (no compression)
                     entryData = fileData.subdata(in: dataStart..<dataEnd)
                 } else if compressionMethod == 8 {
-                    // Deflate
                     let compressed = fileData.subdata(in: dataStart..<dataEnd)
-                    guard let decompressed = decompress(compressed, expectedSize: uncompressedSize) else {
+                    guard let decompressed = decompressBackground(compressed, expectedSize: uncompressedSize) else {
                         offset = dataEnd
                         continue
                     }
@@ -389,9 +580,7 @@ final class KnowledgeBaseStore {
         return extractedPaths
     }
 
-    /// Decompress deflate data using the Compression framework
-    private func decompress(_ data: Data, expectedSize: Int) -> Data? {
-        // Sanity limit: refuse to allocate more than 100 MB for a single entry
+    nonisolated private static func decompressBackground(_ data: Data, expectedSize: Int) -> Data? {
         let maxAllowedSize = 100 * 1024 * 1024
         let bufferSize = min(max(expectedSize, 1024), maxAllowedSize)
         guard bufferSize > 0 else { return nil }
@@ -413,12 +602,80 @@ final class KnowledgeBaseStore {
         return Data(bytes: destinationBuffer, count: result)
     }
 
+    /// Background-safe chunking (nonisolated static).
+    nonisolated private static func chunkTextBackground(
+        _ text: String,
+        locationLabel: String,
+        knowledgeBaseID: UUID,
+        startIndex: inout Int
+    ) -> [DocumentChunk] {
+        let config = Self.chunkingConfig
+        var chunks: [DocumentChunk] = []
+        let paragraphs = text.components(separatedBy: "\n\n")
+            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+
+        var currentChunk = ""
+
+        for paragraph in paragraphs {
+            let trimmed = paragraph.trimmingCharacters(in: .whitespaces)
+            if currentChunk.count + trimmed.count + 2 > config.targetCharacters
+                && currentChunk.count >= config.minChunkCharacters {
+                let keywords = Array(SharedDataManager.extractKeywords(from: currentChunk, limit: 8))
+                chunks.append(DocumentChunk(
+                    knowledgeBaseID: knowledgeBaseID,
+                    content: currentChunk.trimmingCharacters(in: .whitespacesAndNewlines),
+                    keywords: keywords,
+                    locationLabel: locationLabel,
+                    index: startIndex
+                ))
+                startIndex += 1
+
+                let overlapStart = max(0, currentChunk.count - config.overlapCharacters)
+                let overlapIdx = currentChunk.index(currentChunk.startIndex, offsetBy: overlapStart)
+                currentChunk = String(currentChunk[overlapIdx...]) + "\n\n" + trimmed
+            } else {
+                if !currentChunk.isEmpty { currentChunk += "\n\n" }
+                currentChunk += trimmed
+            }
+        }
+
+        let remaining = currentChunk.trimmingCharacters(in: .whitespacesAndNewlines)
+        if remaining.count >= config.minChunkCharacters {
+            let keywords = Array(SharedDataManager.extractKeywords(from: remaining, limit: 8))
+            chunks.append(DocumentChunk(
+                knowledgeBaseID: knowledgeBaseID,
+                content: remaining,
+                keywords: keywords,
+                locationLabel: locationLabel,
+                index: startIndex
+            ))
+            startIndex += 1
+        } else if !remaining.isEmpty, let last = chunks.indices.last {
+            chunks[last] = DocumentChunk(
+                knowledgeBaseID: knowledgeBaseID,
+                content: chunks[last].content + "\n\n" + remaining,
+                keywords: Array(SharedDataManager.extractKeywords(
+                    from: chunks[last].content + " " + remaining, limit: 8
+                )),
+                locationLabel: chunks[last].locationLabel,
+                index: chunks[last].index
+            )
+        }
+
+        return chunks
+    }
+
     // MARK: - Chunking
 
-    private struct ChunkingConfig {
-        let targetCharacters = 3000
-        let overlapCharacters = 300
-        let minChunkCharacters = 200
+    nonisolated private static let chunkingConfig = ChunkingConfig()
+
+    private struct ChunkingConfig: Sendable {
+        /// ~600 chars ≈ ~170 tokens — small enough for 2-3 chunks to fit
+        /// inside the RAG context budget while remaining topically focused.
+        let targetCharacters = 600
+        /// ~100 chars of overlap prevents hard cuts mid-thought.
+        let overlapCharacters = 100
+        let minChunkCharacters = 150
     }
 
     private func chunkText(
@@ -427,7 +684,7 @@ final class KnowledgeBaseStore {
         knowledgeBaseID: UUID,
         startIndex: inout Int
     ) -> [DocumentChunk] {
-        let config = ChunkingConfig()
+        let config = Self.chunkingConfig
         var chunks: [DocumentChunk] = []
         let paragraphs = text.components(separatedBy: "\n\n")
             .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
@@ -487,22 +744,259 @@ final class KnowledgeBaseStore {
         return chunks
     }
 
-    // MARK: - Retrieval
+    // MARK: - Retrieval (Accelerate-optimized)
 
-    /// Pre-computed keyword sets for each chunk, avoiding repeated tokenization of full content.
+    /// Pre-computed keyword sets for each chunk (used as fallback when embeddings are unavailable).
     private var chunkKeywordCache: [UUID: Set<String>] = [:]
 
-    func retrieve(for query: String, limit: Int = 2) -> [DocumentChunk] {
+    /// Inverted keyword index: word → set of chunk UUIDs that contain that word.
+    /// Used for fast two-phase retrieval (keyword pre-filter → semantic re-rank).
+    private var invertedKeywordIndex: [String: Set<UUID>] = [:]
+
+    /// Rebuild the embedding matrix from the current chunk cache.
+    /// Call this after chunks are loaded, added, removed, or re-embedded.
+    private func rebuildEmbeddingMatrix() {
+        let dim = EmbeddingService.shared.dimension
+        guard dim > 0 else {
+            embeddingMatrix = nil
+            return
+        }
+        embeddingMatrix = EmbeddingMatrix.build(from: chunkCache, dimension: dim)
+    }
+
+    /// Invalidate the embedding matrix so it will be rebuilt on next retrieval.
+    private func invalidateEmbeddingMatrix() {
+        embeddingMatrix = nil
+    }
+
+    /// Rebuild the inverted keyword index from the current chunk cache.
+    private func rebuildInvertedIndex() {
+        invertedKeywordIndex.removeAll()
+        for (_, chunks) in chunkCache {
+            for chunk in chunks {
+                let words: Set<String>
+                if let cached = chunkKeywordCache[chunk.id] {
+                    words = cached
+                } else {
+                    let computed = Set(chunk.keywords).union(SharedDataManager.tokenize(chunk.content))
+                    chunkKeywordCache[chunk.id] = computed
+                    words = computed
+                }
+                for word in words {
+                    invertedKeywordIndex[word, default: []].insert(chunk.id)
+                }
+            }
+        }
+    }
+
+    /// Retrieve the most relevant document chunks for a query.
+    ///
+    /// **Primary path:** Batch cosine similarity via Accelerate/vDSP against the
+    /// pre-computed embedding matrix. With many chunks, uses a two-phase approach:
+    /// keyword pre-filter → semantic re-rank on the smaller candidate set.
+    ///
+    /// **Fallback:** Keyword overlap (used when embedding assets aren't downloaded yet
+    /// or chunks were imported before embeddings were available).
+    func retrieve(for query: String, limit: Int = 3) -> [DocumentChunk] {
+        ensureAllChunksLoaded()
+
+        let embeddingService = EmbeddingService.shared
+
+        // Try semantic retrieval first
+        if let queryVector = embeddingService.embed(query) {
+            return retrieveBySimilarity(queryVector: queryVector, query: query, limit: limit)
+        }
+
+        // Fallback: keyword matching
+        return retrieveByKeywords(query: query, limit: limit)
+    }
+
+    /// Semantic retrieval using Accelerate-powered batch cosine similarity.
+    ///
+    /// For small corpora (< 200 chunks), does a full matrix scan — this is extremely
+    /// fast with vDSP/BLAS (~microseconds for 1000 × 512 matrix).
+    ///
+    /// For larger corpora (≥ 200 chunks), uses two-phase retrieval:
+    /// 1. **Keyword pre-filter:** Use the inverted index to find candidate chunks
+    ///    that share at least one keyword with the query.
+    /// 2. **Semantic re-rank:** Score only the candidate subset using cosine similarity.
+    ///
+    /// This avoids scoring thousands of irrelevant chunks while maintaining recall.
+    private func retrieveBySimilarity(queryVector: [Double], query: String, limit: Int) -> [DocumentChunk] {
+        // Ensure the embedding matrix is built
+        if embeddingMatrix == nil {
+            rebuildEmbeddingMatrix()
+        }
+        guard let matrix = embeddingMatrix, matrix.rowCount > 0 else {
+            return [] // No embedded chunks available
+        }
+
+        // Determine total chunk count for strategy selection
+        let totalChunks = matrix.rowCount
+
+        // Two-phase for large corpora
+        if totalChunks >= 200 {
+            return twoPhaseRetrieval(queryVector: queryVector, query: query, limit: limit, matrix: matrix)
+        }
+
+        // Full matrix scan for small corpora — fast enough with Accelerate
+        return fullMatrixRetrieval(queryVector: queryVector, limit: limit, matrix: matrix)
+    }
+
+    /// Full matrix batch cosine similarity — scores all chunks at once via BLAS.
+    private func fullMatrixRetrieval(queryVector: [Double], limit: Int, matrix: EmbeddingMatrix) -> [DocumentChunk] {
+        let similarities = EmbeddingService.batchCosineSimilarity(
+            query: queryVector,
+            matrix: matrix.data,
+            norms: matrix.norms,
+            dimension: matrix.dimension
+        )
+
+        // Top-K selection using partial sort (faster than full sort for small K)
+        return topK(similarities: similarities, matrix: matrix, limit: limit, threshold: 0.3)
+    }
+
+    /// Two-phase retrieval: keyword pre-filter → semantic re-rank.
+    private func twoPhaseRetrieval(queryVector: [Double], query: String, limit: Int, matrix: EmbeddingMatrix) -> [DocumentChunk] {
+        // Build inverted index if needed
+        if invertedKeywordIndex.isEmpty {
+            rebuildInvertedIndex()
+        }
+
+        // Phase 1: Keyword pre-filter — find candidate chunk IDs
+        let queryWords = SharedDataManager.tokenize(query)
+        var candidateChunkIDs = Set<UUID>()
+        for word in queryWords {
+            if let chunkIDs = invertedKeywordIndex[word] {
+                candidateChunkIDs.formUnion(chunkIDs)
+            }
+            // Also check prefix matches for longer words
+            if word.count >= 5 {
+                for (indexWord, chunkIDs) in invertedKeywordIndex where indexWord.count >= 5 {
+                    if indexWord.hasPrefix(word) || word.hasPrefix(indexWord) {
+                        candidateChunkIDs.formUnion(chunkIDs)
+                    }
+                }
+            }
+        }
+
+        // If keyword filter finds very few candidates or none, fall back to full scan
+        // (the query might use different vocabulary than the documents)
+        let minCandidates = max(limit * 3, 20)
+        if candidateChunkIDs.count < minCandidates {
+            return fullMatrixRetrieval(queryVector: queryVector, limit: limit, matrix: matrix)
+        }
+
+        // Phase 2: Build a smaller matrix from candidates and score with Accelerate
+        let dim = matrix.dimension
+        var subMatrix: [Double] = []
+        var subNorms: [Double] = []
+        var subRowMap: [(UUID, Int)] = []
+
+        subMatrix.reserveCapacity(candidateChunkIDs.count * dim)
+
+        for (rowIdx, mapping) in matrix.rowMap.enumerated() {
+            let chunk = chunkCache[mapping.knowledgeBaseID]?[mapping.chunkIndex]
+            guard let chunk, candidateChunkIDs.contains(chunk.id) else { continue }
+
+            // Copy this row's embedding from the full matrix
+            let start = rowIdx * dim
+            let end = start + dim
+            subMatrix.append(contentsOf: matrix.data[start ..< end])
+            subNorms.append(matrix.norms[rowIdx])
+            subRowMap.append(mapping)
+        }
+
+        guard !subRowMap.isEmpty else {
+            return fullMatrixRetrieval(queryVector: queryVector, limit: limit, matrix: matrix)
+        }
+
+        let similarities = EmbeddingService.batchCosineSimilarity(
+            query: queryVector,
+            matrix: subMatrix,
+            norms: subNorms,
+            dimension: dim
+        )
+
+        // Use the sub-matrix row map for resolution
+        let subEmbeddingMatrix = EmbeddingMatrix(
+            data: subMatrix,
+            norms: subNorms,
+            dimension: dim,
+            rowCount: subRowMap.count,
+            rowMap: subRowMap
+        )
+
+        return topK(similarities: similarities, matrix: subEmbeddingMatrix, limit: limit, threshold: 0.3)
+    }
+
+    /// Extract the top-K results from a similarity array using partial sort.
+    /// More efficient than full sort when K << N.
+    private func topK(similarities: [Double], matrix: EmbeddingMatrix, limit: Int, threshold: Double) -> [DocumentChunk] {
+        // Use a min-heap approach: maintain the K best scores
+        // For typical K=3 and N=1000+, this is O(N log K) vs O(N log N) for full sort
+        struct ScoredRow: Comparable {
+            let rowIndex: Int
+            let score: Double
+            static func < (lhs: ScoredRow, rhs: ScoredRow) -> Bool { lhs.score < rhs.score }
+        }
+
+        var heap: [ScoredRow] = []
+        heap.reserveCapacity(limit + 1)
+
+        for i in 0 ..< similarities.count {
+            let score = similarities[i]
+            guard score > threshold else { continue }
+
+            if heap.count < limit {
+                heap.append(ScoredRow(rowIndex: i, score: score))
+                // Maintain min-heap order: sift up
+                var idx = heap.count - 1
+                while idx > 0 {
+                    let parent = (idx - 1) / 2
+                    if heap[idx] < heap[parent] {
+                        heap.swapAt(idx, parent)
+                        idx = parent
+                    } else { break }
+                }
+            } else if score > heap[0].score {
+                // Replace the minimum (root) with new higher score
+                heap[0] = ScoredRow(rowIndex: i, score: score)
+                // Sift down to restore heap
+                var idx = 0
+                while true {
+                    let left = 2 * idx + 1
+                    let right = 2 * idx + 2
+                    var smallest = idx
+                    if left < heap.count && heap[left] < heap[smallest] { smallest = left }
+                    if right < heap.count && heap[right] < heap[smallest] { smallest = right }
+                    if smallest == idx { break }
+                    heap.swapAt(idx, smallest)
+                    idx = smallest
+                }
+            }
+        }
+
+        // Sort the heap by score descending for final output
+        let sorted = heap.sorted { $0.score > $1.score }
+
+        // Resolve row indices back to DocumentChunks
+        return sorted.compactMap { scored in
+            let mapping = matrix.rowMap[scored.rowIndex]
+            return chunkCache[mapping.knowledgeBaseID]?[mapping.chunkIndex]
+        }
+    }
+
+    /// Keyword fallback: normalized word overlap scoring.
+    private func retrieveByKeywords(query: String, limit: Int) -> [DocumentChunk] {
         let queryWords = SharedDataManager.tokenize(query)
         guard !queryWords.isEmpty else { return [] }
-
-        ensureAllChunksLoaded()
+        let queryCount = Double(queryWords.count)
 
         var allScored: [(DocumentChunk, Double)] = []
 
         for (_, chunks) in chunkCache {
             for chunk in chunks {
-                // Use cached keyword set, or compute and cache once
                 let allWords: Set<String>
                 if let cached = chunkKeywordCache[chunk.id] {
                     allWords = cached
@@ -512,20 +1006,22 @@ final class KnowledgeBaseStore {
                     allWords = computed
                 }
 
-                var score = 0.0
+                var matchedWords = 0.0
                 for word in queryWords {
                     if allWords.contains(word) {
-                        score += 1.0
-                    } else {
-                        for entryWord in allWords where entryWord.hasPrefix(word) || word.hasPrefix(entryWord) {
-                            score += 0.5
+                        matchedWords += 1.0
+                    } else if word.count >= 5 {
+                        for entryWord in allWords where entryWord.count >= 5
+                            && (entryWord.hasPrefix(word) || word.hasPrefix(entryWord)) {
+                            matchedWords += 0.5
                             break
                         }
                     }
                 }
 
-                if score > 0.3 {
-                    allScored.append((chunk, score))
+                let normalizedScore = matchedWords / queryCount
+                if normalizedScore >= 0.30 {
+                    allScored.append((chunk, normalizedScore))
                 }
             }
         }
@@ -541,6 +1037,32 @@ final class KnowledgeBaseStore {
         return Array(chunks.prefix(limit))
     }
 
+    // MARK: - Storage Statistics
+
+    /// Total original file size of all imported documents.
+    var totalOriginalFileSize: Int64 {
+        knowledgeBases.reduce(0) { $0 + $1.fileSize }
+    }
+
+    /// Total number of chunks across all knowledge bases.
+    var totalChunkCount: Int {
+        knowledgeBases.reduce(0) { $0 + $1.chunkCount }
+    }
+
+    /// Total size of chunk JSON files on disk (includes embeddings).
+    var totalChunkStorageSize: Int64 {
+        guard let dir = SharedDataManager.chunksDirectoryURL else { return 0 }
+        var total: Int64 = 0
+        for kb in knowledgeBases {
+            let fileURL = dir.appendingPathComponent("\(kb.id.uuidString).json")
+            if let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+               let size = attrs[.size] as? Int64 {
+                total += size
+            }
+        }
+        return total
+    }
+
     // MARK: - Management
 
     func deleteKnowledgeBase(_ kb: KnowledgeBase) {
@@ -552,6 +1074,8 @@ final class KnowledgeBaseStore {
         }
         knowledgeBases.removeAll { $0.id == kb.id }
         chunkCache.removeValue(forKey: kb.id)
+        invalidateEmbeddingMatrix()
+        invertedKeywordIndex.removeAll()
         if let dir = SharedDataManager.chunksDirectoryURL {
             try? FileManager.default.removeItem(at: dir.appendingPathComponent("\(kb.id.uuidString).json"))
         }
@@ -567,6 +1091,8 @@ final class KnowledgeBaseStore {
         knowledgeBases.removeAll()
         chunkCache.removeAll()
         chunkKeywordCache.removeAll()
+        invalidateEmbeddingMatrix()
+        invertedKeywordIndex.removeAll()
         saveMetadata()
     }
 
@@ -601,8 +1127,14 @@ final class KnowledgeBaseStore {
     }
 
     private func ensureAllChunksLoaded() {
+        var didLoad = false
         for kb in knowledgeBases where chunkCache[kb.id] == nil {
             chunkCache[kb.id] = loadChunks(for: kb.id)
+            didLoad = true
+        }
+        if didLoad {
+            invalidateEmbeddingMatrix()
+            invertedKeywordIndex.removeAll()
         }
     }
 }

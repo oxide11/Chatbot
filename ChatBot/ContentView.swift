@@ -35,8 +35,8 @@ extension Color {
 
 enum AppInfo {
     static let name = "Engram"
-    static let version = "1.0.0"
-    static let build = "1"
+    static let version = "1.1.0"
+    static let build = "2"
 }
 
 // MARK: - Content View
@@ -102,6 +102,8 @@ struct ContentView: View {
         .onAppear {
             store.conversations.first?.checkAvailability()
             store.configureOrchestrator(with: modelContext)
+            // Ensure embedding model assets are downloaded for semantic RAG
+            EmbeddingService.shared.requestAssetsIfNeeded()
         }
     }
 
@@ -161,8 +163,47 @@ struct ContentView: View {
         .searchToolbarBehavior(.minimize)
         #endif
         .navigationTitle("Chats")
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            sidebarBottomBar
+        .toolbar {
+            #if os(macOS)
+            ToolbarItem(placement: .automatic) {
+                Button {
+                    showingSettings = true
+                } label: {
+                    Image(systemName: "gearshape")
+                }
+                .help("Settings")
+            }
+            ToolbarItem(placement: .automatic) {
+                Button {
+                    _ = store.createConversation()
+                } label: {
+                    Label("New Chat", systemImage: "plus")
+                }
+                .keyboardShortcut("n", modifiers: .command)
+                .help("New Chat (⌘N)")
+            }
+            #else
+            ToolbarItem(placement: .bottomBar) {
+                HStack {
+                    Button {
+                        showingSettings = true
+                    } label: {
+                        Image(systemName: "gearshape")
+                    }
+                    .help("Settings")
+
+                    Spacer()
+
+                    Button {
+                        _ = store.createConversation()
+                    } label: {
+                        Label("New Chat", systemImage: "plus")
+                    }
+                    .keyboardShortcut("n", modifiers: .command)
+                    .help("New Chat (⌘N)")
+                }
+            }
+            #endif
         }
         .sheet(isPresented: $showingSettings) {
             SettingsView(store: store)
@@ -199,45 +240,6 @@ struct ContentView: View {
             }
         } message: {
             Text("This conversation will be permanently deleted.")
-        }
-    }
-
-    private var sidebarBottomBar: some View {
-        VStack(spacing: 0) {
-            Divider()
-            HStack(spacing: 12) {
-                Button {
-                    showingSettings = true
-                } label: {
-                    Image(systemName: "gearshape")
-                        .font(.title3)
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-                .help("Settings")
-
-                Spacer()
-
-                Button {
-                    _ = store.createConversation()
-                } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: "plus")
-                            .font(.body.weight(.semibold))
-                        Text("New Chat")
-                            .font(.body.weight(.medium))
-                    }
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 7)
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.regular)
-                .keyboardShortcut("n", modifiers: .command)
-                .help("New Chat (⌘N)")
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
-            .background(.bar)
         }
     }
 
@@ -1050,6 +1052,46 @@ struct SettingsView: View {
                     Text("Applied to new conversations. Individual chats can override this.")
                 }
 
+                // MARK: Storage
+                Section {
+                    HStack {
+                        Label("Conversations", systemImage: "bubble.left.and.bubble.right")
+                        Spacer()
+                        Text("\(store.conversations.count) · \(ByteCountFormatter.string(fromByteCount: Int64(store.conversationDataSize), countStyle: .file))")
+                            .foregroundStyle(.secondary)
+                    }
+
+                    HStack {
+                        Label("Memories", systemImage: "brain")
+                        Spacer()
+                        Text("\(store.memoryStore.memories.count) · \(ByteCountFormatter.string(fromByteCount: Int64(store.memoryDataSize), countStyle: .file))")
+                            .foregroundStyle(.secondary)
+                    }
+
+                    HStack {
+                        Label("Knowledge Bases", systemImage: "books.vertical")
+                        Spacer()
+                        if store.knowledgeBaseStore.knowledgeBases.isEmpty {
+                            Text("None")
+                                .foregroundStyle(.secondary)
+                        } else {
+                            Text("\(store.knowledgeBaseStore.knowledgeBases.count) docs · \(store.knowledgeBaseStore.totalChunkCount) chunks")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    HStack {
+                        Label("Embeddings", systemImage: "sparkles")
+                        Spacer()
+                        Text(EmbeddingService.shared.isAvailable ? "Active" : "Unavailable")
+                            .foregroundStyle(EmbeddingService.shared.isAvailable ? .green : .secondary)
+                    }
+                } header: {
+                    Text("Storage")
+                } footer: {
+                    Text("Total: \(ByteCountFormatter.string(fromByteCount: store.totalStorageBytes, countStyle: .file))")
+                }
+
                 // MARK: Data
                 Section {
                     Button(role: .destructive) {
@@ -1146,7 +1188,10 @@ struct AboutView: View {
             Section {
                 FeatureRow(icon: "lock.shield", title: "Fully Private", detail: "All AI processing happens on-device using Apple Foundation Models")
                 FeatureRow(icon: "brain", title: "Persistent Memory", detail: "Remembers key facts across conversations using RAG")
+                FeatureRow(icon: "magnifyingglass.circle", title: "Semantic Search", detail: "On-device BERT embeddings for intelligent document and memory retrieval")
                 FeatureRow(icon: "books.vertical", title: "Knowledge Bases", detail: "Import PDF and ePUB documents as reference material")
+                FeatureRow(icon: "square.and.arrow.down.on.square", title: "Batch Import", detail: "Queue multiple documents for processing at once")
+                FeatureRow(icon: "person.2.badge.gearshape", title: "Agentic Workers", detail: "Delegate specialized tasks to AI worker personas")
                 FeatureRow(icon: "bubble.left.and.bubble.right", title: "Multi-Conversation", detail: "Manage multiple independent chat threads")
                 FeatureRow(icon: "arrow.triangle.2.circlepath", title: "Smart Context", detail: "Automatic context rotation with summarization when nearing limits")
                 FeatureRow(icon: "person.text.rectangle", title: "Custom Personas", detail: "Set per-conversation or default system prompts")
@@ -1157,6 +1202,16 @@ struct AboutView: View {
             }
 
             Section {
+                ChangelogEntry(version: "1.1.0", date: "February 2026", changes: [
+                    "Semantic embeddings with NLContextualEmbedding (BERT) for intelligent retrieval",
+                    "Batch document ingestion — queue multiple files at once",
+                    "Storage statistics in Settings",
+                    "Agentic Manager-Worker system with built-in presets",
+                    "Optimized prompts and context management (~225 tokens saved per turn)",
+                    "Session prewarming for faster first responses",
+                    "Smaller document chunks (600 chars) for better retrieval accuracy",
+                    "Cross-device embedding portability with automatic re-embedding"
+                ])
                 ChangelogEntry(version: "1.0.0", date: "February 2026", changes: [
                     "Initial release",
                     "On-device AI chat with Apple Foundation Models",
@@ -1185,9 +1240,21 @@ struct AboutView: View {
                         .foregroundStyle(.secondary)
                 }
                 HStack {
+                    Text("Embeddings")
+                    Spacer()
+                    Text("NLContextualEmbedding (BERT)")
+                        .foregroundStyle(.secondary)
+                }
+                HStack {
                     Text("Platform")
                     Spacer()
                     Text(platformName)
+                        .foregroundStyle(.secondary)
+                }
+                HStack {
+                    Text("Min. OS")
+                    Spacer()
+                    Text("iOS 26 / macOS 26")
                         .foregroundStyle(.secondary)
                 }
             } header: {
@@ -1588,8 +1655,7 @@ struct KnowledgeBaseListView: View {
                         } label: {
                             Image(systemName: "plus")
                         }
-                        .disabled(knowledgeBaseStore.isProcessing)
-                        .help("Import Document")
+                        .help("Import Documents")
                     }
                     ToolbarItem(placement: .automatic) {
                         if !knowledgeBaseStore.knowledgeBases.isEmpty {
@@ -1605,12 +1671,10 @@ struct KnowledgeBaseListView: View {
                 .fileImporter(
                     isPresented: $showingImporter,
                     allowedContentTypes: [.pdf, .epub],
-                    allowsMultipleSelection: false
+                    allowsMultipleSelection: true
                 ) { result in
-                    if case .success(let urls) = result, let url = urls.first {
-                        Task {
-                            await knowledgeBaseStore.ingestDocument(from: url)
-                        }
+                    if case .success(let urls) = result, !urls.isEmpty {
+                        knowledgeBaseStore.queueDocuments(from: urls)
                     }
                 }
                 .alert("Delete All Knowledge Bases?", isPresented: $showingDeleteAllConfirmation) {
@@ -1629,29 +1693,95 @@ struct KnowledgeBaseListView: View {
 
     @ViewBuilder
     private var kbContent: some View {
-        if knowledgeBaseStore.knowledgeBases.isEmpty && !knowledgeBaseStore.isProcessing {
+        if knowledgeBaseStore.knowledgeBases.isEmpty && !knowledgeBaseStore.isProcessing && knowledgeBaseStore.ingestionQueue.isEmpty {
             ContentUnavailableView {
                 Label("No Knowledge Bases", systemImage: "books.vertical")
             } description: {
-                Text("Import PDF or ePUB documents to give the assistant knowledge about specific topics.")
+                Text("Import PDF or ePUB documents to give the assistant knowledge about specific topics. You can select multiple files at once.")
             } actions: {
                 Button {
                     showingImporter = true
                 } label: {
-                    Text("Import Document")
+                    Text("Import Documents")
                 }
             }
         } else {
             List {
-                if knowledgeBaseStore.isProcessing {
+                // Ingestion queue
+                if !knowledgeBaseStore.ingestionQueue.isEmpty {
                     Section {
-                        VStack(spacing: 8) {
-                            ProgressView(value: knowledgeBaseStore.processingProgress)
-                            Text("Processing document…")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                        if knowledgeBaseStore.isProcessing {
+                            VStack(spacing: 6) {
+                                ProgressView(value: knowledgeBaseStore.processingProgress)
+                                let done = knowledgeBaseStore.ingestionQueue.filter(\.isFinished).count
+                                Text("Processing \(done + 1) of \(knowledgeBaseStore.ingestionQueue.count)…")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(.vertical, 4)
                         }
-                        .padding(.vertical, 4)
+
+                        ForEach(knowledgeBaseStore.ingestionQueue) { job in
+                            HStack(spacing: 10) {
+                                Group {
+                                    switch job.status {
+                                    case .processing:
+                                        ProgressView()
+                                            .controlSize(.small)
+                                    case .completed:
+                                        Image(systemName: "checkmark.circle.fill")
+                                            .foregroundStyle(.green)
+                                    case .failed:
+                                        Image(systemName: "exclamationmark.triangle.fill")
+                                            .foregroundStyle(.red)
+                                    case .queued:
+                                        Image(systemName: "clock")
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                                .frame(width: 20)
+
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(job.fileName)
+                                        .font(.subheadline)
+                                        .lineLimit(1)
+                                    Text(job.status.label)
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+
+                                Spacer()
+
+                                if job.isFinished {
+                                    Button {
+                                        knowledgeBaseStore.removeJob(job)
+                                    } label: {
+                                        Image(systemName: "xmark.circle.fill")
+                                            .foregroundStyle(.tertiary)
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                            .padding(.vertical, 2)
+                        }
+
+                        if knowledgeBaseStore.isProcessing {
+                            Button("Cancel Remaining") {
+                                knowledgeBaseStore.cancelQueue()
+                            }
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                        }
+
+                        let finishedCount = knowledgeBaseStore.ingestionQueue.filter(\.isFinished).count
+                        if !knowledgeBaseStore.isProcessing && finishedCount > 0 {
+                            Button("Clear Queue") {
+                                knowledgeBaseStore.clearFinishedJobs()
+                            }
+                            .font(.caption)
+                        }
+                    } header: {
+                        Text("Import Queue")
                     }
                 }
 
@@ -1663,46 +1793,53 @@ struct KnowledgeBaseListView: View {
                     }
                 }
 
-                ForEach(knowledgeBaseStore.knowledgeBases) { kb in
-                    NavigationLink {
-                        KnowledgeBaseDetailView(kb: kb, store: knowledgeBaseStore)
-                    } label: {
-                        HStack(spacing: 12) {
-                            Image(systemName: kb.documentType.icon)
-                                .font(.title2)
-                                .foregroundStyle(.secondary)
-                                .frame(width: 32)
+                // Existing knowledge bases
+                if !knowledgeBaseStore.knowledgeBases.isEmpty {
+                    Section {
+                        ForEach(knowledgeBaseStore.knowledgeBases) { kb in
+                            NavigationLink {
+                                KnowledgeBaseDetailView(kb: kb, store: knowledgeBaseStore)
+                            } label: {
+                                HStack(spacing: 12) {
+                                    Image(systemName: kb.documentType.icon)
+                                        .font(.title2)
+                                        .foregroundStyle(.secondary)
+                                        .frame(width: 32)
 
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(kb.name)
-                                    .font(.body)
-                                    .lineLimit(1)
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text(kb.name)
+                                            .font(.body)
+                                            .lineLimit(1)
 
-                                HStack(spacing: 4) {
-                                    Text(kb.documentType.label)
-                                    Text("·")
-                                    Text("\(kb.chunkCount) chunks")
-                                    Text("·")
-                                    Text(ByteCountFormatter.string(fromByteCount: kb.fileSize, countStyle: .file))
+                                        HStack(spacing: 4) {
+                                            Text(kb.documentType.label)
+                                            Text("·")
+                                            Text("\(kb.chunkCount) chunks")
+                                            Text("·")
+                                            Text(ByteCountFormatter.string(fromByteCount: kb.fileSize, countStyle: .file))
+                                        }
+                                        .font(.caption2)
+                                        .foregroundStyle(.tertiary)
+                                    }
                                 }
-                                .font(.caption2)
-                                .foregroundStyle(.tertiary)
+                                .padding(.vertical, 2)
+                            }
+                            .contextMenu {
+                                Button(role: .destructive) {
+                                    knowledgeBaseStore.deleteKnowledgeBase(kb)
+                                } label: {
+                                    Label("Delete", systemImage: "trash")
+                                }
                             }
                         }
-                        .padding(.vertical, 2)
-                    }
-                    .contextMenu {
-                        Button(role: .destructive) {
-                            knowledgeBaseStore.deleteKnowledgeBase(kb)
-                        } label: {
-                            Label("Delete", systemImage: "trash")
+                        .onDelete { offsets in
+                            let toDelete = offsets.map { knowledgeBaseStore.knowledgeBases[$0] }
+                            for kb in toDelete {
+                                knowledgeBaseStore.deleteKnowledgeBase(kb)
+                            }
                         }
-                    }
-                }
-                .onDelete { offsets in
-                    let toDelete = offsets.map { knowledgeBaseStore.knowledgeBases[$0] }
-                    for kb in toDelete {
-                        knowledgeBaseStore.deleteKnowledgeBase(kb)
+                    } header: {
+                        Text("Documents")
                     }
                 }
             }

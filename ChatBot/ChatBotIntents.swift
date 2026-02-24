@@ -42,6 +42,7 @@ struct SaveMemoryIntent: AppIntent {
         }
     }
 
+    @MainActor
     func perform() async throws -> some IntentResult & ProvidesDialog {
         let keywords: [String]
         if keywordsText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {

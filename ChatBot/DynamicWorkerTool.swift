@@ -12,8 +12,7 @@ import FoundationModels
 /// The arguments the Manager model generates when invoking a worker tool.
 @Generable
 struct WorkerTaskArguments: Hashable {
-    /// The specific task or question to delegate to this worker.
-    @Guide(description: "The task, question, or content to send to the specialized worker for processing.")
+    @Guide(description: "The task or text to process.")
     var task: String
 }
 

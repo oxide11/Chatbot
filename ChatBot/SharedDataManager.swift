@@ -3,7 +3,7 @@ import Foundation
 /// Centralized access to the App Group shared UserDefaults.
 /// Used by both the main app and the Share Extension to exchange data.
 enum SharedDataManager {
-    static let suiteName = "group.com.polygoncyber.ChatBot"
+    nonisolated static let suiteName = "group.com.polygoncyber.ChatBot"
 
     static var sharedDefaults: UserDefaults {
         UserDefaults(suiteName: suiteName) ?? .standard
@@ -98,8 +98,10 @@ enum SharedDataManager {
     }
 
     // MARK: - Tokenization (shared utility)
+    //
+    // These are pure functions safe to call from any isolation context.
 
-    private static let stopWords: Set<String> = [
+    nonisolated private static let stopWords: Set<String> = [
         "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
         "have", "has", "had", "do", "does", "did", "will", "would", "could",
         "should", "may", "might", "shall", "can", "to", "of", "in", "for",
@@ -111,7 +113,7 @@ enum SharedDataManager {
 
     /// Tokenize text into significant words, filtering stop words.
     /// Used by MemoryStore, KnowledgeBaseStore, and keyword extraction.
-    static func tokenize(_ text: String) -> Set<String> {
+    nonisolated static func tokenize(_ text: String) -> Set<String> {
         let words = text.lowercased()
             .components(separatedBy: CharacterSet.alphanumerics.inverted)
             .filter { $0.count > 2 && !stopWords.contains($0) }
@@ -120,7 +122,7 @@ enum SharedDataManager {
 
     /// Extract keywords from text, ranked by frequency.
     /// Returns a deterministic, frequency-sorted list of the most significant words.
-    static func extractKeywords(from text: String, limit: Int = 5) -> [String] {
+    nonisolated static func extractKeywords(from text: String, limit: Int = 5) -> [String] {
         let words = text.lowercased()
             .components(separatedBy: CharacterSet.alphanumerics.inverted)
             .filter { $0.count > 2 && !stopWords.contains($0) }
@@ -138,25 +140,107 @@ enum SharedDataManager {
     }
 
     // MARK: - App Group Container (file-based storage)
+    //
+    // Path lookups and directory creation are safe from any thread.
+    // Falls back to the app's own Documents directory if the App Group
+    // container is unavailable (e.g. simulator without entitlements).
 
-    /// Root directory for the App Group shared container.
-    static var containerURL: URL? {
-        FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: suiteName)
+    /// Root directory for file-based storage.
+    /// Prefers the App Group shared container; falls back to the app's Documents dir.
+    nonisolated static var containerURL: URL? {
+        if let groupURL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: suiteName) {
+            return groupURL
+        }
+        // Fallback: app-local Documents directory (still persists across launches)
+        return FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
     }
 
-    /// Documents directory inside the App Group container.
-    static var documentsURL: URL? {
+    /// Documents directory inside the container.
+    nonisolated static var documentsURL: URL? {
         containerURL?.appendingPathComponent("Documents", isDirectory: true)
     }
 
     /// Chunks directory for knowledge base storage.
-    static var chunksDirectoryURL: URL? {
+    nonisolated static var chunksDirectoryURL: URL? {
         documentsURL?.appendingPathComponent("chunks", isDirectory: true)
     }
 
+    /// Memories file for file-based memory persistence.
+    nonisolated static var memoriesFileURL: URL? {
+        documentsURL?.appendingPathComponent("memories.json")
+    }
+
     /// Ensure the file-based storage directories exist.
-    static func ensureDirectoriesExist() {
-        guard let chunksURL = chunksDirectoryURL else { return }
-        try? FileManager.default.createDirectory(at: chunksURL, withIntermediateDirectories: true)
+    nonisolated static func ensureDirectoriesExist() {
+        guard let docsURL = documentsURL else { return }
+        try? FileManager.default.createDirectory(at: docsURL, withIntermediateDirectories: true)
+        if let chunksURL = chunksDirectoryURL {
+            try? FileManager.default.createDirectory(at: chunksURL, withIntermediateDirectories: true)
+        }
+    }
+
+    // MARK: - File-based Memory Persistence
+    //
+    // Memories are now stored as a JSON file instead of UserDefaults
+    // to avoid the ~1MB size limit (embeddings are large).
+    // Embeddings are stripped on save and recomputed on load.
+
+    /// A lightweight version of MemoryEntry without the embedding vector,
+    /// used for compact on-disk storage.
+    private struct StoredMemory: Codable {
+        let id: UUID
+        let content: String
+        let keywords: [String]
+        let sourceConversationTitle: String
+        let createdAt: Date
+    }
+
+    static func loadMemoriesFromFile() -> [MemoryEntry] {
+        ensureDirectoriesExist()
+
+        // Try file-based storage first
+        if let url = memoriesFileURL,
+           let data = try? Data(contentsOf: url),
+           let stored = try? JSONDecoder().decode([StoredMemory].self, from: data) {
+            return stored.map { s in
+                MemoryEntry(
+                    id: s.id,
+                    content: s.content,
+                    keywords: s.keywords,
+                    sourceConversationTitle: s.sourceConversationTitle,
+                    createdAt: s.createdAt,
+                    embedding: nil  // Recomputed lazily or on access
+                )
+            }
+        }
+
+        // Fall back to legacy UserDefaults (one-time migration)
+        if let data = sharedDefaults.data(forKey: memoriesKey),
+           let decoded = try? JSONDecoder().decode([MemoryEntry].self, from: data) {
+            // Migrate to file and remove from UserDefaults
+            saveMemoriesToFile(decoded)
+            sharedDefaults.removeObject(forKey: memoriesKey)
+            return decoded
+        }
+
+        return []
+    }
+
+    static func saveMemoriesToFile(_ memories: [MemoryEntry]) {
+        ensureDirectoriesExist()
+        guard let url = memoriesFileURL else { return }
+
+        // Strip embeddings for compact storage — they'll be recomputed on load
+        let stored = memories.map { m in
+            StoredMemory(
+                id: m.id,
+                content: m.content,
+                keywords: m.keywords,
+                sourceConversationTitle: m.sourceConversationTitle,
+                createdAt: m.createdAt
+            )
+        }
+
+        try? JSONEncoder().encode(stored).write(to: url)
     }
 }

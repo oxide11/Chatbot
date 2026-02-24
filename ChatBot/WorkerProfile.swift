@@ -54,43 +54,30 @@ enum BuiltInWorkers {
     }
 
     /// The full catalog of built-in worker presets.
+    /// Instructions and descriptions are kept concise to minimise context usage
+    /// on the ~3B parameter on-device model (4096 token window).
     static let all: [Preset] = [
         // --- Writing Tools equivalents ---
 
         Preset(
             name: "Proofread",
             icon: "text.badge.checkmark",
-            triggerDescription: "Use when the user asks to proofread, spell-check, or fix grammar in a piece of text.",
-            systemInstructions: """
-            You are a meticulous proofreader. Your job is to correct all grammar, spelling, \
-            punctuation, and capitalization errors in the provided text. \
-            Preserve the original meaning, tone, and style. \
-            Return the corrected text, then list the changes you made in a brief summary.
-            """
+            triggerDescription: "Proofread, spell-check, or fix grammar.",
+            systemInstructions: "Fix all grammar, spelling, and punctuation errors. Preserve meaning and tone. Return corrected text, then briefly list changes."
         ),
 
         Preset(
             name: "Summarize",
             icon: "doc.text.magnifyingglass",
-            triggerDescription: "Use when the user provides a long text and wants a summary, key takeaways, or a condensed version.",
-            systemInstructions: """
-            You are a professional summarizer. Produce a concise summary that captures all \
-            key points, main arguments, and important details from the provided text. \
-            Keep the summary under 3 sentences for short inputs, or use bullet points for longer ones. \
-            Never add information that is not in the original text.
-            """
+            triggerDescription: "Summarize or condense long text.",
+            systemInstructions: "Produce a concise summary capturing key points. Use 2-3 sentences or bullet points. Never add information not in the original."
         ),
 
         Preset(
             name: "Rewrite",
             icon: "pencil.and.outline",
-            triggerDescription: "Use when the user wants to rewrite, rephrase, or improve the clarity and style of a piece of text.",
-            systemInstructions: """
-            You are a skilled editor. Rewrite the provided text to be clearer, more polished, \
-            and well-structured while preserving the core meaning and the author's voice. \
-            If the user specifies a tone (e.g. professional, casual, friendly), match it. \
-            Return the rewritten text followed by a brief note on what you changed.
-            """
+            triggerDescription: "Rewrite or rephrase text for clarity.",
+            systemInstructions: "Rewrite the text to be clearer and more polished. Preserve core meaning. Match any tone the user requests."
         ),
 
         // --- Practical utility workers ---
@@ -98,36 +85,22 @@ enum BuiltInWorkers {
         Preset(
             name: "Code Reviewer",
             icon: "terminal",
-            triggerDescription: "Use when the user shares code and asks for a review, feedback, or improvement suggestions.",
-            systemInstructions: """
-            You are an expert code reviewer. Analyze the provided code for bugs, performance issues, \
-            readability, and best practices. Be constructive and specific. \
-            Suggest concrete improvements with brief code examples when helpful. \
-            Organize your feedback by severity: critical issues first, then suggestions.
-            """
+            triggerDescription: "Review code for bugs or improvements.",
+            systemInstructions: "Review the code for bugs, performance, and best practices. Be specific. List critical issues first, then suggestions."
         ),
 
         Preset(
             name: "Translator",
             icon: "globe",
-            triggerDescription: "Use when the user wants to translate text from one language to another.",
-            systemInstructions: """
-            You are a professional translator. Translate the provided text accurately while preserving \
-            meaning, tone, and nuance. If the target language is not specified, ask or infer it from \
-            context. Provide only the translated text unless the user asks for explanations.
-            """
+            triggerDescription: "Translate text between languages.",
+            systemInstructions: "Translate accurately, preserving meaning and tone. Provide only the translation unless asked for notes."
         ),
 
         Preset(
             name: "Explain Simply",
             icon: "lightbulb",
-            triggerDescription: "Use when the user asks to explain a concept simply, in plain language, or as if explaining to a beginner.",
-            systemInstructions: """
-            You are a patient teacher who excels at making complex topics accessible. \
-            Explain the provided concept in clear, plain language. \
-            Use analogies, examples, and short sentences. Avoid jargon. \
-            Aim for an explanation a curious teenager could understand.
-            """
+            triggerDescription: "Explain a concept in simple terms.",
+            systemInstructions: "Explain in clear, plain language. Use analogies and short sentences. No jargon."
         ),
     ]
 

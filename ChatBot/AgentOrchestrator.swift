@@ -95,22 +95,14 @@ final class AgentOrchestrator {
         var fullInstructions = baseInstructions
 
         if !tools.isEmpty {
-            let workerList = tools.map { "- \($0.name): \($0.description)" }
-                .joined(separator: "\n")
-
-            fullInstructions += """
-
-
-            You are a Coordinator. You have access to a team of specialized workers via tools. \
-            For simple questions, respond directly. For tasks that clearly match a worker's specialty, \
-            delegate by calling the appropriate tool and then summarize their findings for the user. \
-            Available workers:
-            \(workerList)
-            """
+            // Keep the coordinator preamble minimal — the tool names and descriptions
+            // are already included in the tool schema by the framework, so we only need
+            // a short behavioural instruction here to save context tokens.
+            fullInstructions += "\nYou have worker tools. Answer simple questions directly. Delegate specialised tasks to the matching tool."
         }
 
-        if let summary = conversationSummary {
-            fullInstructions += "\n\nPrevious conversation context: \(summary)\nContinue the conversation naturally."
+        if let summary = conversationSummary, !summary.isEmpty {
+            fullInstructions += "\nContext: \(summary)"
         }
 
         let instructions = fullInstructions
