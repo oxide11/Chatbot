@@ -54,7 +54,7 @@ struct SaveMemoryIntent: AppIntent {
         }
 
         let entry = MemoryEntry(content: content, keywords: keywords, sourceConversationTitle: "Siri Shortcut")
-        var memories = SharedDataManager.loadMemories()
+        var memories = SharedDataManager.loadMemoriesFromFile()
         guard !memories.contains(where: { $0.content == content }) else {
             return .result(dialog: "This memory already exists.")
         }
@@ -62,7 +62,7 @@ struct SaveMemoryIntent: AppIntent {
         if memories.count > 100 {
             memories = Array(memories.prefix(100))
         }
-        SharedDataManager.saveMemories(memories)
+        SharedDataManager.saveMemoriesToFile(memories)
 
         return .result(dialog: "Memory saved with \(keywords.count) keywords.")
     }

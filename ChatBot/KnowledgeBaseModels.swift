@@ -27,6 +27,9 @@ final class SDKnowledgeBase {
     var fileSize: Int64
     var embeddingModelID: String?
 
+    /// Parent domain this KB belongs to (nil treated as General during migration).
+    var domain: SDKnowledgeDomain?
+
     @Relationship(deleteRule: .cascade, inverse: \SDDocumentChunk.knowledgeBase)
     var chunks: [SDDocumentChunk] = []
 
@@ -78,7 +81,8 @@ final class SDKnowledgeBase {
             fileSize: fileSize,
             embeddingModelID: embeddingModelID,
             createdAt: createdAt,
-            updatedAt: updatedAt
+            updatedAt: updatedAt,
+            domainID: domain?.id
         )
     }
 }

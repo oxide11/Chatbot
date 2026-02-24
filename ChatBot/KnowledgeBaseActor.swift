@@ -12,15 +12,101 @@
 
 import Foundation
 import SwiftData
+import os
 
 @ModelActor
 actor KnowledgeBaseActor {
 
+    // MARK: - Domain CRUD
+
+    /// Insert a new knowledge domain.
+    func insertDomain(_ domain: KnowledgeDomain) throws {
+        let sd = SDKnowledgeDomain(from: domain)
+        modelContext.insert(sd)
+        try modelContext.save()
+        AppLogger.kbActor.info("Inserted domain '\(domain.name)' (\(domain.id))")
+    }
+
+    /// Load all domains as lightweight structs.
+    func loadAllDomains() throws -> [KnowledgeDomain] {
+        let descriptor = FetchDescriptor<SDKnowledgeDomain>(
+            sortBy: [SortDescriptor(\.createdAt)]
+        )
+        return try modelContext.fetch(descriptor).map { $0.toStruct() }
+    }
+
+    /// Rename a domain.
+    func renameDomain(id: UUID, to newName: String) throws {
+        let predicate = #Predicate<SDKnowledgeDomain> { $0.id == id }
+        let descriptor = FetchDescriptor<SDKnowledgeDomain>(predicate: predicate)
+        if let sd = try modelContext.fetch(descriptor).first {
+            sd.name = newName
+            try modelContext.save()
+            AppLogger.kbActor.info("Renamed domain \(id) to '\(newName)'")
+        }
+    }
+
+    /// Delete a domain. KBs cascade-delete via the relationship.
+    func deleteDomain(id: UUID) throws {
+        let predicate = #Predicate<SDKnowledgeDomain> { $0.id == id }
+        let descriptor = FetchDescriptor<SDKnowledgeDomain>(predicate: predicate)
+        if let sd = try modelContext.fetch(descriptor).first {
+            let name = sd.name
+            modelContext.delete(sd)
+            try modelContext.save()
+            AppLogger.kbActor.info("Deleted domain '\(name)' (\(id))")
+        }
+    }
+
+    /// Move a knowledge base to a different domain.
+    func moveKnowledgeBase(kbID: UUID, toDomainID: UUID) throws {
+        let kbPredicate = #Predicate<SDKnowledgeBase> { $0.id == kbID }
+        let kbDescriptor = FetchDescriptor<SDKnowledgeBase>(predicate: kbPredicate)
+
+        let domainPredicate = #Predicate<SDKnowledgeDomain> { $0.id == toDomainID }
+        let domainDescriptor = FetchDescriptor<SDKnowledgeDomain>(predicate: domainPredicate)
+
+        if let sdKB = try modelContext.fetch(kbDescriptor).first,
+           let sdDomain = try modelContext.fetch(domainDescriptor).first {
+            sdKB.domain = sdDomain
+            try modelContext.save()
+            AppLogger.kbActor.info("Moved KB \(kbID) to domain '\(sdDomain.name)'")
+        }
+    }
+
+    /// Assign all KBs with nil domain to the specified domain (migration helper).
+    func assignOrphanKBsToDomain(domainID: UUID) throws {
+        let domainPredicate = #Predicate<SDKnowledgeDomain> { $0.id == domainID }
+        let domainDescriptor = FetchDescriptor<SDKnowledgeDomain>(predicate: domainPredicate)
+        guard let sdDomain = try modelContext.fetch(domainDescriptor).first else { return }
+
+        let allDescriptor = FetchDescriptor<SDKnowledgeBase>()
+        let allKBs = try modelContext.fetch(allDescriptor)
+        var count = 0
+        for sdKB in allKBs where sdKB.domain == nil {
+            sdKB.domain = sdDomain
+            count += 1
+        }
+
+        if count > 0 {
+            try modelContext.save()
+            AppLogger.kbActor.info("Assigned \(count) orphan KBs to domain '\(sdDomain.name)'")
+        }
+    }
+
     // MARK: - Insert
 
-    /// Insert a new knowledge base with all its chunks.
-    func insertKnowledgeBase(_ kb: KnowledgeBase, chunks: [DocumentChunk]) throws {
+    /// Insert a new knowledge base with all its chunks, optionally in a domain.
+    func insertKnowledgeBase(_ kb: KnowledgeBase, chunks: [DocumentChunk], domainID: UUID? = nil) throws {
         let sdKB = SDKnowledgeBase(from: kb)
+
+        // Assign to domain if provided
+        if let domainID {
+            let predicate = #Predicate<SDKnowledgeDomain> { $0.id == domainID }
+            let descriptor = FetchDescriptor<SDKnowledgeDomain>(predicate: predicate)
+            sdKB.domain = try modelContext.fetch(descriptor).first
+        }
+
         modelContext.insert(sdKB)
 
         for chunk in chunks {
@@ -29,7 +115,7 @@ actor KnowledgeBaseActor {
         }
 
         try modelContext.save()
-        print("[KBActor] Inserted KB '\(kb.name)' with \(chunks.count) chunks")
+        AppLogger.kbActor.info("Inserted KB '\(kb.name)' with \(chunks.count) chunks")
     }
 
     // MARK: - Delete
@@ -42,7 +128,7 @@ actor KnowledgeBaseActor {
             let name = sdKB.name
             modelContext.delete(sdKB) // cascade deletes chunks
             try modelContext.save()
-            print("[KBActor] Deleted KB '\(name)' (\(id))")
+            AppLogger.kbActor.info("Deleted KB '\(name)' (\(id))")
         }
     }
 
@@ -54,7 +140,7 @@ actor KnowledgeBaseActor {
             modelContext.delete(sdKB)
         }
         try modelContext.save()
-        print("[KBActor] Deleted all \(all.count) knowledge bases")
+        AppLogger.kbActor.info("Deleted all \(all.count) knowledge bases")
     }
 
     /// Delete a single chunk from a knowledge base.
@@ -74,7 +160,7 @@ actor KnowledgeBaseActor {
         }
 
         try modelContext.save()
-        print("[KBActor] Deleted chunk \(chunkID) from KB \(kbID)")
+        AppLogger.kbActor.info("Deleted chunk \(chunkID) from KB \(kbID)")
     }
 
     // MARK: - Update
@@ -87,7 +173,7 @@ actor KnowledgeBaseActor {
             sdKB.name = newName
             sdKB.updatedAt = Date()
             try modelContext.save()
-            print("[KBActor] Renamed KB \(id) to '\(newName)'")
+            AppLogger.kbActor.info("Renamed KB \(id) to '\(newName)'")
         }
     }
 
@@ -117,7 +203,7 @@ actor KnowledgeBaseActor {
         sdKB.embeddingModelID = embeddingModelID
 
         try modelContext.save()
-        print("[KBActor] Replaced chunks for KB \(kbID) — \(newChunks.count) new chunks")
+        AppLogger.kbActor.info("Replaced chunks for KB \(kbID) — \(newChunks.count) new chunks")
     }
 
     /// Update embeddings for all chunks in a KB (re-embedding after model update).
@@ -138,7 +224,7 @@ actor KnowledgeBaseActor {
 
         sdKB.embeddingModelID = embeddingModelID
         try modelContext.save()
-        print("[KBActor] Updated embeddings for KB \(kbID) (\(embeddings.count) chunks)")
+        AppLogger.kbActor.info("Updated embeddings for KB \(kbID) (\(embeddings.count) chunks)")
     }
 
     // MARK: - Load
@@ -191,6 +277,6 @@ actor KnowledgeBaseActor {
         }
 
         try modelContext.save()
-        print("[KBActor] Migration complete — imported \(knowledgeBases.count) knowledge bases")
+        AppLogger.kbActor.info("Migration complete — imported \(knowledgeBases.count) knowledge bases")
     }
 }

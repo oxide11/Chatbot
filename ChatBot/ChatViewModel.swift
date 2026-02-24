@@ -30,6 +30,8 @@ struct ConversationData: Identifiable, Codable, Sendable {
     let createdAt: Date
     var messages: [Message]
     var customSystemPrompt: String?
+    /// The knowledge domain assigned to this conversation (nil treated as General).
+    var domainID: UUID?
 }
 
 // MARK: - Memory Entry (RAG)
@@ -44,22 +46,27 @@ struct MemoryEntry: Identifiable, Codable, Hashable, Sendable {
     /// Semantic embedding vector (512-dim from NLContextualEmbedding).
     var embedding: [Double]?
 
-    init(content: String, keywords: [String], sourceConversationTitle: String) {
+    /// The domain this memory belongs to (nil treated as General).
+    var domainID: UUID?
+
+    init(content: String, keywords: [String], sourceConversationTitle: String, domainID: UUID? = nil) {
         self.id = UUID()
         self.content = content
         self.keywords = keywords.map { $0.lowercased() }
         self.sourceConversationTitle = sourceConversationTitle
         self.createdAt = Date()
         self.embedding = EmbeddingService.shared.embed(content)
+        self.domainID = domainID
     }
 
-    init(id: UUID = UUID(), content: String, keywords: [String], sourceConversationTitle: String, createdAt: Date = Date(), embedding: [Double]? = nil) {
+    init(id: UUID = UUID(), content: String, keywords: [String], sourceConversationTitle: String, createdAt: Date = Date(), embedding: [Double]? = nil, domainID: UUID? = nil) {
         self.id = id
         self.content = content
         self.keywords = keywords.map { $0.lowercased() }
         self.sourceConversationTitle = sourceConversationTitle
         self.createdAt = createdAt
         self.embedding = embedding
+        self.domainID = domainID
     }
 }
 
@@ -80,11 +87,11 @@ final class MemoryStore {
     }
 
     /// Store a new memory extracted from a conversation
-    func addMemory(_ content: String, keywords: [String], source: String) {
+    func addMemory(_ content: String, keywords: [String], source: String, domainID: UUID = KnowledgeDomain.generalID) {
         // Avoid exact duplicates
         guard !memories.contains(where: { $0.content == content }) else { return }
 
-        let entry = MemoryEntry(content: content, keywords: keywords, sourceConversationTitle: source)
+        let entry = MemoryEntry(content: content, keywords: keywords, sourceConversationTitle: source, domainID: domainID)
         memories.insert(entry, at: 0)
 
         // Evict oldest if over capacity
@@ -94,14 +101,16 @@ final class MemoryStore {
         saveToDisk()
     }
 
-    /// Retrieve memories relevant to a query.
+    /// Retrieve memories relevant to a query, scoped to a domain.
     ///
     /// **Primary path:** Embed the query and rank by cosine similarity.
     /// **Fallback:** Keyword overlap (for old memories without embeddings or when assets unavailable).
-    func retrieve(for query: String, limit: Int = 5) -> [MemoryEntry] {
+    func retrieve(for query: String, domainID: UUID = KnowledgeDomain.generalID, limit: Int = 5) -> [MemoryEntry] {
+        let domainMemories = memories.filter { ($0.domainID ?? KnowledgeDomain.generalID) == domainID }
+
         // Try semantic retrieval first
         if let queryVector = EmbeddingService.shared.embed(query) {
-            let scored = memories.compactMap { entry -> (MemoryEntry, Double)? in
+            let scored = domainMemories.compactMap { entry -> (MemoryEntry, Double)? in
                 guard let memVector = entry.embedding else { return nil }
                 let similarity = EmbeddingService.cosineSimilarity(queryVector, memVector)
                 guard similarity > 0.3 else { return nil }
@@ -117,16 +126,16 @@ final class MemoryStore {
         }
 
         // Fallback: keyword matching
-        return retrieveByKeywords(query: query, limit: limit)
+        return retrieveByKeywords(query: query, from: domainMemories, limit: limit)
     }
 
     /// Keyword-based fallback retrieval for memories without embeddings.
-    private func retrieveByKeywords(query: String, limit: Int) -> [MemoryEntry] {
+    private func retrieveByKeywords(query: String, from pool: [MemoryEntry], limit: Int) -> [MemoryEntry] {
         let queryWords = tokenize(query)
         guard !queryWords.isEmpty else { return [] }
         let queryCount = Double(queryWords.count)
 
-        let scored = memories.compactMap { entry -> (MemoryEntry, Double)? in
+        let scored = pool.compactMap { entry -> (MemoryEntry, Double)? in
             let allEntryWords = Set(entry.keywords).union(tokenize(entry.content))
 
             var matchedWords = 0.0
@@ -158,12 +167,18 @@ final class MemoryStore {
 
     func updateMemory(_ entry: MemoryEntry, content: String, keywords: [String]) {
         guard let index = memories.firstIndex(where: { $0.id == entry.id }) else { return }
+        // Re-embed if content changed; preserve existing embedding otherwise.
+        let newEmbedding = (content != entry.content)
+            ? EmbeddingService.shared.embed(content)
+            : entry.embedding
         memories[index] = MemoryEntry(
             id: entry.id,
             content: content,
             keywords: keywords,
             sourceConversationTitle: entry.sourceConversationTitle,
-            createdAt: entry.createdAt
+            createdAt: entry.createdAt,
+            embedding: newEmbedding,
+            domainID: entry.domainID
         )
         saveToDisk()
     }
@@ -178,8 +193,28 @@ final class MemoryStore {
         saveToDisk()
     }
 
+    /// Return memories filtered by domain.
+    func memories(for domainID: UUID) -> [MemoryEntry] {
+        memories.filter { ($0.domainID ?? KnowledgeDomain.generalID) == domainID }
+    }
+
+    /// Move a memory to a different domain.
+    func moveMemory(_ entry: MemoryEntry, toDomain domainID: UUID) {
+        guard let index = memories.firstIndex(where: { $0.id == entry.id }) else { return }
+        memories[index] = MemoryEntry(
+            id: entry.id,
+            content: entry.content,
+            keywords: entry.keywords,
+            sourceConversationTitle: entry.sourceConversationTitle,
+            createdAt: entry.createdAt,
+            embedding: entry.embedding,
+            domainID: domainID
+        )
+        saveToDisk()
+    }
+
     /// Extract memories from a conversation summary using the on-device model
-    func extractMemories(from transcript: String, conversationTitle: String) async {
+    func extractMemories(from transcript: String, conversationTitle: String, domainID: UUID = KnowledgeDomain.generalID) async {
         let extractionSession = LanguageModelSession {
             """
             Extract 1-3 key facts or decisions from this conversation.
@@ -214,13 +249,13 @@ final class MemoryStore {
                     let fact = String(trimmedLine[factStart...]).trimmingCharacters(in: .whitespaces)
 
                     if !fact.isEmpty && !keywords.isEmpty {
-                        addMemory(fact, keywords: keywords, source: conversationTitle)
+                        addMemory(fact, keywords: keywords, source: conversationTitle, domainID: domainID)
                     }
                 } else {
                     // No bracket format — store the whole line with auto-extracted keywords
                     let keywords = SharedDataManager.extractKeywords(from: trimmedLine, limit: 5)
                     if !keywords.isEmpty {
-                        addMemory(trimmedLine, keywords: keywords, source: conversationTitle)
+                        addMemory(trimmedLine, keywords: keywords, source: conversationTitle, domainID: domainID)
                     }
                 }
             }
@@ -263,6 +298,9 @@ final class ChatViewModel: Identifiable {
     var title: String
     let createdAt: Date
     var customSystemPrompt: String?
+
+    /// The knowledge domain assigned to this conversation.
+    var domainID: UUID = KnowledgeDomain.generalID
 
     private(set) var messages: [Message] = []
     private(set) var streamingText = ""
@@ -377,6 +415,7 @@ final class ChatViewModel: Identifiable {
         self.createdAt = data.createdAt
         self.messages = data.messages
         self.customSystemPrompt = data.customSystemPrompt
+        self.domainID = data.domainID ?? KnowledgeDomain.generalID
         self.hasAutoTitle = !data.messages.isEmpty
 
         // Initial session without tools — will be rebuilt after orchestrator is assigned
@@ -405,7 +444,8 @@ final class ChatViewModel: Identifiable {
             title: title,
             createdAt: createdAt,
             messages: messages,
-            customSystemPrompt: customSystemPrompt
+            customSystemPrompt: customSystemPrompt,
+            domainID: domainID
         )
     }
 
@@ -522,6 +562,19 @@ final class ChatViewModel: Identifiable {
         notifyChanged()
     }
 
+    /// Edit a user message and resend it, removing the original message and everything after it.
+    func editAndResend(_ message: Message, newContent: String) {
+        guard let index = messages.firstIndex(where: { $0.id == message.id }) else { return }
+        // Remove the edited message and all subsequent messages
+        messages.removeSubrange(index...)
+        notifyChanged()
+        // Send the new content
+        let task = Task {
+            await send(newContent)
+        }
+        currentStreamingTask = task
+    }
+
     /// Regenerate the last assistant response by re-sending the previous user message.
     func regenerateLastResponse() async {
         // Find the last assistant message and the user message before it
@@ -598,9 +651,9 @@ final class ChatViewModel: Identifiable {
         var chunkCount = 0
         var docNames: Set<String> = []
 
-        // Retrieve memories
+        // Retrieve memories (scoped to conversation's domain)
         if ragSettings.memoryRetrievalEnabled, let store = memoryStore {
-            let relevantMemories = store.retrieve(for: userText, limit: ragSettings.maxMemoryResults)
+            let relevantMemories = store.retrieve(for: userText, domainID: domainID, limit: ragSettings.maxMemoryResults)
             if !relevantMemories.isEmpty {
                 memoryCount = relevantMemories.count
                 let block = relevantMemories.map { "- \($0.content)" }.joined(separator: "\n")
@@ -609,10 +662,10 @@ final class ChatViewModel: Identifiable {
             }
         }
 
-        // Retrieve document chunks
+        // Retrieve document chunks (scoped to conversation's domain)
         if ragSettings.knowledgeBaseRetrievalEnabled, let kbStore = knowledgeBaseStore, usedChars < maxContextChars {
             let budget = maxContextChars - usedChars
-            let relevantChunks = kbStore.retrieve(for: userText, limit: ragSettings.maxDocumentChunks)
+            let relevantChunks = kbStore.retrieve(for: userText, domainID: domainID, limit: ragSettings.maxDocumentChunks)
             if !relevantChunks.isEmpty {
                 // Build a lookup dictionary once instead of O(N) linear search per chunk
                 let kbLookup = Dictionary(uniqueKeysWithValues: kbStore.knowledgeBases.map { ($0.id, $0.name) })
@@ -708,7 +761,7 @@ final class ChatViewModel: Identifiable {
 
         // Extract memories from the conversation being rotated out (RAG ingestion)
         if ragSettings.autoExtractMemories, let store = memoryStore {
-            await store.extractMemories(from: transcript, conversationTitle: title)
+            await store.extractMemories(from: transcript, conversationTitle: title, domainID: domainID)
         }
 
         // Summarise for the new session — use greedy sampling for a deterministic, focused summary
@@ -764,7 +817,7 @@ final class ChatViewModel: Identifiable {
         #endif
     }
 
-    private func notifyChanged() {
+    func notifyChanged() {
         onChanged?()
     }
 }

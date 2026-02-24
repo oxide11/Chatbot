@@ -102,7 +102,7 @@ struct ShareExtensionView: View {
     private func performAction() {
         switch selectedAction {
         case .saveAsMemory:
-            // Save directly to shared UserDefaults
+            // Save directly to shared file-based storage
             let keywords: [String]
             let trimmed = keywordsText.trimmingCharacters(in: .whitespaces)
             if trimmed.isEmpty {
@@ -118,7 +118,7 @@ struct ShareExtensionView: View {
                 keywords: keywords,
                 sourceConversationTitle: "Shared Content"
             )
-            var memories = SharedDataManager.loadMemories()
+            var memories = SharedDataManager.loadMemoriesFromFile()
             guard !memories.contains(where: { $0.content == sharedText }) else {
                 isSaved = true
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1) { onDone() }
@@ -128,7 +128,7 @@ struct ShareExtensionView: View {
             if memories.count > 100 {
                 memories = Array(memories.prefix(100))
             }
-            SharedDataManager.saveMemories(memories)
+            SharedDataManager.saveMemoriesToFile(memories)
 
             isSaved = true
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { onDone() }

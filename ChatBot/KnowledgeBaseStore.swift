@@ -2,6 +2,7 @@ import Foundation
 import PDFKit
 import Compression
 import SwiftData
+import os
 
 // MARK: - Data Models
 
@@ -40,7 +41,10 @@ struct KnowledgeBase: Identifiable, Codable, Sendable {
     /// Used to detect when re-embedding is needed (e.g. after an OS update).
     var embeddingModelID: String?
 
-    nonisolated init(id: UUID = UUID(), name: String, documentType: DocumentType, chunkCount: Int, fileSize: Int64, embeddingModelID: String? = nil, createdAt: Date = Date(), updatedAt: Date = Date()) {
+    /// The domain this KB belongs to (nil treated as General).
+    var domainID: UUID?
+
+    nonisolated init(id: UUID = UUID(), name: String, documentType: DocumentType, chunkCount: Int, fileSize: Int64, embeddingModelID: String? = nil, createdAt: Date = Date(), updatedAt: Date = Date(), domainID: UUID? = nil) {
         self.id = id
         self.name = name
         self.documentType = documentType
@@ -49,9 +53,10 @@ struct KnowledgeBase: Identifiable, Codable, Sendable {
         self.chunkCount = chunkCount
         self.fileSize = fileSize
         self.embeddingModelID = embeddingModelID
+        self.domainID = domainID
     }
 
-    /// Backward-compatible decoding: old data without `updatedAt` falls back to `createdAt`.
+    /// Backward-compatible decoding: old data without `updatedAt`/`domainID` uses defaults.
     nonisolated init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(UUID.self, forKey: .id)
@@ -62,6 +67,14 @@ struct KnowledgeBase: Identifiable, Codable, Sendable {
         chunkCount = try container.decode(Int.self, forKey: .chunkCount)
         fileSize = try container.decode(Int64.self, forKey: .fileSize)
         embeddingModelID = try container.decodeIfPresent(String.self, forKey: .embeddingModelID)
+        domainID = try container.decodeIfPresent(UUID.self, forKey: .domainID)
+    }
+}
+
+extension KnowledgeBase {
+    /// Domain ID for filtering, treating nil as General.
+    var effectiveDomainID: UUID {
+        domainID ?? KnowledgeDomain.generalID
     }
 }
 
@@ -95,6 +108,7 @@ struct IngestionJob: Identifiable {
     let url: URL
     let fileName: String
     var status: IngestionStatus
+    let domainID: UUID
 
     /// Whether this job has finished (completed or failed).
     var isFinished: Bool {
@@ -148,15 +162,18 @@ final class KnowledgeBaseStore {
     private(set) var processingProgress: Double = 0
     private(set) var processingError: String?
 
+    /// All knowledge domains.
+    private(set) var domains: [KnowledgeDomain] = []
+
     /// Batch ingestion queue
     private(set) var ingestionQueue: [IngestionJob] = []
     private var isQueueRunning = false
 
     private var chunkCache: [UUID: [DocumentChunk]] = [:]
 
-    /// Pre-computed embedding matrix for fast batch similarity scoring.
-    /// Invalidated whenever chunks are added, removed, or re-embedded.
-    private var embeddingMatrix: EmbeddingMatrix?
+    /// Per-domain embedding matrices for fast batch similarity scoring.
+    /// Keyed by domain UUID. Invalidated per-domain when chunks change.
+    private var embeddingMatrices: [UUID: EmbeddingMatrix] = [:]
 
     /// SwiftData actor for thread-safe persistence. Created via `configure(with:)`.
     private var dbActor: KnowledgeBaseActor?
@@ -188,11 +205,44 @@ final class KnowledgeBaseStore {
             // Load all data from SwiftData
             await loadFromSwiftData(actor: actor)
 
+            // Ensure domains exist (auto-create "General" on first launch)
+            await ensureDomainsExist(actor: actor)
+
             // Re-embed stale chunks if the OS embedding model has changed
             await reembedStaleKnowledgeBasesIfNeeded(actor: actor)
 
             isConfigured = true
-            print("[KBStore] Configuration complete — \(knowledgeBases.count) KBs, \(chunkCache.values.reduce(0) { $0 + $1.count }) chunks loaded")
+            AppLogger.kbStore.info("Configuration complete — \(self.domains.count) domains, \(self.knowledgeBases.count) KBs, \(self.chunkCache.values.reduce(0) { $0 + $1.count }) chunks loaded")
+        }
+    }
+
+    /// Ensure at least the "General" domain exists. Assigns orphan KBs to it.
+    private func ensureDomainsExist(actor: KnowledgeBaseActor) async {
+        do {
+            let loaded = try await actor.loadAllDomains()
+            if loaded.isEmpty {
+                let general = KnowledgeDomain.general()
+                try await actor.insertDomain(general)
+                try await actor.assignOrphanKBsToDomain(domainID: general.id)
+                self.domains = [general]
+                // Update in-memory KBs to reflect the domain assignment
+                for i in knowledgeBases.indices where knowledgeBases[i].domainID == nil {
+                    knowledgeBases[i].domainID = general.id
+                }
+            } else {
+                self.domains = loaded
+                // If there are orphan KBs (nil domain), assign to General
+                let generalID = loaded.first(where: { $0.isDefault })?.id ?? KnowledgeDomain.generalID
+                let hasOrphans = knowledgeBases.contains { $0.domainID == nil }
+                if hasOrphans {
+                    try await actor.assignOrphanKBsToDomain(domainID: generalID)
+                    for i in knowledgeBases.indices where knowledgeBases[i].domainID == nil {
+                        knowledgeBases[i].domainID = generalID
+                    }
+                }
+            }
+        } catch {
+            AppLogger.kbStore.error("Failed loading domains: \(error.localizedDescription)")
         }
     }
 
@@ -201,7 +251,7 @@ final class KnowledgeBaseStore {
         do {
             let kbs = try await actor.loadAllKnowledgeBases()
             self.knowledgeBases = kbs
-            print("[KBStore] Loaded \(kbs.count) knowledge bases from SwiftData")
+            AppLogger.kbStore.info("Loaded \(kbs.count) knowledge bases from SwiftData")
 
             // Eagerly load all chunks into the in-memory cache
             for kb in kbs {
@@ -209,10 +259,10 @@ final class KnowledgeBaseStore {
                 chunkCache[kb.id] = chunks
             }
 
-            invalidateEmbeddingMatrix()
+            invalidateAllEmbeddingMatrices()
             invertedKeywordIndex.removeAll()
         } catch {
-            print("[KBStore] ERROR loading from SwiftData: \(error.localizedDescription)")
+            AppLogger.kbStore.error("Failed loading from SwiftData: \(error.localizedDescription)")
         }
     }
 
@@ -221,7 +271,7 @@ final class KnowledgeBaseStore {
         let migrationKey = "kb_migrated_to_swiftdata"
         guard !UserDefaults.standard.bool(forKey: migrationKey) else { return }
 
-        print("[KBStore] Starting one-time JSON → SwiftData migration…")
+        AppLogger.kbStore.info("Starting one-time JSON → SwiftData migration…")
 
         // Read old metadata file
         SharedDataManager.ensureDirectoriesExist()
@@ -229,7 +279,7 @@ final class KnowledgeBaseStore {
               FileManager.default.fileExists(atPath: url.path) else {
             // No old data to migrate — mark as done
             UserDefaults.standard.set(true, forKey: migrationKey)
-            print("[KBStore] No legacy data found — migration skipped")
+            AppLogger.kbStore.info("No legacy data found — migration skipped")
             return
         }
 
@@ -251,9 +301,9 @@ final class KnowledgeBaseStore {
 
             try await actor.migrateFromJSON(knowledgeBases: oldKBs, chunksByKB: chunksByKB)
             UserDefaults.standard.set(true, forKey: migrationKey)
-            print("[KBStore] Migration complete — \(oldKBs.count) KBs migrated")
+            AppLogger.kbStore.info("Migration complete — \(oldKBs.count) KBs migrated")
         } catch {
-            print("[KBStore] ERROR during migration: \(error.localizedDescription)")
+            AppLogger.kbStore.error("Migration failed: \(error.localizedDescription)")
             // Don't set the flag — retry on next launch
         }
     }
@@ -285,7 +335,7 @@ final class KnowledgeBaseStore {
             }
 
             chunkCache[kb.id] = chunks
-            invalidateEmbeddingMatrix()
+            invalidateEmbeddingMatrix(for: kb.effectiveDomainID)
             invertedKeywordIndex.removeAll()
 
             // Persist updated embeddings to SwiftData
@@ -296,7 +346,7 @@ final class KnowledgeBaseStore {
                     embeddingModelID: currentModelID
                 )
             } catch {
-                print("[KBStore] ERROR persisting re-embeddings for '\(kb.name)': \(error.localizedDescription)")
+                AppLogger.kbStore.error("Failed persisting re-embeddings for '\(kb.name)': \(error.localizedDescription)")
             }
 
             // Update the model stamp in memory
@@ -307,13 +357,14 @@ final class KnowledgeBaseStore {
     // MARK: - Ingestion Pipeline
 
     /// Queue one or more documents for ingestion. Processing runs sequentially.
-    func queueDocuments(from urls: [URL]) {
+    func queueDocuments(from urls: [URL], domainID: UUID = KnowledgeDomain.generalID) {
         for url in urls {
             let job = IngestionJob(
                 id: UUID(),
                 url: url,
                 fileName: url.deletingPathExtension().lastPathComponent,
-                status: .queued
+                status: .queued,
+                domainID: domainID
             )
             ingestionQueue.append(job)
         }
@@ -379,20 +430,22 @@ final class KnowledgeBaseStore {
             // Update UI state back on MainActor
             if let idx = ingestionQueue.firstIndex(where: { $0.id == job.id }) {
                 switch outcome {
-                case .success(let result):
+                case .success(var result):
                     ingestionQueue[idx].status = .completed
+                    result.kb.domainID = job.domainID
                     knowledgeBases.insert(result.kb, at: 0)
                     chunkCache[result.kb.id] = result.chunks
-                    invalidateEmbeddingMatrix()
+                    invalidateEmbeddingMatrix(for: job.domainID)
                     invertedKeywordIndex.removeAll()
 
                     // Persist to SwiftData (fire-and-forget — in-memory state is already updated)
                     if let actor = dbActor {
+                        let domainID = job.domainID
                         Task {
                             do {
-                                try await actor.insertKnowledgeBase(result.kb, chunks: result.chunks)
+                                try await actor.insertKnowledgeBase(result.kb, chunks: result.chunks, domainID: domainID)
                             } catch {
-                                print("[KBStore] ERROR persisting ingestion result: \(error.localizedDescription)")
+                                AppLogger.kbStore.error("Failed persisting ingestion result: \(error.localizedDescription)")
                             }
                         }
                     }
@@ -430,7 +483,7 @@ final class KnowledgeBaseStore {
 
     /// Result of a successful ingestion, ready to merge into the store.
     private struct IngestionResult: Sendable {
-        let kb: KnowledgeBase
+        var kb: KnowledgeBase
         let chunks: [DocumentChunk]
     }
 
@@ -890,20 +943,27 @@ final class KnowledgeBaseStore {
     /// Used for fast two-phase retrieval (keyword pre-filter → semantic re-rank).
     private var invertedKeywordIndex: [String: Set<UUID>] = [:]
 
-    /// Rebuild the embedding matrix from the current chunk cache.
-    /// Call this after chunks are loaded, added, removed, or re-embedded.
-    private func rebuildEmbeddingMatrix() {
+    /// Rebuild the embedding matrix for a specific domain from filtered chunk cache.
+    private func rebuildEmbeddingMatrix(for domainID: UUID) {
         let dim = EmbeddingService.shared.dimension
         guard dim > 0 else {
-            embeddingMatrix = nil
+            embeddingMatrices[domainID] = nil
             return
         }
-        embeddingMatrix = EmbeddingMatrix.build(from: chunkCache, dimension: dim)
+        let filteredCache = chunkCache.filter { kbID, _ in
+            knowledgeBases.first(where: { $0.id == kbID })?.effectiveDomainID == domainID
+        }
+        embeddingMatrices[domainID] = EmbeddingMatrix.build(from: filteredCache, dimension: dim)
     }
 
-    /// Invalidate the embedding matrix so it will be rebuilt on next retrieval.
-    private func invalidateEmbeddingMatrix() {
-        embeddingMatrix = nil
+    /// Invalidate the embedding matrix for a specific domain.
+    private func invalidateEmbeddingMatrix(for domainID: UUID) {
+        embeddingMatrices.removeValue(forKey: domainID)
+    }
+
+    /// Invalidate all domain embedding matrices (used during bulk operations).
+    private func invalidateAllEmbeddingMatrices() {
+        embeddingMatrices.removeAll()
     }
 
     /// Rebuild the inverted keyword index from the current chunk cache.
@@ -926,26 +986,26 @@ final class KnowledgeBaseStore {
         }
     }
 
-    /// Retrieve the most relevant document chunks for a query.
+    /// Retrieve the most relevant document chunks for a query, scoped to a domain.
     ///
     /// **Primary path:** Batch cosine similarity via Accelerate/vDSP against the
-    /// pre-computed embedding matrix. With many chunks, uses a two-phase approach:
+    /// per-domain embedding matrix. With many chunks, uses a two-phase approach:
     /// keyword pre-filter → semantic re-rank on the smaller candidate set.
     ///
     /// **Fallback:** Keyword overlap (used when embedding assets aren't downloaded yet
     /// or chunks were imported before embeddings were available).
-    func retrieve(for query: String, limit: Int = 3) -> [DocumentChunk] {
+    func retrieve(for query: String, domainID: UUID = KnowledgeDomain.generalID, limit: Int = 3) -> [DocumentChunk] {
         ensureAllChunksLoaded()
 
         let embeddingService = EmbeddingService.shared
 
         // Try semantic retrieval first
         if let queryVector = embeddingService.embed(query) {
-            return retrieveBySimilarity(queryVector: queryVector, query: query, limit: limit)
+            return retrieveBySimilarity(queryVector: queryVector, query: query, domainID: domainID, limit: limit)
         }
 
         // Fallback: keyword matching
-        return retrieveByKeywords(query: query, limit: limit)
+        return retrieveByKeywords(query: query, domainID: domainID, limit: limit)
     }
 
     /// Semantic retrieval using Accelerate-powered batch cosine similarity.
@@ -959,13 +1019,13 @@ final class KnowledgeBaseStore {
     /// 2. **Semantic re-rank:** Score only the candidate subset using cosine similarity.
     ///
     /// This avoids scoring thousands of irrelevant chunks while maintaining recall.
-    private func retrieveBySimilarity(queryVector: [Double], query: String, limit: Int) -> [DocumentChunk] {
-        // Ensure the embedding matrix is built
-        if embeddingMatrix == nil {
-            rebuildEmbeddingMatrix()
+    private func retrieveBySimilarity(queryVector: [Double], query: String, domainID: UUID, limit: Int) -> [DocumentChunk] {
+        // Ensure the per-domain embedding matrix is built
+        if embeddingMatrices[domainID] == nil {
+            rebuildEmbeddingMatrix(for: domainID)
         }
-        guard let matrix = embeddingMatrix, matrix.rowCount > 0 else {
-            return [] // No embedded chunks available
+        guard let matrix = embeddingMatrices[domainID], matrix.rowCount > 0 else {
+            return [] // No embedded chunks available for this domain
         }
 
         // Determine total chunk count for strategy selection
@@ -973,7 +1033,7 @@ final class KnowledgeBaseStore {
 
         // Two-phase for large corpora
         if totalChunks >= 200 {
-            return twoPhaseRetrieval(queryVector: queryVector, query: query, limit: limit, matrix: matrix)
+            return twoPhaseRetrieval(queryVector: queryVector, query: query, domainID: domainID, limit: limit, matrix: matrix)
         }
 
         // Full matrix scan for small corpora — fast enough with Accelerate
@@ -997,7 +1057,7 @@ final class KnowledgeBaseStore {
     }
 
     /// Two-phase retrieval: keyword pre-filter → semantic re-rank.
-    private func twoPhaseRetrieval(queryVector: [Double], query: String, limit: Int, matrix: EmbeddingMatrix) -> [DocumentChunk] {
+    private func twoPhaseRetrieval(queryVector: [Double], query: String, domainID: UUID, limit: Int, matrix: EmbeddingMatrix) -> [DocumentChunk] {
         // Build inverted index if needed
         if invertedKeywordIndex.isEmpty {
             rebuildInvertedIndex()
@@ -1126,15 +1186,18 @@ final class KnowledgeBaseStore {
         }
     }
 
-    /// Keyword fallback: normalized word overlap scoring.
-    private func retrieveByKeywords(query: String, limit: Int) -> [DocumentChunk] {
+    /// Keyword fallback: normalized word overlap scoring, scoped to a domain.
+    private func retrieveByKeywords(query: String, domainID: UUID, limit: Int) -> [DocumentChunk] {
         let queryWords = SharedDataManager.tokenize(query)
         guard !queryWords.isEmpty else { return [] }
         let queryCount = Double(queryWords.count)
 
+        // Filter chunk cache to the requested domain
+        let domainKBIDs = Set(knowledgeBases.filter { $0.effectiveDomainID == domainID }.map { $0.id })
+
         var allScored: [(DocumentChunk, Double)] = []
 
-        for (_, chunks) in chunkCache {
+        for (kbID, chunks) in chunkCache where domainKBIDs.contains(kbID) {
             for chunk in chunks {
                 let allWords: Set<String>
                 if let cached = chunkKeywordCache[chunk.id] {
@@ -1211,16 +1274,17 @@ final class KnowledgeBaseStore {
                 chunkKeywordCache.removeValue(forKey: chunk.id)
             }
         }
+        let affectedDomain = kb.effectiveDomainID
         knowledgeBases.removeAll { $0.id == kb.id }
         chunkCache.removeValue(forKey: kb.id)
-        invalidateEmbeddingMatrix()
+        invalidateEmbeddingMatrix(for: affectedDomain)
         invertedKeywordIndex.removeAll()
 
         // Persist deletion to SwiftData
         if let actor = dbActor {
             Task {
                 do { try await actor.deleteKnowledgeBase(id: kb.id) }
-                catch { print("[KBStore] ERROR deleting KB from SwiftData: \(error.localizedDescription)") }
+                catch { AppLogger.kbStore.error("Failed deleting KB from SwiftData: \(error.localizedDescription)") }
             }
         }
     }
@@ -1229,14 +1293,14 @@ final class KnowledgeBaseStore {
         knowledgeBases.removeAll()
         chunkCache.removeAll()
         chunkKeywordCache.removeAll()
-        invalidateEmbeddingMatrix()
+        invalidateAllEmbeddingMatrices()
         invertedKeywordIndex.removeAll()
 
         // Persist deletion to SwiftData
         if let actor = dbActor {
             Task {
                 do { try await actor.deleteAllKnowledgeBases() }
-                catch { print("[KBStore] ERROR deleting all KBs: \(error.localizedDescription)") }
+                catch { AppLogger.kbStore.error("Failed deleting all KBs: \(error.localizedDescription)") }
             }
         }
     }
@@ -1252,7 +1316,7 @@ final class KnowledgeBaseStore {
         if let actor = dbActor {
             Task {
                 do { try await actor.renameKnowledgeBase(id: kb.id, to: trimmed) }
-                catch { print("[KBStore] ERROR renaming KB: \(error.localizedDescription)") }
+                catch { AppLogger.kbStore.error("Failed renaming KB: \(error.localizedDescription)") }
             }
         }
     }
@@ -1270,15 +1334,16 @@ final class KnowledgeBaseStore {
             knowledgeBases[index].updatedAt = Date()
         }
 
-        // Invalidate matrices
-        invalidateEmbeddingMatrix()
+        // Invalidate matrices for the affected domain
+        let affectedDomain = knowledgeBases.first(where: { $0.id == kbID })?.effectiveDomainID ?? KnowledgeDomain.generalID
+        invalidateEmbeddingMatrix(for: affectedDomain)
         invertedKeywordIndex.removeAll()
 
         // Persist to SwiftData
         if let actor = dbActor {
             Task {
                 do { try await actor.deleteChunk(id: chunkID, from: kbID) }
-                catch { print("[KBStore] ERROR deleting chunk: \(error.localizedDescription)") }
+                catch { AppLogger.kbStore.error("Failed deleting chunk: \(error.localizedDescription)") }
             }
         }
     }
@@ -1289,7 +1354,8 @@ final class KnowledgeBaseStore {
             id: UUID(),
             url: url,
             fileName: "\(kb.name) (Update)",
-            status: .queued
+            status: .queued,
+            domainID: kb.effectiveDomainID
         )
         ingestionQueue.append(job)
 
@@ -1337,7 +1403,7 @@ final class KnowledgeBaseStore {
                         knowledgeBases[kbIndex].updatedAt = Date()
                         knowledgeBases[kbIndex].embeddingModelID = result.kb.embeddingModelID
 
-                        invalidateEmbeddingMatrix()
+                        invalidateEmbeddingMatrix(for: kb.effectiveDomainID)
                         invertedKeywordIndex.removeAll()
 
                         // Persist to SwiftData
@@ -1350,7 +1416,7 @@ final class KnowledgeBaseStore {
                                         embeddingModelID: result.kb.embeddingModelID
                                     )
                                 } catch {
-                                    print("[KBStore] ERROR persisting re-import: \(error.localizedDescription)")
+                                    AppLogger.kbStore.error("Failed persisting re-import: \(error.localizedDescription)")
                                 }
                             }
                         }
@@ -1365,7 +1431,7 @@ final class KnowledgeBaseStore {
     }
 
     /// Ingest plain text directly (no file needed) — creates a new KB from pasted text.
-    func ingestText(name: String, text: String) {
+    func ingestText(name: String, text: String, domainID: UUID = KnowledgeDomain.generalID) {
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedName.isEmpty, !trimmedText.isEmpty else { return }
@@ -1384,26 +1450,27 @@ final class KnowledgeBaseStore {
 
             await MainActor.run {
                 switch result {
-                case .success(let ingestionResult):
+                case .success(var ingestionResult):
+                    ingestionResult.kb.domainID = domainID
                     self.knowledgeBases.insert(ingestionResult.kb, at: 0)
                     self.chunkCache[ingestionResult.kb.id] = ingestionResult.chunks
-                    self.invalidateEmbeddingMatrix()
+                    self.invalidateEmbeddingMatrix(for: domainID)
                     self.invertedKeywordIndex.removeAll()
-                    print("[KBStore] Ingested text '\(trimmedName)' — \(ingestionResult.chunks.count) chunks")
+                    AppLogger.kbStore.info("Ingested text '\(trimmedName)' — \(ingestionResult.chunks.count) chunks")
 
                     // Persist to SwiftData
                     if let actor = self.dbActor {
                         Task {
                             do {
-                                try await actor.insertKnowledgeBase(ingestionResult.kb, chunks: ingestionResult.chunks)
+                                try await actor.insertKnowledgeBase(ingestionResult.kb, chunks: ingestionResult.chunks, domainID: domainID)
                             } catch {
-                                print("[KBStore] ERROR persisting text ingestion: \(error.localizedDescription)")
+                                AppLogger.kbStore.error("Failed persisting text ingestion: \(error.localizedDescription)")
                             }
                         }
                     }
                 case .failure(let reason):
                     self.processingError = reason
-                    print("[KBStore] Text ingestion failed: \(reason)")
+                    AppLogger.kbStore.error("Text ingestion failed: \(reason)")
                 }
                 self.isProcessing = false
             }
@@ -1506,10 +1573,10 @@ final class KnowledgeBaseStore {
             encoder.outputFormatting = .prettyPrinted
             let data = try encoder.encode(export)
             try data.write(to: tempURL, options: .atomic)
-            print("[KBStore] Exported KB '\(kb.name)' — \(data.count) bytes")
+            AppLogger.kbStore.info("Exported KB '\(kb.name)' — \(data.count) bytes")
             return tempURL
         } catch {
-            print("[KBStore] ERROR exporting KB: \(error.localizedDescription)")
+            AppLogger.kbStore.error("Failed exporting KB: \(error.localizedDescription)")
             return nil
         }
     }
@@ -1532,12 +1599,99 @@ final class KnowledgeBaseStore {
                         let chunks = try await actor.loadChunks(for: kb.id)
                         chunkCache[kb.id] = chunks
                     } catch {
-                        print("[KBStore] ERROR lazy-loading chunks for '\(kb.name)': \(error.localizedDescription)")
+                        AppLogger.kbStore.error("Failed lazy-loading chunks for '\(kb.name)': \(error.localizedDescription)")
                         chunkCache[kb.id] = []
                     }
                 }
-                invalidateEmbeddingMatrix()
+                invalidateAllEmbeddingMatrices()
                 invertedKeywordIndex.removeAll()
+            }
+        }
+    }
+
+    // MARK: - Domain Management
+
+    /// Return KBs filtered for a specific domain.
+    func knowledgeBases(for domainID: UUID) -> [KnowledgeBase] {
+        knowledgeBases.filter { $0.effectiveDomainID == domainID }
+    }
+
+    /// Create a new domain and persist it.
+    func createDomain(name: String) -> KnowledgeDomain {
+        let domain = KnowledgeDomain(name: name)
+        domains.append(domain)
+        if let actor = dbActor {
+            Task {
+                do { try await actor.insertDomain(domain) }
+                catch { AppLogger.kbStore.error("Failed persisting new domain: \(error.localizedDescription)") }
+            }
+        }
+        return domain
+    }
+
+    /// Rename an existing domain.
+    func renameDomain(_ domain: KnowledgeDomain, to newName: String) {
+        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        guard let index = domains.firstIndex(where: { $0.id == domain.id }) else { return }
+        domains[index].name = trimmed
+        if let actor = dbActor {
+            Task {
+                do { try await actor.renameDomain(id: domain.id, to: trimmed) }
+                catch { AppLogger.kbStore.error("Failed renaming domain: \(error.localizedDescription)") }
+            }
+        }
+    }
+
+    /// Delete a domain, moving its KBs to the General domain first.
+    func deleteDomain(_ domain: KnowledgeDomain) {
+        guard !domain.isDefault else { return } // Cannot delete General
+
+        let generalID = domains.first(where: { $0.isDefault })?.id ?? KnowledgeDomain.generalID
+
+        // Capture IDs of KBs to move *before* the in-memory mutation.
+        let kbIDsToMove = knowledgeBases
+            .filter { $0.effectiveDomainID == domain.id }
+            .map(\.id)
+
+        // Move all KBs in this domain to General (in-memory)
+        for i in knowledgeBases.indices where knowledgeBases[i].effectiveDomainID == domain.id {
+            knowledgeBases[i].domainID = generalID
+        }
+        invalidateEmbeddingMatrix(for: generalID)
+        invalidateEmbeddingMatrix(for: domain.id)
+
+        domains.removeAll { $0.id == domain.id }
+
+        if let actor = dbActor {
+            let domainID = domain.id
+            Task {
+                do {
+                    // Move KBs to General in SwiftData, then delete the domain.
+                    for kbID in kbIDsToMove {
+                        try await actor.moveKnowledgeBase(kbID: kbID, toDomainID: generalID)
+                    }
+                    try await actor.deleteDomain(id: domainID)
+                } catch {
+                    AppLogger.kbStore.error("Failed deleting domain: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    /// Move a knowledge base to a different domain.
+    func moveKnowledgeBase(_ kb: KnowledgeBase, toDomain targetDomainID: UUID) {
+        guard let index = knowledgeBases.firstIndex(where: { $0.id == kb.id }) else { return }
+        let oldDomainID = kb.effectiveDomainID
+        knowledgeBases[index].domainID = targetDomainID
+        invalidateEmbeddingMatrix(for: oldDomainID)
+        invalidateEmbeddingMatrix(for: targetDomainID)
+        invertedKeywordIndex.removeAll()
+
+        if let actor = dbActor {
+            Task {
+                do { try await actor.moveKnowledgeBase(kbID: kb.id, toDomainID: targetDomainID) }
+                catch { AppLogger.kbStore.error("Failed moving KB: \(error.localizedDescription)") }
             }
         }
     }

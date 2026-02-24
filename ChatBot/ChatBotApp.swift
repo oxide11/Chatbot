@@ -16,7 +16,7 @@ struct ChatBotApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView(store: store)
-                .modelContainer(for: [WorkerProfile.self, SDKnowledgeBase.self, SDDocumentChunk.self])
+                .modelContainer(for: [WorkerProfile.self, SDKnowledgeDomain.self, SDKnowledgeBase.self, SDDocumentChunk.self])
                 .onOpenURL { url in
                     // Handle engram://shared or chatbot://shared URL from Share Extension
                     if (url.scheme == "engram" || url.scheme == "chatbot") && url.host == "shared" {

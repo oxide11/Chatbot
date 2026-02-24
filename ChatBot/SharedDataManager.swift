@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// Centralized access to the App Group shared UserDefaults.
 /// Used by both the main app and the Share Extension to exchange data.
@@ -161,18 +162,18 @@ enum SharedDataManager {
         if let groupURL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: suiteName) {
             _cachedContainerURL = groupURL
             _containerResolved = true
-            print("[SharedData] Using App Group container: \(groupURL.path)")
+            AppLogger.sharedData.info("Using App Group container: \(groupURL.path)")
             return groupURL
         }
         // Fallback: app-local Documents directory (still persists across launches)
         if let fallback = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
             _cachedContainerURL = fallback
             _containerResolved = true
-            print("[SharedData] Using fallback Documents directory: \(fallback.path)")
+            AppLogger.sharedData.info("Using fallback Documents directory: \(fallback.path)")
             return fallback
         }
 
-        print("[SharedData] ERROR: No container URL available — both App Group and Documents dir failed")
+        AppLogger.sharedData.error("No container URL available — both App Group and Documents dir failed")
         return nil
     }
 
@@ -197,7 +198,7 @@ enum SharedDataManager {
     /// (used for memories.json). Knowledge base chunks now use SwiftData.
     nonisolated static func ensureDirectoriesExist() {
         guard let docsURL = documentsURL else {
-            print("[SharedData] ERROR: Cannot resolve Documents URL — ensureDirectoriesExist() skipped")
+            AppLogger.sharedData.error("Cannot resolve Documents URL — ensureDirectoriesExist() skipped")
             return
         }
 
@@ -205,9 +206,9 @@ enum SharedDataManager {
         if !fm.fileExists(atPath: docsURL.path) {
             do {
                 try fm.createDirectory(at: docsURL, withIntermediateDirectories: true)
-                print("[SharedData] Created Documents directory: \(docsURL.path)")
+                AppLogger.sharedData.info("Created Documents directory: \(docsURL.path)")
             } catch {
-                print("[SharedData] ERROR creating Documents dir at \(docsURL.path): \(error.localizedDescription)")
+                AppLogger.sharedData.error("Failed creating Documents dir at \(docsURL.path): \(error.localizedDescription)")
             }
         }
     }
@@ -226,6 +227,7 @@ enum SharedDataManager {
         let keywords: [String]
         let sourceConversationTitle: String
         let createdAt: Date
+        let domainID: UUID?
     }
 
     static func loadMemoriesFromFile() -> [MemoryEntry] {
@@ -242,7 +244,8 @@ enum SharedDataManager {
                     keywords: s.keywords,
                     sourceConversationTitle: s.sourceConversationTitle,
                     createdAt: s.createdAt,
-                    embedding: nil  // Recomputed lazily or on access
+                    embedding: nil,  // Recomputed lazily or on access
+                    domainID: s.domainID
                 )
             }
         }
@@ -270,7 +273,8 @@ enum SharedDataManager {
                 content: m.content,
                 keywords: m.keywords,
                 sourceConversationTitle: m.sourceConversationTitle,
-                createdAt: m.createdAt
+                createdAt: m.createdAt,
+                domainID: m.domainID
             )
         }
 
