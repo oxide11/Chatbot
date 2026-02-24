@@ -1,6 +1,7 @@
 import Foundation
 import PDFKit
 import Compression
+import SwiftData
 
 // MARK: - Data Models
 
@@ -39,12 +40,12 @@ struct KnowledgeBase: Identifiable, Codable, Sendable {
     /// Used to detect when re-embedding is needed (e.g. after an OS update).
     var embeddingModelID: String?
 
-    nonisolated init(id: UUID = UUID(), name: String, documentType: DocumentType, chunkCount: Int, fileSize: Int64, embeddingModelID: String? = nil) {
+    nonisolated init(id: UUID = UUID(), name: String, documentType: DocumentType, chunkCount: Int, fileSize: Int64, embeddingModelID: String? = nil, createdAt: Date = Date(), updatedAt: Date = Date()) {
         self.id = id
         self.name = name
         self.documentType = documentType
-        self.createdAt = Date()
-        self.updatedAt = Date()
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
         self.chunkCount = chunkCount
         self.fileSize = fileSize
         self.embeddingModelID = embeddingModelID
@@ -76,8 +77,8 @@ struct DocumentChunk: Identifiable, Codable, Sendable {
     /// Optional for backward compatibility with chunks created before embeddings.
     var embedding: [Double]?
 
-    nonisolated init(knowledgeBaseID: UUID, content: String, keywords: [String], locationLabel: String, index: Int, embedding: [Double]? = nil) {
-        self.id = UUID()
+    nonisolated init(id: UUID = UUID(), knowledgeBaseID: UUID, content: String, keywords: [String], locationLabel: String, index: Int, embedding: [Double]? = nil) {
+        self.id = id
         self.knowledgeBaseID = knowledgeBaseID
         self.content = content
         self.keywords = keywords.map { $0.lowercased() }
@@ -157,12 +158,104 @@ final class KnowledgeBaseStore {
     /// Invalidated whenever chunks are added, removed, or re-embedded.
     private var embeddingMatrix: EmbeddingMatrix?
 
-    private static let metadataFilename = "knowledge_bases.json"
+    /// SwiftData actor for thread-safe persistence. Created via `configure(with:)`.
+    private var dbActor: KnowledgeBaseActor?
+
+    /// Whether `configure(with:)` has been called and initial data loaded.
+    private(set) var isConfigured = false
+
+    /// Legacy metadata filename — used only during one-time migration.
+    private static let legacyMetadataFilename = "knowledge_bases.json"
 
     init() {
-        loadMetadata()
-        verifyDataIntegrity()
-        reembedStaleKnowledgeBasesIfNeeded()
+        // Lightweight init — actual data loading happens in configure(with:)
+    }
+
+    // MARK: - Configuration (SwiftData)
+
+    /// Provide the SwiftData model container. Call once from the view layer.
+    /// Creates the background actor, runs one-time JSON → SwiftData migration,
+    /// loads all KB metadata and chunks, then runs re-embedding if needed.
+    func configure(with modelContainer: ModelContainer) {
+        guard !isConfigured else { return }
+        let actor = KnowledgeBaseActor(modelContainer: modelContainer)
+        self.dbActor = actor
+
+        Task {
+            // One-time migration from old JSON files
+            await performMigrationIfNeeded(actor: actor)
+
+            // Load all data from SwiftData
+            await loadFromSwiftData(actor: actor)
+
+            // Re-embed stale chunks if the OS embedding model has changed
+            await reembedStaleKnowledgeBasesIfNeeded(actor: actor)
+
+            isConfigured = true
+            print("[KBStore] Configuration complete — \(knowledgeBases.count) KBs, \(chunkCache.values.reduce(0) { $0 + $1.count }) chunks loaded")
+        }
+    }
+
+    /// Load all knowledge bases and their chunks from SwiftData into memory.
+    private func loadFromSwiftData(actor: KnowledgeBaseActor) async {
+        do {
+            let kbs = try await actor.loadAllKnowledgeBases()
+            self.knowledgeBases = kbs
+            print("[KBStore] Loaded \(kbs.count) knowledge bases from SwiftData")
+
+            // Eagerly load all chunks into the in-memory cache
+            for kb in kbs {
+                let chunks = try await actor.loadChunks(for: kb.id)
+                chunkCache[kb.id] = chunks
+            }
+
+            invalidateEmbeddingMatrix()
+            invertedKeywordIndex.removeAll()
+        } catch {
+            print("[KBStore] ERROR loading from SwiftData: \(error.localizedDescription)")
+        }
+    }
+
+    /// One-time migration: read old JSON files → insert into SwiftData.
+    private func performMigrationIfNeeded(actor: KnowledgeBaseActor) async {
+        let migrationKey = "kb_migrated_to_swiftdata"
+        guard !UserDefaults.standard.bool(forKey: migrationKey) else { return }
+
+        print("[KBStore] Starting one-time JSON → SwiftData migration…")
+
+        // Read old metadata file
+        SharedDataManager.ensureDirectoriesExist()
+        guard let url = SharedDataManager.documentsURL?.appendingPathComponent(Self.legacyMetadataFilename),
+              FileManager.default.fileExists(atPath: url.path) else {
+            // No old data to migrate — mark as done
+            UserDefaults.standard.set(true, forKey: migrationKey)
+            print("[KBStore] No legacy data found — migration skipped")
+            return
+        }
+
+        do {
+            let data = try Data(contentsOf: url)
+            let oldKBs = try JSONDecoder().decode([KnowledgeBase].self, from: data)
+
+            var chunksByKB: [UUID: [DocumentChunk]] = [:]
+            for kb in oldKBs {
+                if let dir = SharedDataManager.chunksDirectoryURL {
+                    let chunkURL = dir.appendingPathComponent("\(kb.id.uuidString).json")
+                    if FileManager.default.fileExists(atPath: chunkURL.path),
+                       let chunkData = try? Data(contentsOf: chunkURL) {
+                        let chunks = (try? JSONDecoder().decode([DocumentChunk].self, from: chunkData)) ?? []
+                        chunksByKB[kb.id] = chunks
+                    }
+                }
+            }
+
+            try await actor.migrateFromJSON(knowledgeBases: oldKBs, chunksByKB: chunksByKB)
+            UserDefaults.standard.set(true, forKey: migrationKey)
+            print("[KBStore] Migration complete — \(oldKBs.count) KBs migrated")
+        } catch {
+            print("[KBStore] ERROR during migration: \(error.localizedDescription)")
+            // Don't set the flag — retry on next launch
+        }
     }
 
     // MARK: - Embedding Maintenance
@@ -170,8 +263,7 @@ final class KnowledgeBaseStore {
     /// Re-embed any knowledge bases whose stored model ID doesn't match
     /// the current device's embedding model (e.g. after an OS update).
     /// Also embeds chunks that were imported before embeddings were available.
-    /// Runs synchronously on init but the actual embedding is fast (~ms per chunk).
-    private func reembedStaleKnowledgeBasesIfNeeded() {
+    private func reembedStaleKnowledgeBasesIfNeeded(actor: KnowledgeBaseActor) async {
         let service = EmbeddingService.shared
         guard service.isAvailable else { return }
         let currentModelID = service.modelIdentifier
@@ -182,24 +274,34 @@ final class KnowledgeBaseStore {
             // Skip if already embedded with the current model
             if kb.embeddingModelID == currentModelID { continue }
 
-            // Load chunks, re-embed, and save
-            var chunks = loadChunks(for: kb.id)
-            guard !chunks.isEmpty else { continue }
+            // Re-embed cached chunks
+            guard var chunks = chunkCache[kb.id], !chunks.isEmpty else { continue }
 
+            var embeddingUpdates: [UUID: [Double]?] = [:]
             for j in chunks.indices {
-                chunks[j].embedding = service.embed(chunks[j].content)
+                let newEmbedding = service.embed(chunks[j].content)
+                chunks[j].embedding = newEmbedding
+                embeddingUpdates[chunks[j].id] = newEmbedding
             }
 
-            saveChunks(chunks, for: kb.id)
             chunkCache[kb.id] = chunks
             invalidateEmbeddingMatrix()
             invertedKeywordIndex.removeAll()
 
-            // Update the model stamp
+            // Persist updated embeddings to SwiftData
+            do {
+                try await actor.updateEmbeddings(
+                    for: kb.id,
+                    embeddings: embeddingUpdates,
+                    embeddingModelID: currentModelID
+                )
+            } catch {
+                print("[KBStore] ERROR persisting re-embeddings for '\(kb.name)': \(error.localizedDescription)")
+            }
+
+            // Update the model stamp in memory
             knowledgeBases[i].embeddingModelID = currentModelID
         }
-
-        saveMetadata()
     }
 
     // MARK: - Ingestion Pipeline
@@ -267,7 +369,7 @@ final class KnowledgeBaseStore {
             // Security-scoped access must start on the calling thread
             let accessing = job.url.startAccessingSecurityScopedResource()
 
-            // Run all heavy work (extraction, chunking, embedding, file I/O) off the main actor
+            // Run all heavy work (extraction, chunking, embedding) off the main actor
             let outcome = await Task.detached(priority: .userInitiated) {
                 await Self.ingestSingleDocument(url: job.url)
             }.value
@@ -283,7 +385,17 @@ final class KnowledgeBaseStore {
                     chunkCache[result.kb.id] = result.chunks
                     invalidateEmbeddingMatrix()
                     invertedKeywordIndex.removeAll()
-                    saveMetadata()
+
+                    // Persist to SwiftData (fire-and-forget — in-memory state is already updated)
+                    if let actor = dbActor {
+                        Task {
+                            do {
+                                try await actor.insertKnowledgeBase(result.kb, chunks: result.chunks)
+                            } catch {
+                                print("[KBStore] ERROR persisting ingestion result: \(error.localizedDescription)")
+                            }
+                        }
+                    }
                 case .failure(let reason):
                     ingestionQueue[idx].status = .failed(reason)
                 }
@@ -392,7 +504,7 @@ final class KnowledgeBaseStore {
             }
         }
 
-        // Write chunk file to disk (I/O)
+        // Build the KB metadata (persistence happens on the MainActor after return)
         let kb = KnowledgeBase(
             id: kbID,
             name: url.deletingPathExtension().lastPathComponent,
@@ -401,21 +513,6 @@ final class KnowledgeBaseStore {
             fileSize: fileSize,
             embeddingModelID: embeddingService.isAvailable ? embeddingService.modelIdentifier : nil
         )
-
-        SharedDataManager.ensureDirectoriesExist()
-        guard let dir = SharedDataManager.chunksDirectoryURL else {
-            print("[KBStore] ERROR: Storage directory unavailable during ingestion")
-            return .failure("Storage directory unavailable")
-        }
-        let fileURL = dir.appendingPathComponent("\(kbID.uuidString).json")
-        do {
-            let data = try JSONEncoder().encode(allChunks)
-            try data.write(to: fileURL, options: .atomic)
-            print("[KBStore] Saved \(allChunks.count) chunks for '\(kb.name)' (\(data.count) bytes)")
-        } catch {
-            print("[KBStore] ERROR writing chunks during ingestion: \(error.localizedDescription)")
-            return .failure("Failed to save chunks: \(error.localizedDescription)")
-        }
 
         return .success(IngestionResult(kb: kb, chunks: allChunks))
     }
@@ -1075,7 +1172,7 @@ final class KnowledgeBaseStore {
     }
 
     func previewChunks(for kbID: UUID, limit: Int = 5) -> [DocumentChunk] {
-        let chunks = chunkCache[kbID] ?? loadChunks(for: kbID)
+        let chunks = chunkCache[kbID] ?? []
         return Array(chunks.prefix(limit))
     }
 
@@ -1091,15 +1188,15 @@ final class KnowledgeBaseStore {
         knowledgeBases.reduce(0) { $0 + $1.chunkCount }
     }
 
-    /// Total size of chunk JSON files on disk (includes embeddings).
+    /// Estimated total storage used by all knowledge bases (content + embeddings).
     var totalChunkStorageSize: Int64 {
-        guard let dir = SharedDataManager.chunksDirectoryURL else { return 0 }
         var total: Int64 = 0
-        for kb in knowledgeBases {
-            let fileURL = dir.appendingPathComponent("\(kb.id.uuidString).json")
-            if let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
-               let size = attrs[.size] as? Int64 {
-                total += size
+        for (_, chunks) in chunkCache {
+            for chunk in chunks {
+                total += Int64(chunk.content.utf8.count)
+                if chunk.embedding != nil {
+                    total += Int64(512 * MemoryLayout<Double>.size) // 4096 bytes per embedding
+                }
             }
         }
         return total
@@ -1118,24 +1215,30 @@ final class KnowledgeBaseStore {
         chunkCache.removeValue(forKey: kb.id)
         invalidateEmbeddingMatrix()
         invertedKeywordIndex.removeAll()
-        if let dir = SharedDataManager.chunksDirectoryURL {
-            try? FileManager.default.removeItem(at: dir.appendingPathComponent("\(kb.id.uuidString).json"))
+
+        // Persist deletion to SwiftData
+        if let actor = dbActor {
+            Task {
+                do { try await actor.deleteKnowledgeBase(id: kb.id) }
+                catch { print("[KBStore] ERROR deleting KB from SwiftData: \(error.localizedDescription)") }
+            }
         }
-        saveMetadata()
     }
 
     func deleteAllKnowledgeBases() {
-        for kb in knowledgeBases {
-            if let dir = SharedDataManager.chunksDirectoryURL {
-                try? FileManager.default.removeItem(at: dir.appendingPathComponent("\(kb.id.uuidString).json"))
-            }
-        }
         knowledgeBases.removeAll()
         chunkCache.removeAll()
         chunkKeywordCache.removeAll()
         invalidateEmbeddingMatrix()
         invertedKeywordIndex.removeAll()
-        saveMetadata()
+
+        // Persist deletion to SwiftData
+        if let actor = dbActor {
+            Task {
+                do { try await actor.deleteAllKnowledgeBases() }
+                catch { print("[KBStore] ERROR deleting all KBs: \(error.localizedDescription)") }
+            }
+        }
     }
 
     func renameKnowledgeBase(_ kb: KnowledgeBase, to newName: String) {
@@ -1144,7 +1247,14 @@ final class KnowledgeBaseStore {
         guard let index = knowledgeBases.firstIndex(where: { $0.id == kb.id }) else { return }
         knowledgeBases[index].name = trimmed
         knowledgeBases[index].updatedAt = Date()
-        saveMetadata()
+
+        // Persist to SwiftData
+        if let actor = dbActor {
+            Task {
+                do { try await actor.renameKnowledgeBase(id: kb.id, to: trimmed) }
+                catch { print("[KBStore] ERROR renaming KB: \(error.localizedDescription)") }
+            }
+        }
     }
 
     func deleteChunk(chunkID: UUID, from kbID: UUID) {
@@ -1164,9 +1274,13 @@ final class KnowledgeBaseStore {
         invalidateEmbeddingMatrix()
         invertedKeywordIndex.removeAll()
 
-        // Persist changes
-        saveChunks(chunks, for: kbID)
-        saveMetadata()
+        // Persist to SwiftData
+        if let actor = dbActor {
+            Task {
+                do { try await actor.deleteChunk(id: chunkID, from: kbID) }
+                catch { print("[KBStore] ERROR deleting chunk: \(error.localizedDescription)") }
+            }
+        }
     }
 
     /// Re-import a document for an existing KB, replacing all chunks but keeping the same KB identity.
@@ -1225,8 +1339,21 @@ final class KnowledgeBaseStore {
 
                         invalidateEmbeddingMatrix()
                         invertedKeywordIndex.removeAll()
-                        saveChunks(rekeyedChunks, for: kb.id)
-                        saveMetadata()
+
+                        // Persist to SwiftData
+                        if let actor = dbActor {
+                            Task {
+                                do {
+                                    try await actor.replaceChunks(
+                                        for: kb.id,
+                                        newChunks: rekeyedChunks,
+                                        embeddingModelID: result.kb.embeddingModelID
+                                    )
+                                } catch {
+                                    print("[KBStore] ERROR persisting re-import: \(error.localizedDescription)")
+                                }
+                            }
+                        }
                     }
 
                 case .failure(let reason):
@@ -1262,8 +1389,18 @@ final class KnowledgeBaseStore {
                     self.chunkCache[ingestionResult.kb.id] = ingestionResult.chunks
                     self.invalidateEmbeddingMatrix()
                     self.invertedKeywordIndex.removeAll()
-                    self.saveMetadata()
                     print("[KBStore] Ingested text '\(trimmedName)' — \(ingestionResult.chunks.count) chunks")
+
+                    // Persist to SwiftData
+                    if let actor = self.dbActor {
+                        Task {
+                            do {
+                                try await actor.insertKnowledgeBase(ingestionResult.kb, chunks: ingestionResult.chunks)
+                            } catch {
+                                print("[KBStore] ERROR persisting text ingestion: \(error.localizedDescription)")
+                            }
+                        }
+                    }
                 case .failure(let reason):
                     self.processingError = reason
                     print("[KBStore] Text ingestion failed: \(reason)")
@@ -1274,6 +1411,7 @@ final class KnowledgeBaseStore {
     }
 
     /// Background-safe plain text ingestion pipeline.
+    /// No file I/O — just extraction, chunking, and embedding.
     nonisolated private static func ingestPlainText(
         kbID: UUID,
         name: String,
@@ -1315,141 +1453,92 @@ final class KnowledgeBaseStore {
             embeddingModelID: embeddingService.isAvailable ? embeddingService.modelIdentifier : nil
         )
 
-        SharedDataManager.ensureDirectoriesExist()
-        guard let dir = SharedDataManager.chunksDirectoryURL else {
-            return .failure("Storage directory unavailable")
-        }
-        let fileURL = dir.appendingPathComponent("\(kbID.uuidString).json")
-        do {
-            let data = try JSONEncoder().encode(allChunks)
-            try data.write(to: fileURL, options: .atomic)
-        } catch {
-            return .failure("Failed to save: \(error.localizedDescription)")
-        }
-
         return .success(IngestionResult(kb: kb, chunks: allChunks))
     }
 
     /// Load all chunks for a knowledge base (full set, not just preview).
     func allChunks(for kbID: UUID) -> [DocumentChunk] {
-        if let cached = chunkCache[kbID] {
-            return cached
-        }
-        let loaded = loadChunks(for: kbID)
-        chunkCache[kbID] = loaded
-        return loaded
+        return chunkCache[kbID] ?? []
     }
 
-    /// Calculate actual disk usage for a single knowledge base's chunk file.
+    /// Estimated storage size for a single knowledge base.
     func storageSize(for kb: KnowledgeBase) -> Int64 {
-        guard let dir = SharedDataManager.chunksDirectoryURL else { return 0 }
-        let fileURL = dir.appendingPathComponent("\(kb.id.uuidString).json")
-        guard let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
-              let size = attrs[.size] as? Int64 else { return 0 }
-        return size
-    }
-
-    // MARK: - Persistence (file-based, hardened)
-
-    private func saveMetadata() {
-        SharedDataManager.ensureDirectoriesExist()
-        guard let url = SharedDataManager.documentsURL?.appendingPathComponent(Self.metadataFilename) else {
-            print("[KBStore] ERROR: Cannot resolve metadata file URL for save")
-            return
-        }
-        do {
-            let data = try JSONEncoder().encode(knowledgeBases)
-            try data.write(to: url, options: .atomic)
-            print("[KBStore] Saved \(knowledgeBases.count) knowledge bases (\(data.count) bytes)")
-        } catch {
-            print("[KBStore] ERROR saving metadata: \(error.localizedDescription)")
-        }
-    }
-
-    private func loadMetadata() {
-        guard let url = SharedDataManager.documentsURL?.appendingPathComponent(Self.metadataFilename) else {
-            print("[KBStore] WARNING: Cannot resolve metadata file URL during load")
-            return
-        }
-        guard FileManager.default.fileExists(atPath: url.path) else {
-            print("[KBStore] No metadata file found — starting fresh")
-            return
-        }
-        do {
-            let data = try Data(contentsOf: url)
-            let decoded = try JSONDecoder().decode([KnowledgeBase].self, from: data)
-            knowledgeBases = decoded
-            print("[KBStore] Loaded \(decoded.count) knowledge bases from disk")
-        } catch {
-            print("[KBStore] ERROR loading metadata: \(error.localizedDescription)")
-            knowledgeBases = []
-        }
-    }
-
-    /// Verify that chunk files exist for all metadata entries.
-    /// Removes orphaned metadata entries that have no chunk file on disk.
-    private func verifyDataIntegrity() {
-        guard let dir = SharedDataManager.chunksDirectoryURL else { return }
-        var orphaned: [UUID] = []
-        for kb in knowledgeBases {
-            let fileURL = dir.appendingPathComponent("\(kb.id.uuidString).json")
-            if !FileManager.default.fileExists(atPath: fileURL.path) {
-                print("[KBStore] INTEGRITY: Chunk file missing for '\(kb.name)' (\(kb.id)) — removing entry")
-                orphaned.append(kb.id)
+        guard let chunks = chunkCache[kb.id] else { return 0 }
+        var total: Int64 = 0
+        for chunk in chunks {
+            total += Int64(chunk.content.utf8.count)
+            if chunk.embedding != nil {
+                total += Int64(512 * MemoryLayout<Double>.size)
             }
         }
-        if !orphaned.isEmpty {
-            knowledgeBases.removeAll { orphaned.contains($0.id) }
-            saveMetadata()
-            print("[KBStore] Removed \(orphaned.count) orphaned metadata entries")
-        }
+        return total
     }
 
-    private func saveChunks(_ chunks: [DocumentChunk], for kbID: UUID) {
-        SharedDataManager.ensureDirectoriesExist()
-        guard let dir = SharedDataManager.chunksDirectoryURL else {
-            print("[KBStore] ERROR: Cannot resolve chunks directory for save")
-            return
+    // MARK: - Export
+
+    /// Export a knowledge base as a JSON file for sharing.
+    /// Returns a temporary file URL suitable for `ShareLink` or `UIActivityViewController`.
+    func exportKnowledgeBase(_ kb: KnowledgeBase) -> URL? {
+        let chunks = allChunks(for: kb.id)
+
+        struct ExportData: Encodable {
+            let knowledgeBase: KnowledgeBase
+            let chunks: [DocumentChunk]
+            let exportDate: Date
         }
-        let fileURL = dir.appendingPathComponent("\(kbID.uuidString).json")
+
+        let export = ExportData(
+            knowledgeBase: kb,
+            chunks: chunks,
+            exportDate: Date()
+        )
+
+        // Sanitize filename
+        let safeName = kb.name
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ":", with: "-")
+            .prefix(100)
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("\(safeName).engram-kb.json")
+
         do {
-            let data = try JSONEncoder().encode(chunks)
-            try data.write(to: fileURL, options: .atomic)
-            print("[KBStore] Saved \(chunks.count) chunks for KB \(kbID) (\(data.count) bytes)")
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = .prettyPrinted
+            let data = try encoder.encode(export)
+            try data.write(to: tempURL, options: .atomic)
+            print("[KBStore] Exported KB '\(kb.name)' — \(data.count) bytes")
+            return tempURL
         } catch {
-            print("[KBStore] ERROR saving chunks for \(kbID): \(error.localizedDescription)")
+            print("[KBStore] ERROR exporting KB: \(error.localizedDescription)")
+            return nil
         }
     }
 
-    private func loadChunks(for kbID: UUID) -> [DocumentChunk] {
-        guard let dir = SharedDataManager.chunksDirectoryURL else {
-            print("[KBStore] WARNING: Cannot resolve chunks directory for load")
-            return []
-        }
-        let fileURL = dir.appendingPathComponent("\(kbID.uuidString).json")
-        guard FileManager.default.fileExists(atPath: fileURL.path) else {
-            print("[KBStore] WARNING: No chunk file found for KB \(kbID)")
-            return []
-        }
-        do {
-            let data = try Data(contentsOf: fileURL)
-            let decoded = try JSONDecoder().decode([DocumentChunk].self, from: data)
-            return decoded
-        } catch {
-            print("[KBStore] ERROR loading chunks for \(kbID): \(error.localizedDescription)")
-            return []
-        }
-    }
+    // MARK: - Chunk Loading
 
+    /// Ensure all knowledge bases have their chunks loaded into the in-memory cache.
+    /// After `configure()`, all chunks are already loaded, so this is a fast no-op
+    /// for normal operation. Only triggers a load for KBs that somehow missed caching.
     private func ensureAllChunksLoaded() {
-        var didLoad = false
-        for kb in knowledgeBases where chunkCache[kb.id] == nil {
-            chunkCache[kb.id] = loadChunks(for: kb.id)
-            didLoad = true
-        }
-        if didLoad {
-            invalidateEmbeddingMatrix()
-            invertedKeywordIndex.removeAll()
+        // All chunks are eagerly loaded during configure(). This check handles edge cases.
+        let missingKBs = knowledgeBases.filter { chunkCache[$0.id] == nil }
+        guard !missingKBs.isEmpty else { return }
+
+        // Load missing chunks asynchronously via the actor
+        if let actor = dbActor {
+            Task {
+                for kb in missingKBs {
+                    do {
+                        let chunks = try await actor.loadChunks(for: kb.id)
+                        chunkCache[kb.id] = chunks
+                    } catch {
+                        print("[KBStore] ERROR lazy-loading chunks for '\(kb.name)': \(error.localizedDescription)")
+                        chunkCache[kb.id] = []
+                    }
+                }
+                invalidateEmbeddingMatrix()
+                invertedKeywordIndex.removeAll()
+            }
         }
     }
 }

@@ -102,6 +102,7 @@ struct ContentView: View {
         .onAppear {
             store.conversations.first?.checkAvailability()
             store.configureOrchestrator(with: modelContext)
+            store.configureKnowledgeBaseStore(with: modelContext)
             // Ensure embedding model assets are downloaded for semantic RAG
             EmbeddingService.shared.requestAssetsIfNeeded()
         }
@@ -1956,6 +1957,8 @@ struct KnowledgeBaseDetailView: View {
     @State private var showingReimporter = false
     @State private var showingRenameAlert = false
     @State private var renameDraft = ""
+    @State private var exportURL: URL?
+    @State private var showingExportShare = false
 
     var body: some View {
         List {
@@ -2076,6 +2079,15 @@ struct KnowledgeBaseDetailView: View {
                         Label("Re-import Document", systemImage: "arrow.triangle.2.circlepath")
                     }
 
+                    Button {
+                        exportURL = store.exportKnowledgeBase(kb)
+                        if exportURL != nil {
+                            showingExportShare = true
+                        }
+                    } label: {
+                        Label("Export", systemImage: "square.and.arrow.up")
+                    }
+
                     Divider()
 
                     Button(role: .destructive) {
@@ -2115,8 +2127,45 @@ struct KnowledgeBaseDetailView: View {
                 store.updateDocument(for: kb, from: url)
             }
         }
+        .sheet(isPresented: $showingExportShare) {
+            if let url = exportURL {
+                #if os(iOS) || os(tvOS) || os(visionOS)
+                ShareSheetView(items: [url])
+                #else
+                // On macOS, use ShareLink or handle differently
+                VStack(spacing: 16) {
+                    Text("Export Successful")
+                        .font(.headline)
+                    Text("File saved to: \(url.path)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    ShareLink(item: url) {
+                        Label("Share File", systemImage: "square.and.arrow.up")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    Button("Done") {
+                        showingExportShare = false
+                    }
+                }
+                .padding()
+                #endif
+            }
+        }
     }
 }
+
+#if os(iOS) || os(tvOS) || os(visionOS)
+/// Minimal UIActivityViewController wrapper for sharing exported KB files.
+struct ShareSheetView: UIViewControllerRepresentable {
+    let items: [Any]
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
+}
+#endif
 
 // MARK: - Preview
 

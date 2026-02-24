@@ -144,15 +144,36 @@ enum SharedDataManager {
     // Path lookups and directory creation are safe from any thread.
     // Falls back to the app's own Documents directory if the App Group
     // container is unavailable (e.g. simulator without entitlements).
+    //
+    // URLs are cached after first resolution to avoid repeated filesystem
+    // lookups and eliminate race conditions on background threads.
+
+    /// Cached container URL — resolved once and reused for the process lifetime.
+    private nonisolated(unsafe) static var _cachedContainerURL: URL?
+    private nonisolated(unsafe) static var _containerResolved = false
 
     /// Root directory for file-based storage.
     /// Prefers the App Group shared container; falls back to the app's Documents dir.
+    /// Result is cached after first successful resolution.
     nonisolated static var containerURL: URL? {
+        if _containerResolved { return _cachedContainerURL }
+
         if let groupURL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: suiteName) {
+            _cachedContainerURL = groupURL
+            _containerResolved = true
+            print("[SharedData] Using App Group container: \(groupURL.path)")
             return groupURL
         }
         // Fallback: app-local Documents directory (still persists across launches)
-        return FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+        if let fallback = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
+            _cachedContainerURL = fallback
+            _containerResolved = true
+            print("[SharedData] Using fallback Documents directory: \(fallback.path)")
+            return fallback
+        }
+
+        print("[SharedData] ERROR: No container URL available — both App Group and Documents dir failed")
+        return nil
     }
 
     /// Documents directory inside the container.
@@ -160,7 +181,8 @@ enum SharedDataManager {
         containerURL?.appendingPathComponent("Documents", isDirectory: true)
     }
 
-    /// Chunks directory for knowledge base storage.
+    /// Legacy chunks directory — used only during one-time migration from JSON to SwiftData.
+    /// Knowledge base chunks are now stored in SwiftData (Application Support/default.store).
     nonisolated static var chunksDirectoryURL: URL? {
         documentsURL?.appendingPathComponent("chunks", isDirectory: true)
     }
@@ -171,11 +193,22 @@ enum SharedDataManager {
     }
 
     /// Ensure the file-based storage directories exist.
+    /// Safe to call from any thread. Only creates the Documents directory
+    /// (used for memories.json). Knowledge base chunks now use SwiftData.
     nonisolated static func ensureDirectoriesExist() {
-        guard let docsURL = documentsURL else { return }
-        try? FileManager.default.createDirectory(at: docsURL, withIntermediateDirectories: true)
-        if let chunksURL = chunksDirectoryURL {
-            try? FileManager.default.createDirectory(at: chunksURL, withIntermediateDirectories: true)
+        guard let docsURL = documentsURL else {
+            print("[SharedData] ERROR: Cannot resolve Documents URL — ensureDirectoriesExist() skipped")
+            return
+        }
+
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: docsURL.path) {
+            do {
+                try fm.createDirectory(at: docsURL, withIntermediateDirectories: true)
+                print("[SharedData] Created Documents directory: \(docsURL.path)")
+            } catch {
+                print("[SharedData] ERROR creating Documents dir at \(docsURL.path): \(error.localizedDescription)")
+            }
         }
     }
 

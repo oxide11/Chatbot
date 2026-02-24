@@ -849,6 +849,11 @@ final class ConversationStore {
         }
     }
 
+    /// Provide the SwiftData ModelContainer to the knowledge base store. Call from the view layer.
+    func configureKnowledgeBaseStore(with modelContext: ModelContext) {
+        knowledgeBaseStore.configure(with: modelContext.container)
+    }
+
     func createConversation() -> ChatViewModel {
         let conversation = ChatViewModel()
         conversation.checkAvailability()
