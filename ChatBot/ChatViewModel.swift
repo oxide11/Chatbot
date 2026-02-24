@@ -614,6 +614,8 @@ final class ChatViewModel: Identifiable {
             let budget = maxContextChars - usedChars
             let relevantChunks = kbStore.retrieve(for: userText, limit: ragSettings.maxDocumentChunks)
             if !relevantChunks.isEmpty {
+                // Build a lookup dictionary once instead of O(N) linear search per chunk
+                let kbLookup = Dictionary(uniqueKeysWithValues: kbStore.knowledgeBases.map { ($0.id, $0.name) })
                 var chunkTexts: [String] = []
                 var chunkChars = 0
                 for chunk in relevantChunks {
@@ -622,9 +624,9 @@ final class ChatViewModel: Identifiable {
                     chunkTexts.append(text)
                     chunkChars += text.count
                     chunkCount += 1
-                    // Resolve KB name
-                    if let kb = kbStore.knowledgeBases.first(where: { $0.id == chunk.knowledgeBaseID }) {
-                        docNames.insert(kb.name)
+                    // Resolve KB name via O(1) dictionary lookup
+                    if let name = kbLookup[chunk.knowledgeBaseID] {
+                        docNames.insert(name)
                     }
                 }
                 if !chunkTexts.isEmpty {

@@ -883,12 +883,15 @@ final class KnowledgeBaseStore {
         return fullMatrixRetrieval(queryVector: queryVector, limit: limit, matrix: matrix)
     }
 
-    /// Full matrix batch cosine similarity — scores all chunks at once via BLAS.
+    /// Full matrix batch dot product — scores all chunks at once via Float32 BLAS.
+    /// Since embeddings are pre-normalized, dot product = cosine similarity.
     private func fullMatrixRetrieval(queryVector: [Double], limit: Int, matrix: EmbeddingMatrix) -> [DocumentChunk] {
-        let similarities = EmbeddingService.batchCosineSimilarity(
-            query: queryVector,
+        let floatQuery = EmbeddingMatrix.prepareQuery(queryVector, dimension: matrix.dimension)
+
+        let similarities = EmbeddingService.batchDotProduct(
+            query: floatQuery,
             matrix: matrix.data,
-            norms: matrix.norms,
+            count: matrix.rowCount,
             dimension: matrix.dimension
         )
 
@@ -927,10 +930,9 @@ final class KnowledgeBaseStore {
             return fullMatrixRetrieval(queryVector: queryVector, limit: limit, matrix: matrix)
         }
 
-        // Phase 2: Build a smaller matrix from candidates and score with Accelerate
+        // Phase 2: Build a smaller Float32 matrix from candidates and score
         let dim = matrix.dimension
-        var subMatrix: [Double] = []
-        var subNorms: [Double] = []
+        var subMatrix: [Float] = []
         var subRowMap: [(UUID, Int)] = []
 
         subMatrix.reserveCapacity(candidateChunkIDs.count * dim)
@@ -943,7 +945,6 @@ final class KnowledgeBaseStore {
             let start = rowIdx * dim
             let end = start + dim
             subMatrix.append(contentsOf: matrix.data[start ..< end])
-            subNorms.append(matrix.norms[rowIdx])
             subRowMap.append(mapping)
         }
 
@@ -951,17 +952,18 @@ final class KnowledgeBaseStore {
             return fullMatrixRetrieval(queryVector: queryVector, limit: limit, matrix: matrix)
         }
 
-        let similarities = EmbeddingService.batchCosineSimilarity(
-            query: queryVector,
+        let floatQuery = EmbeddingMatrix.prepareQuery(queryVector, dimension: dim)
+
+        let similarities = EmbeddingService.batchDotProduct(
+            query: floatQuery,
             matrix: subMatrix,
-            norms: subNorms,
+            count: subRowMap.count,
             dimension: dim
         )
 
         // Use the sub-matrix row map for resolution
         let subEmbeddingMatrix = EmbeddingMatrix(
             data: subMatrix,
-            norms: subNorms,
             dimension: dim,
             rowCount: subRowMap.count,
             rowMap: subRowMap
@@ -970,14 +972,14 @@ final class KnowledgeBaseStore {
         return topK(similarities: similarities, matrix: subEmbeddingMatrix, limit: limit, threshold: 0.3)
     }
 
-    /// Extract the top-K results from a similarity array using partial sort.
+    /// Extract the top-K results from a Float32 similarity array using partial sort.
     /// More efficient than full sort when K << N.
-    private func topK(similarities: [Double], matrix: EmbeddingMatrix, limit: Int, threshold: Double) -> [DocumentChunk] {
+    private func topK(similarities: [Float], matrix: EmbeddingMatrix, limit: Int, threshold: Float) -> [DocumentChunk] {
         // Use a min-heap approach: maintain the K best scores
         // For typical K=3 and N=1000+, this is O(N log K) vs O(N log N) for full sort
         struct ScoredRow: Comparable {
             let rowIndex: Int
-            let score: Double
+            let score: Float
             static func < (lhs: ScoredRow, rhs: ScoredRow) -> Bool { lhs.score < rhs.score }
         }
 
