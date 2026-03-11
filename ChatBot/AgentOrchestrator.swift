@@ -95,14 +95,21 @@ final class AgentOrchestrator {
         var fullInstructions = baseInstructions
 
         if !tools.isEmpty {
-            // Keep the coordinator preamble minimal — the tool names and descriptions
-            // are already included in the tool schema by the framework, so we only need
-            // a short behavioural instruction here to save context tokens.
-            fullInstructions += "\nYou have worker tools. Answer simple questions directly. Delegate specialised tasks to the matching tool."
+            // Provide clear delegation instructions so the Manager knows when and how
+            // to use workers vs. answering directly. Tool schemas are already injected
+            // by the framework, so we focus on behavioral guidance here.
+            fullInstructions += """
+
+            You have access to specialized worker tools. Follow these delegation rules:
+            - For simple questions, greetings, or general conversation: answer directly without using any tool.
+            - For tasks that match a worker's specialty (e.g. proofreading, summarizing, translating, code review): delegate to the appropriate worker tool by passing the relevant text as the task.
+            - Use only one worker per response unless the user explicitly asks for multiple operations.
+            - After receiving a worker's result, present it to the user naturally. Do not mention the worker by name or say "I used a tool."
+            """
         }
 
         if let summary = conversationSummary, !summary.isEmpty {
-            fullInstructions += "\nContext: \(summary)"
+            fullInstructions += "\nConversation context (summary of prior messages): \(summary)\nContinue the conversation naturally from where it left off."
         }
 
         let instructions = fullInstructions

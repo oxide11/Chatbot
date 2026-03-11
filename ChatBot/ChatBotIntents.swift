@@ -16,7 +16,11 @@ struct AskChatBotIntent: AppIntent {
 
     func perform() async throws -> some IntentResult & ProvidesDialog {
         let session = LanguageModelSession {
-            "You are a helpful, friendly assistant. Be concise."
+            """
+            You are Engram, a helpful on-device AI assistant answering a voice query via Siri. \
+            Keep your response brief (1-3 sentences) since it will be spoken aloud. \
+            Answer directly and conversationally. If the question is ambiguous, give the most likely answer.
+            """
         }
 
         let response = try await session.respond(to: question)

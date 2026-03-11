@@ -213,13 +213,24 @@ final class MemoryStore {
         saveToDisk()
     }
 
-    /// Extract memories from a conversation summary using the on-device model
+    /// Extract memories from a conversation summary using the on-device model.
+    /// Uses few-shot prompting with explicit format examples for reliable structured output.
     func extractMemories(from transcript: String, conversationTitle: String, domainID: UUID = KnowledgeDomain.generalID) async {
         let extractionSession = LanguageModelSession {
             """
-            Extract 1-3 key facts or decisions from this conversation.
-            Format: [keyword1, keyword2] Fact text.
-            If nothing notable, respond: NONE
+            You are a fact extractor. Your role is to identify 1-3 important facts, decisions, or preferences from a conversation transcript.
+
+            Instructions:
+            - Extract only concrete, reusable facts (e.g. preferences, decisions, names, dates, technical choices).
+            - Ignore greetings, filler, and questions that were not answered.
+            - Each fact must be a self-contained sentence that makes sense without the original conversation.
+            - Format each fact on its own line as: [keyword1, keyword2] Fact sentence here.
+            - If no notable facts exist, respond with exactly: NONE
+
+            Examples:
+            [python, preference] The user prefers Python for scripting tasks.
+            [meeting, tuesday] Weekly team meeting is scheduled for Tuesdays at 10am.
+            [api, openai] The project uses the OpenAI API with GPT-4 for summarization.
             """
         }
 
@@ -228,13 +239,24 @@ final class MemoryStore {
             maximumResponseTokens: 200
         )
 
+        // Guard against empty or trivially short transcripts
+        let trimmedTranscript = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmedTranscript.count >= 20 else { return }
+
         do {
-            let response = try await extractionSession.respond(to: transcript, options: extractionOptions)
+            let response = try await extractionSession.respond(to: trimmedTranscript, options: extractionOptions)
             let lines = response.content.components(separatedBy: "\n").filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
 
             for line in lines {
-                let trimmedLine = line.trimmingCharacters(in: .whitespaces)
-                if trimmedLine.uppercased() == "NONE" || trimmedLine.isEmpty { continue }
+                // Strip leading bullets, dashes, or numbering (e.g. "- [kw] fact" or "1. [kw] fact")
+                var trimmedLine = line.trimmingCharacters(in: .whitespaces)
+                if let firstBracket = trimmedLine.firstIndex(of: "["), firstBracket != trimmedLine.startIndex {
+                    // Remove any prefix before the opening bracket (bullets, numbering, etc.)
+                    trimmedLine = String(trimmedLine[firstBracket...])
+                }
+                trimmedLine = trimmedLine.trimmingCharacters(in: .whitespaces)
+
+                if trimmedLine.uppercased().contains("NONE") || trimmedLine.isEmpty { continue }
 
                 // Parse "[keyword1, keyword2] fact text"
                 if trimmedLine.hasPrefix("["),
@@ -260,7 +282,7 @@ final class MemoryStore {
                 }
             }
         } catch {
-            // Extraction failed silently — not critical
+            AppLogger.chat.warning("Memory extraction failed: \(error.localizedDescription)")
         }
     }
 
@@ -341,9 +363,17 @@ final class ChatViewModel: Identifiable {
     private static let estimatedMaxTokens = 4096.0
     private static let charsPerToken = 3.5
 
-    /// Concise system prompt optimised for the small on-device model.
-    /// Shorter instructions leave more context for the actual conversation.
-    static let defaultInstructions = "Be helpful, friendly, and concise. Answer directly."
+    /// System prompt optimised for the on-device model.
+    /// Follows prompt engineering best practices: Role, Instruction, Tone, and Formatting.
+    /// Kept compact to preserve context budget on the ~3B parameter model.
+    static let defaultInstructions = """
+        You are Engram, a knowledgeable and friendly on-device AI assistant. \
+        Your role is to help the user by answering questions clearly, solving problems step by step, and assisting with everyday tasks. \
+        When given reference material, use it only if directly relevant to the question. \
+        Respond concisely in a warm, conversational tone. \
+        Use short paragraphs and bullet points for clarity when listing multiple items. \
+        If you are unsure about something, say so honestly rather than guessing.
+        """
 
     var activeInstructions: String {
         customSystemPrompt?.isEmpty == false
@@ -369,7 +399,12 @@ final class ChatViewModel: Identifiable {
         } else if let summary = conversationSummary, !summary.isEmpty {
             let inst = instructions
             return LanguageModelSession {
-                "\(inst)\nContext: \(summary)"
+                """
+                \(inst)
+
+                Conversation context (summary of prior messages): \(summary)
+                Continue the conversation naturally from where it left off.
+                """
             }
         } else {
             let inst = instructions
@@ -657,7 +692,7 @@ final class ChatViewModel: Identifiable {
             if !relevantMemories.isEmpty {
                 memoryCount = relevantMemories.count
                 let block = relevantMemories.map { "- \($0.content)" }.joined(separator: "\n")
-                contextBlocks.append("Remembered context from previous conversations:\n\(block)")
+                contextBlocks.append("**Memories** (facts recalled from previous conversations):\n\(block)")
                 usedChars += block.count
             }
         }
@@ -683,7 +718,7 @@ final class ChatViewModel: Identifiable {
                     }
                 }
                 if !chunkTexts.isEmpty {
-                    contextBlocks.append("Relevant knowledge base excerpts:\n\(chunkTexts.joined(separator: "\n---\n"))")
+                    contextBlocks.append("**Knowledge Base Excerpts** (from imported documents):\n\(chunkTexts.joined(separator: "\n---\n"))")
                 }
             }
         }
@@ -698,16 +733,17 @@ final class ChatViewModel: Identifiable {
             return (userText, ragContext)
         }
 
-        // Format: user question FIRST, then supplementary context AFTER.
-        // This ensures the model prioritises the question and its own knowledge,
-        // treating the retrieved context as optional reference material only.
+        // Format: user question FIRST, then structured reference context AFTER.
+        // Clear RAG integration instructions help the model use retrieved content appropriately.
         let enriched = """
         \(userText)
 
         ---
-        Note: The following is supplementary reference material that MAY be relevant. \
-        Only use it if it directly relates to the question above. \
-        Otherwise rely on your own knowledge.
+        **Reference Material** (retrieved from your knowledge base and memory):
+        Use the following information to support your answer when it is directly relevant to the question above. \
+        If the reference material does not relate to the question, ignore it and rely on your own knowledge. \
+        When you do use reference material, incorporate it naturally — do not simply repeat it verbatim. \
+        Never mention that you are using "reference material" or "retrieved context" in your response.
 
         \(contextBlocks.joined(separator: "\n\n"))
         """
@@ -744,7 +780,7 @@ final class ChatViewModel: Identifiable {
                 try await streamResponse(to: originalPrompt)
                 turnCount = 1
             } catch {
-                messages.append(Message(role: .system, content: "Unable to continue — the message may be too long for on-device AI."))
+                messages.append(Message(role: .system, content: "Unable to process this message — it may exceed the on-device model's context limit. Try breaking your message into smaller parts."))
             }
         default:
             messages.append(Message(role: .system, content: "Error: \(error.localizedDescription)"))
@@ -764,9 +800,19 @@ final class ChatViewModel: Identifiable {
             await store.extractMemories(from: transcript, conversationTitle: title, domainID: domainID)
         }
 
-        // Summarise for the new session — use greedy sampling for a deterministic, focused summary
+        // Summarise for the new session — use greedy sampling for a deterministic, focused summary.
+        // Uses instructive prompting with clear formatting guidance for reliable continuation.
         let summarySession = LanguageModelSession {
-            "Summarize this conversation in 2 concise sentences. State only topics discussed and decisions made."
+            """
+            You are a conversation summarizer. Your role is to create a brief context summary that allows a conversation to continue seamlessly.
+
+            Instructions:
+            - Write exactly 2-3 sentences summarizing the conversation so far.
+            - Prioritize: (1) the main topic or question, (2) any decisions or conclusions reached, (3) the user's current need or next step.
+            - Use third-person perspective (e.g. "The user asked about..." or "They discussed...").
+            - Do not include greetings, filler, or meta-commentary.
+            - The summary must be self-contained — a reader should understand the conversation state without seeing the original messages.
+            """
         }
 
         let greedyOptions = GenerationOptions(
@@ -791,7 +837,7 @@ final class ChatViewModel: Identifiable {
         session.prewarm()
         turnCount = 0
 
-        messages.append(Message(role: .system, content: "Context refreshed — I still remember the key points."))
+        messages.append(Message(role: .system, content: "Context window refreshed. The conversation summary has been preserved so I can continue seamlessly."))
     }
 
     private func updateContextEstimate() {
