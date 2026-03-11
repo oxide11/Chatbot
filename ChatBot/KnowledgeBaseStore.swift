@@ -1395,10 +1395,23 @@ final class KnowledgeBaseStore {
         let b = 0.75
 
         // Compute IDF for each query term (using domain scope)
+        // Iterate the smaller of the two sets to avoid allocating a temporary intersection.
         let domainChunkSet = Set(domainChunkIDs)
         var termIDF: [String: Double] = [:]
         for word in queryWords {
-            let docsContaining = invertedKeywordIndex[word]?.intersection(domainChunkSet).count ?? 0
+            var docsContaining = 0
+            if let postingList = invertedKeywordIndex[word] {
+                // Count domain-scoped hits without allocating an intersection set
+                if postingList.count <= domainChunkSet.count {
+                    for chunkID in postingList where domainChunkSet.contains(chunkID) {
+                        docsContaining += 1
+                    }
+                } else {
+                    for chunkID in domainChunkSet where postingList.contains(chunkID) {
+                        docsContaining += 1
+                    }
+                }
+            }
             // IDF with smoothing: log((N - n(t) + 0.5) / (n(t) + 0.5) + 1)
             let idf = log((n - Double(docsContaining) + 0.5) / (Double(docsContaining) + 0.5) + 1.0)
             termIDF[word] = idf
@@ -1555,9 +1568,10 @@ final class KnowledgeBaseStore {
             let denseWeight: Float = 1.0 - lexicalWeight
             for i in 0 ..< similarities.count {
                 let mapping = matrix.rowMap[i]
-                let chunk = chunkCache[mapping.knowledgeBaseID]?[mapping.chunkIndex]
-                let bm25 = chunk.flatMap { bm25Scores[$0.id] } ?? 0
-                // Hybrid score: weighted combination of dense cosine similarity and BM25
+                // Bounds-check to guard against stale rowMap indices after chunkCache mutations
+                guard let chunks = chunkCache[mapping.knowledgeBaseID],
+                      mapping.chunkIndex < chunks.count else { continue }
+                let bm25 = bm25Scores[chunks[mapping.chunkIndex].id] ?? 0
                 similarities[i] = denseWeight * similarities[i] + lexicalWeight * bm25
             }
         }
@@ -1574,16 +1588,31 @@ final class KnowledgeBaseStore {
         }
 
         // Phase 1: Keyword pre-filter — find candidate chunk IDs
+        // Build domain chunk ID set from the matrix to scope candidates correctly
+        // (the inverted index is global across all domains)
+        var domainChunkIDs = Set<UUID>()
+        for mapping in matrix.rowMap {
+            if let chunks = chunkCache[mapping.knowledgeBaseID],
+               mapping.chunkIndex < chunks.count {
+                domainChunkIDs.insert(chunks[mapping.chunkIndex].id)
+            }
+        }
+
         var candidateChunkIDs = Set<UUID>()
         for word in queryWords {
             if let chunkIDs = invertedKeywordIndex[word] {
-                candidateChunkIDs.formUnion(chunkIDs)
+                // Only include chunks from this domain
+                for id in chunkIDs where domainChunkIDs.contains(id) {
+                    candidateChunkIDs.insert(id)
+                }
             }
             // Also check prefix matches for longer words
             if word.count >= 5 {
                 for (indexWord, chunkIDs) in invertedKeywordIndex where indexWord.count >= 5 {
                     if indexWord.hasPrefix(word) || word.hasPrefix(indexWord) {
-                        candidateChunkIDs.formUnion(chunkIDs)
+                        for id in chunkIDs where domainChunkIDs.contains(id) {
+                            candidateChunkIDs.insert(id)
+                        }
                     }
                 }
             }
@@ -1632,8 +1661,9 @@ final class KnowledgeBaseStore {
             let denseWeight: Float = 1.0 - lexicalWeight
             for i in 0 ..< similarities.count {
                 let mapping = subRowMap[i]
-                let chunk = chunkCache[mapping.knowledgeBaseID]?[mapping.chunkIndex]
-                let bm25 = chunk.flatMap { bm25Scores[$0.id] } ?? 0
+                guard let chunks = chunkCache[mapping.knowledgeBaseID],
+                      mapping.chunkIndex < chunks.count else { continue }
+                let bm25 = bm25Scores[chunks[mapping.chunkIndex].id] ?? 0
                 similarities[i] = denseWeight * similarities[i] + lexicalWeight * bm25
             }
         }
