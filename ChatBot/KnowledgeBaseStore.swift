@@ -2308,4 +2308,39 @@ final class KnowledgeBaseStore {
             AppLogger.kbStore.warning("Domain summary generation failed: \(error.localizedDescription)")
         }
     }
+
+    // MARK: - Test Support
+
+    #if DEBUG
+    /// Inject test data directly without SwiftData. For unit tests only.
+    func injectTestData(knowledgeBases: [KnowledgeBase], chunks: [UUID: [DocumentChunk]], domains: [KnowledgeDomain]) {
+        self.knowledgeBases = knowledgeBases
+        self.chunkCache = chunks
+        self.domains = domains
+        invalidateAllEmbeddingMatrices()
+        invertedKeywordIndex.removeAll()
+        chunkKeywordCache.removeAll()
+    }
+
+    /// Retrieve using a pre-computed query vector (bypasses EmbeddingService). For unit tests only.
+    func retrieveWithVector(_ queryVector: [Double], query: String, domainID: UUID = KnowledgeDomain.generalID, limit: Int = 3, lexicalWeight: Float = 0.3) -> [DocumentChunk] {
+        let queryWords = SharedDataManager.tokenize(query)
+        let bm25Scores = lexicalWeight > 0 ? computeBM25Scores(queryWords: queryWords, domainID: domainID) : [:]
+        return retrieveBySimilarity(
+            queryVector: queryVector, queryWords: queryWords, domainID: domainID,
+            limit: limit, bm25Scores: bm25Scores, lexicalWeight: lexicalWeight
+        )
+    }
+
+    /// Expose BM25 scores for testing. For unit tests only.
+    func testBM25Scores(query: String, domainID: UUID = KnowledgeDomain.generalID) -> [UUID: Float] {
+        let queryWords = SharedDataManager.tokenize(query)
+        return computeBM25Scores(queryWords: queryWords, domainID: domainID)
+    }
+
+    /// Expose keyword-only retrieval for testing. For unit tests only.
+    func testKeywordRetrieve(query: String, domainID: UUID = KnowledgeDomain.generalID, limit: Int = 3) -> [DocumentChunk] {
+        return retrieveByKeywords(query: query, domainID: domainID, limit: limit)
+    }
+    #endif
 }
