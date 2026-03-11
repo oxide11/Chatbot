@@ -103,22 +103,35 @@ final class MemoryStore {
 
     /// Retrieve memories relevant to a query, scoped to a domain.
     ///
-    /// **Primary path:** Embed the query and rank by cosine similarity.
+    /// **Primary path:** Hybrid retrieval — fuse cosine similarity (dense) with
+    /// BM25 lexical scoring, matching the knowledge-base retrieval approach.
     /// **Fallback:** Keyword overlap (for old memories without embeddings or when assets unavailable).
-    func retrieve(for query: String, domainID: UUID = KnowledgeDomain.generalID, limit: Int = 5) -> [MemoryEntry] {
+    func retrieve(for query: String, domainID: UUID = KnowledgeDomain.generalID, limit: Int = 5, lexicalWeight: Float = 0.3) -> [MemoryEntry] {
         let domainMemories = memories.filter { ($0.domainID ?? KnowledgeDomain.generalID) == domainID }
+        guard !domainMemories.isEmpty else { return [] }
 
-        // Try semantic retrieval first
+        let queryWords = SharedDataManager.tokenize(query)
+
+        // Try hybrid retrieval (dense + lexical) first
         if let queryVector = EmbeddingService.shared.embed(query) {
+            // Compute BM25 scores for the domain pool
+            let bm25Scores = lexicalWeight > 0 ? computeMemoryBM25(queryWords: queryWords, pool: domainMemories) : [:]
+            let denseWeight: Float = 1.0 - lexicalWeight
+
             let scored = domainMemories.compactMap { entry -> (MemoryEntry, Double)? in
                 guard let memVector = entry.embedding else { return nil }
-                let similarity = EmbeddingService.cosineSimilarity(queryVector, memVector)
-                guard similarity > 0.3 else { return nil }
+                let cosineSim = Float(EmbeddingService.cosineSimilarity(queryVector, memVector))
+
+                // Fuse dense + lexical
+                let bm25 = bm25Scores[entry.id] ?? 0
+                let hybridScore = denseWeight * cosineSim + lexicalWeight * bm25
+
+                guard hybridScore > 0.2 else { return nil }
 
                 // Small recency tiebreaker
                 let ageInDays = max(1, -entry.createdAt.timeIntervalSinceNow / 86400)
                 let recencyBonus = 1.0 / log2(ageInDays + 1)
-                return (entry, similarity + recencyBonus * 0.02)
+                return (entry, Double(hybridScore) + recencyBonus * 0.02)
             }
 
             let results = scored.sorted { $0.1 > $1.1 }.prefix(limit).map { $0.0 }
@@ -127,6 +140,55 @@ final class MemoryStore {
 
         // Fallback: keyword matching
         return retrieveByKeywords(query: query, from: domainMemories, limit: limit)
+    }
+
+    /// BM25 scoring for memories — simplified version of KnowledgeBaseStore.computeBM25Scores.
+    /// Memory pools are small (≤100) so no inverted index needed.
+    private func computeMemoryBM25(queryWords: Set<String>, pool: [MemoryEntry]) -> [UUID: Float] {
+        guard !queryWords.isEmpty, !pool.isEmpty else { return [:] }
+
+        let n = Double(pool.count)
+        let k1 = 1.2
+        let b = 0.75
+
+        // Compute per-memory word sets and average document length
+        var memoryWordSets: [(UUID, Set<String>)] = []
+        var totalWordCount: Double = 0
+        for entry in pool {
+            let words = Set(entry.keywords).union(SharedDataManager.tokenize(entry.content))
+            memoryWordSets.append((entry.id, words))
+            totalWordCount += Double(words.count)
+        }
+        let avgDL = totalWordCount / n
+
+        // IDF for each query term
+        var termIDF: [String: Double] = [:]
+        for word in queryWords {
+            let docsContaining = memoryWordSets.count(where: { $0.1.contains(word) })
+            termIDF[word] = log((n - Double(docsContaining) + 0.5) / (Double(docsContaining) + 0.5) + 1.0)
+        }
+
+        // Theoretical upper bound for normalization
+        let shortDocDenom = 1.0 + k1 * (1.0 - b)
+        let theoreticalMax = termIDF.values.reduce(0.0) { $0 + $1 * (k1 + 1.0) / shortDocDenom }
+        guard theoreticalMax > 0 else { return [:] }
+
+        // Score each memory
+        var scores: [UUID: Float] = [:]
+        for (memID, words) in memoryWordSets {
+            let dl = Double(words.count)
+            var score: Double = 0
+            for queryWord in queryWords {
+                guard let idf = termIDF[queryWord], words.contains(queryWord) else { continue }
+                let numerator = k1 + 1.0
+                let denominator = 1.0 + k1 * (1.0 - b + b * dl / avgDL)
+                score += idf * (numerator / denominator)
+            }
+            if score > 0 {
+                scores[memID] = Float(score / theoreticalMax)
+            }
+        }
+        return scores
     }
 
     /// Keyword-based fallback retrieval for memories without embeddings.
@@ -310,6 +372,17 @@ final class MemoryStore {
         }
         if changed { saveToDisk() }
     }
+
+    // MARK: - Test Support
+
+    #if DEBUG
+    /// Expose BM25 scores for testing. For unit tests only.
+    func testBM25Scores(query: String, domainID: UUID = KnowledgeDomain.generalID) -> [UUID: Float] {
+        let domainMemories = memories.filter { ($0.domainID ?? KnowledgeDomain.generalID) == domainID }
+        let queryWords = SharedDataManager.tokenize(query)
+        return computeMemoryBM25(queryWords: queryWords, pool: domainMemories)
+    }
+    #endif
 }
 
 // MARK: - Chat View Model
@@ -688,7 +761,7 @@ final class ChatViewModel: Identifiable {
 
         // Retrieve memories (scoped to conversation's domain)
         if ragSettings.memoryRetrievalEnabled, let store = memoryStore {
-            let relevantMemories = store.retrieve(for: userText, domainID: domainID, limit: ragSettings.maxMemoryResults)
+            let relevantMemories = store.retrieve(for: userText, domainID: domainID, limit: ragSettings.maxMemoryResults, lexicalWeight: ragSettings.lexicalWeight)
             if !relevantMemories.isEmpty {
                 memoryCount = relevantMemories.count
                 let block = relevantMemories.map { "- \($0.content)" }.joined(separator: "\n")

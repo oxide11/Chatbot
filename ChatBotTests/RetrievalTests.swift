@@ -479,3 +479,99 @@ struct RetrievalEdgeCaseTests {
         #expect(foundIDs.contains(chunkB.id))
     }
 }
+
+// MARK: - Memory BM25 Scoring Tests
+
+@Suite("Memory BM25 Scoring")
+struct MemoryBM25Tests {
+
+    @Test("Exact keyword match produces nonzero memory BM25 score")
+    func exactMatch() {
+        let store = MemoryStore()
+        store.deleteAllMemories()
+        store.addMemory("The user prefers Python for scripting tasks", keywords: ["python", "preference", "scripting"], source: "Test")
+
+        let scores = store.testBM25Scores(query: "python scripting preference")
+        #expect(!scores.isEmpty)
+        let memory = store.memories[0]
+        #expect(scores[memory.id] != nil)
+        #expect(scores[memory.id]! > 0)
+        store.deleteAllMemories()
+    }
+
+    @Test("Non-matching query produces no memory BM25 score")
+    func noMatch() {
+        let store = MemoryStore()
+        store.deleteAllMemories()
+        store.addMemory("The user prefers Python for scripting", keywords: ["python", "scripting"], source: "Test")
+
+        let scores = store.testBM25Scores(query: "quantum physics equations")
+        let memory = store.memories[0]
+        #expect(scores[memory.id] == nil)
+        store.deleteAllMemories()
+    }
+
+    @Test("More keyword matches produce higher memory BM25 score")
+    func moreMatchesHigherScore() {
+        let store = MemoryStore()
+        store.deleteAllMemories()
+        store.addMemory("Weekly team meeting is on Tuesdays at 10am", keywords: ["meeting", "tuesday", "weekly", "team"], source: "Test")
+        store.addMemory("The office has a coffee machine in the kitchen", keywords: ["office", "coffee", "kitchen"], source: "Test")
+
+        let scores = store.testBM25Scores(query: "weekly team meeting tuesday")
+        let meetingMemory = store.memories.first { $0.content.contains("meeting") }!
+        let coffeeMemory = store.memories.first { $0.content.contains("coffee") }!
+
+        let meetingScore = scores[meetingMemory.id] ?? 0
+        let coffeeScore = scores[coffeeMemory.id] ?? 0
+
+        #expect(meetingScore > coffeeScore)
+        store.deleteAllMemories()
+    }
+
+    @Test("Memory BM25 scores are domain-scoped")
+    func domainScoped() {
+        let store = MemoryStore()
+        store.deleteAllMemories()
+        let workDomain = UUID()
+
+        store.addMemory("Python is the preferred language", keywords: ["python", "language", "preferred"], source: "Test", domainID: KnowledgeDomain.generalID)
+        store.addMemory("Use TypeScript for the work project", keywords: ["typescript", "work", "project"], source: "Test", domainID: workDomain)
+
+        let generalScores = store.testBM25Scores(query: "python language", domainID: KnowledgeDomain.generalID)
+        let workScores = store.testBM25Scores(query: "python language", domainID: workDomain)
+
+        // Python memory is in General — should only score there
+        let pythonMemory = store.memories.first { $0.content.contains("Python") }!
+        #expect(generalScores[pythonMemory.id] != nil)
+        #expect(workScores[pythonMemory.id] == nil)
+        store.deleteAllMemories()
+    }
+
+    @Test("Empty query returns empty memory BM25 scores")
+    func emptyQuery() {
+        let store = MemoryStore()
+        store.deleteAllMemories()
+        store.addMemory("Some memory content", keywords: ["memory"], source: "Test")
+
+        let scores = store.testBM25Scores(query: "")
+        #expect(scores.isEmpty)
+        store.deleteAllMemories()
+    }
+
+    @Test("Memory BM25 scores normalized to [0, 1]")
+    func scoresNormalized() {
+        let store = MemoryStore()
+        store.deleteAllMemories()
+        for i in 0..<5 {
+            store.addMemory("Memory \(i) about swift coding patterns", keywords: ["swift", "coding", "patterns"], source: "Test")
+        }
+
+        let scores = store.testBM25Scores(query: "swift coding patterns")
+        for (_, score) in scores {
+            #expect(score >= 0)
+            #expect(score <= 1.0)
+        }
+        store.deleteAllMemories()
+    }
+}
