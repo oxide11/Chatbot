@@ -157,10 +157,34 @@ struct SettingsView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text("Memory Recency")
+                            Spacer()
+                            Text(String(format: "%.0f%%", store.ragSettings.recencyWeight * 100))
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
+                        }
+                        Slider(
+                            value: Binding(
+                                get: { Float(store.ragSettings.recencyWeight) },
+                                set: { newValue in
+                                    store.ragSettings.recencyWeight = Float(newValue)
+                                    store.applyRAGSettings()
+                                }
+                            ),
+                            in: 0...0.4,
+                            step: 0.05
+                        )
+                        Text(store.ragSettings.recencyWeight < 0.05 ? "Age ignored" : store.ragSettings.recencyWeight > 0.3 ? "Strongly prefer recent" : "Balanced")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 } header: {
                     Text("Retrieval")
                 } footer: {
-                    Text("More results use more of the limited context window. Keyword Boost blends exact term matching (BM25) with semantic search — higher values help find specific terms like acronyms, names, or codes.")
+                    Text("More results use more of the limited context window. Keyword Boost blends exact term matching with semantic search. Memory Recency favors recently stored memories over older ones (45-day half-life).")
                 }
 
                 // MARK: Generation

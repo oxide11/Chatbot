@@ -106,40 +106,50 @@ final class MemoryStore {
     /// **Primary path:** Hybrid retrieval — fuse cosine similarity (dense) with
     /// BM25 lexical scoring, matching the knowledge-base retrieval approach.
     /// **Fallback:** Keyword overlap (for old memories without embeddings or when assets unavailable).
-    func retrieve(for query: String, domainID: UUID = KnowledgeDomain.generalID, limit: Int = 5, lexicalWeight: Float = 0.3) -> [MemoryEntry] {
+    func retrieve(for query: String, domainID: UUID = KnowledgeDomain.generalID, limit: Int = 5, lexicalWeight: Float = 0.3, recencyWeight: Float = 0.15) -> [MemoryEntry] {
         let domainMemories = memories.filter { ($0.domainID ?? KnowledgeDomain.generalID) == domainID }
         guard !domainMemories.isEmpty else { return [] }
 
         let queryWords = SharedDataManager.tokenize(query)
 
-        // Try hybrid retrieval (dense + lexical) first
+        // Try hybrid retrieval (dense + lexical + recency) first
         if let queryVector = EmbeddingService.shared.embed(query) {
             // Compute BM25 scores for the domain pool
             let bm25Scores = lexicalWeight > 0 ? computeMemoryBM25(queryWords: queryWords, pool: domainMemories) : [:]
-            let denseWeight: Float = 1.0 - lexicalWeight
+
+            // Three-way weight allocation: dense + lexical + recency = 1.0
+            // Dense and lexical share the non-recency portion in their original ratio
+            let relevanceWeight: Float = 1.0 - recencyWeight
+            let denseWeight: Float = relevanceWeight * (1.0 - lexicalWeight)
+            let scaledLexicalWeight: Float = relevanceWeight * lexicalWeight
 
             let scored = domainMemories.compactMap { entry -> (MemoryEntry, Double)? in
                 guard let memVector = entry.embedding else { return nil }
                 let cosineSim = Float(EmbeddingService.cosineSimilarity(queryVector, memVector))
 
-                // Fuse dense + lexical
+                // Fuse dense + lexical + recency
                 let bm25 = bm25Scores[entry.id] ?? 0
-                let hybridScore = denseWeight * cosineSim + lexicalWeight * bm25
+                let decay = Self.timeDecay(for: entry.createdAt)
+                let finalScore = denseWeight * cosineSim + scaledLexicalWeight * bm25 + recencyWeight * decay
 
-                guard hybridScore > 0.2 else { return nil }
-
-                // Small recency tiebreaker
-                let ageInDays = max(1, -entry.createdAt.timeIntervalSinceNow / 86400)
-                let recencyBonus = 1.0 / log2(ageInDays + 1)
-                return (entry, Double(hybridScore) + recencyBonus * 0.02)
+                guard finalScore > 0.15 else { return nil }
+                return (entry, Double(finalScore))
             }
 
             let results = scored.sorted { $0.1 > $1.1 }.prefix(limit).map { $0.0 }
             if !results.isEmpty { return results }
         }
 
-        // Fallback: keyword matching
-        return retrieveByKeywords(query: query, from: domainMemories, limit: limit)
+        // Fallback: keyword matching with recency
+        return retrieveByKeywords(query: query, from: domainMemories, limit: limit, recencyWeight: recencyWeight)
+    }
+
+    /// Exponential time-decay factor: e^(-age / halfLife).
+    /// Returns a value in (0, 1] where 1.0 = just created, ~0.5 at 45 days, ~0.25 at 90 days.
+    static func timeDecay(for date: Date, halfLifeDays: Double = 45) -> Float {
+        let ageInDays = max(0, -date.timeIntervalSinceNow / 86400)
+        // decay = e^(-age * ln(2) / halfLife) so that decay = 0.5 at exactly halfLifeDays
+        return Float(exp(-ageInDays * log(2) / halfLifeDays))
     }
 
     /// BM25 scoring for memories — simplified version of KnowledgeBaseStore.computeBM25Scores.
@@ -192,10 +202,11 @@ final class MemoryStore {
     }
 
     /// Keyword-based fallback retrieval for memories without embeddings.
-    private func retrieveByKeywords(query: String, from pool: [MemoryEntry], limit: Int) -> [MemoryEntry] {
+    private func retrieveByKeywords(query: String, from pool: [MemoryEntry], limit: Int, recencyWeight: Float = 0.15) -> [MemoryEntry] {
         let queryWords = tokenize(query)
         guard !queryWords.isEmpty else { return [] }
         let queryCount = Double(queryWords.count)
+        let relevanceWeight = 1.0 - Double(recencyWeight)
 
         let scored = pool.compactMap { entry -> (MemoryEntry, Double)? in
             let allEntryWords = Set(entry.keywords).union(tokenize(entry.content))
@@ -216,9 +227,8 @@ final class MemoryStore {
             let normalizedScore = matchedWords / queryCount
             guard normalizedScore >= 0.25 else { return nil }
 
-            let ageInDays = max(1, -entry.createdAt.timeIntervalSinceNow / 86400)
-            let recencyBonus = 1.0 / log2(ageInDays + 1)
-            return (entry, normalizedScore + recencyBonus * 0.05)
+            let decay = Double(Self.timeDecay(for: entry.createdAt))
+            return (entry, relevanceWeight * normalizedScore + Double(recencyWeight) * decay)
         }
 
         return scored
@@ -761,7 +771,7 @@ final class ChatViewModel: Identifiable {
 
         // Retrieve memories (scoped to conversation's domain)
         if ragSettings.memoryRetrievalEnabled, let store = memoryStore {
-            let relevantMemories = store.retrieve(for: userText, domainID: domainID, limit: ragSettings.maxMemoryResults, lexicalWeight: ragSettings.lexicalWeight)
+            let relevantMemories = store.retrieve(for: userText, domainID: domainID, limit: ragSettings.maxMemoryResults, lexicalWeight: ragSettings.lexicalWeight, recencyWeight: ragSettings.recencyWeight)
             if !relevantMemories.isEmpty {
                 memoryCount = relevantMemories.count
                 let block = relevantMemories.map { "- \($0.content)" }.joined(separator: "\n")
@@ -1043,6 +1053,9 @@ struct RAGSettings: Codable, Sendable {
     var topPValue: Double = 0.9
     /// Weight given to BM25 lexical scores in hybrid retrieval (0 = pure dense, 1 = pure lexical).
     var lexicalWeight: Float = 0.3
+    /// Weight given to recency in memory retrieval (0 = ignore age, higher = prefer recent).
+    /// Uses exponential decay with a 45-day half-life.
+    var recencyWeight: Float = 0.15
 
     static let `default` = RAGSettings()
 
@@ -1060,6 +1073,7 @@ struct RAGSettings: Codable, Sendable {
         topKValue = try container.decodeIfPresent(Int.self, forKey: .topKValue) ?? 40
         topPValue = try container.decodeIfPresent(Double.self, forKey: .topPValue) ?? 0.9
         lexicalWeight = try container.decodeIfPresent(Float.self, forKey: .lexicalWeight) ?? 0.3
+        recencyWeight = try container.decodeIfPresent(Float.self, forKey: .recencyWeight) ?? 0.15
     }
 
     /// Build FoundationModels GenerationOptions from the current settings.

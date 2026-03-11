@@ -575,3 +575,63 @@ struct MemoryBM25Tests {
         store.deleteAllMemories()
     }
 }
+
+// MARK: - Time-Decay Tests
+
+@Suite("Memory Time Decay")
+struct TimeDecayTests {
+
+    @Test("Brand new memory has decay near 1.0")
+    func newMemoryDecay() {
+        let decay = MemoryStore.timeDecay(for: Date())
+        #expect(decay > 0.99)
+        #expect(decay <= 1.0)
+    }
+
+    @Test("Decay at half-life is approximately 0.5")
+    func halfLifeDecay() {
+        let halfLifeAgo = Date(timeIntervalSinceNow: -45 * 86400) // 45 days ago
+        let decay = MemoryStore.timeDecay(for: halfLifeAgo)
+        #expect(abs(decay - 0.5) < 0.02)
+    }
+
+    @Test("Decay at double half-life is approximately 0.25")
+    func doubleHalfLifeDecay() {
+        let ninetyDaysAgo = Date(timeIntervalSinceNow: -90 * 86400)
+        let decay = MemoryStore.timeDecay(for: ninetyDaysAgo)
+        #expect(abs(decay - 0.25) < 0.02)
+    }
+
+    @Test("Very old memory has decay near zero")
+    func veryOldDecay() {
+        let yearAgo = Date(timeIntervalSinceNow: -365 * 86400)
+        let decay = MemoryStore.timeDecay(for: yearAgo)
+        #expect(decay < 0.01)
+    }
+
+    @Test("Decay is monotonically decreasing with age")
+    func monotonicDecrease() {
+        let ages = [0, 1, 7, 30, 60, 90, 180, 365]
+        var previousDecay: Float = 2.0 // Start above max
+        for days in ages {
+            let date = Date(timeIntervalSinceNow: -Double(days) * 86400)
+            let decay = MemoryStore.timeDecay(for: date)
+            #expect(decay < previousDecay)
+            previousDecay = decay
+        }
+    }
+
+    @Test("Custom half-life works correctly")
+    func customHalfLife() {
+        let tenDaysAgo = Date(timeIntervalSinceNow: -10 * 86400)
+        let decay = MemoryStore.timeDecay(for: tenDaysAgo, halfLifeDays: 10)
+        #expect(abs(decay - 0.5) < 0.02)
+    }
+
+    @Test("Decay is always positive")
+    func alwaysPositive() {
+        let ancientDate = Date(timeIntervalSinceNow: -10000 * 86400)
+        let decay = MemoryStore.timeDecay(for: ancientDate)
+        #expect(decay > 0)
+    }
+}
