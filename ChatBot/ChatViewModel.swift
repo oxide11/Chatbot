@@ -697,28 +697,59 @@ final class ChatViewModel: Identifiable {
             }
         }
 
-        // Retrieve document chunks (scoped to conversation's domain)
+        // Retrieve document chunks (scoped to conversation's domain).
+        // Strategy: inject chunk summaries for breadth (5x denser), then append
+        // the top 1-2 full chunks for depth when the budget allows.
         if ragSettings.knowledgeBaseRetrievalEnabled, let kbStore = knowledgeBaseStore, usedChars < maxContextChars {
             let budget = maxContextChars - usedChars
-            let relevantChunks = kbStore.retrieve(for: userText, domainID: domainID, limit: ragSettings.maxDocumentChunks)
+            // Retrieve more chunks than usual — summaries are small, so we can fit more context
+            let retrievalLimit = ragSettings.maxDocumentChunks * 2
+            let relevantChunks = kbStore.retrieve(for: userText, domainID: domainID, limit: retrievalLimit)
             if !relevantChunks.isEmpty {
-                // Build a lookup dictionary once instead of O(N) linear search per chunk
                 let kbLookup = Dictionary(uniqueKeysWithValues: kbStore.knowledgeBases.map { ($0.id, $0.name) })
-                var chunkTexts: [String] = []
-                var chunkChars = 0
+                var summaryTexts: [String] = []
+                var fullTexts: [String] = []
+                var totalChars = 0
+
+                // Phase 1: Add chunk summaries for broad coverage
                 for chunk in relevantChunks {
-                    let text = "[\(chunk.locationLabel)] \(chunk.content)"
-                    if chunkChars + text.count > budget { break }
-                    chunkTexts.append(text)
-                    chunkChars += text.count
+                    let text: String
+                    if let summary = chunk.summary, !summary.isEmpty {
+                        text = "[\(chunk.locationLabel)] \(summary)"
+                    } else {
+                        // No summary — use truncated content as fallback
+                        text = "[\(chunk.locationLabel)] \(String(chunk.content.prefix(200)))"
+                    }
+                    if totalChars + text.count > budget { break }
+                    summaryTexts.append(text)
+                    totalChars += text.count
                     chunkCount += 1
-                    // Resolve KB name via O(1) dictionary lookup
                     if let name = kbLookup[chunk.knowledgeBaseID] {
                         docNames.insert(name)
                     }
                 }
-                if !chunkTexts.isEmpty {
-                    contextBlocks.append("**Knowledge Base Excerpts** (from imported documents):\n\(chunkTexts.joined(separator: "\n---\n"))")
+
+                // Phase 2: Append 1-2 full verbatim chunks for depth (top-ranked only)
+                let fullChunkLimit = min(2, relevantChunks.count)
+                for chunk in relevantChunks.prefix(fullChunkLimit) {
+                    // Skip if the chunk is short enough that the summary IS the content
+                    guard chunk.content.count > 200 else { continue }
+                    let fullText = "[\(chunk.locationLabel)] \(chunk.content)"
+                    if totalChars + fullText.count > budget { break }
+                    fullTexts.append(fullText)
+                    totalChars += fullText.count
+                }
+
+                var block = ""
+                if !summaryTexts.isEmpty {
+                    block += "**Knowledge Base Summaries** (condensed from imported documents):\n\(summaryTexts.joined(separator: "\n"))"
+                }
+                if !fullTexts.isEmpty {
+                    if !block.isEmpty { block += "\n\n" }
+                    block += "**Key Excerpts** (verbatim for reference):\n\(fullTexts.joined(separator: "\n---\n"))"
+                }
+                if !block.isEmpty {
+                    contextBlocks.append(block)
                 }
             }
         }
@@ -753,7 +784,8 @@ final class ChatViewModel: Identifiable {
     // MARK: - Private
 
     private func streamResponse(to prompt: String) async throws {
-        let stream = session.streamResponse(to: prompt)
+        let options = ragSettings.chatGenerationOptions
+        let stream = session.streamResponse(to: prompt, options: options)
         var fullText = ""
         for try await partial in stream {
             // Support cancellation — keep partial text
@@ -893,6 +925,31 @@ struct RAGContext {
     }
 }
 
+// MARK: - Sampling Mode Setting
+
+/// Persistent representation of the sampling strategy for the main chat.
+enum SamplingModeSetting: String, Codable, CaseIterable, Sendable {
+    case greedy   = "greedy"
+    case topK     = "topK"
+    case topP     = "topP"
+
+    var label: String {
+        switch self {
+        case .greedy: return "Greedy"
+        case .topK:   return "Top-K"
+        case .topP:   return "Top-P"
+        }
+    }
+
+    var description: String {
+        switch self {
+        case .greedy: return "Deterministic — always picks the most likely token"
+        case .topK:   return "Samples from the K most probable tokens"
+        case .topP:   return "Samples from tokens covering P% cumulative probability"
+        }
+    }
+}
+
 struct RAGSettings: Codable, Sendable {
     var memoryRetrievalEnabled: Bool = true
     var knowledgeBaseRetrievalEnabled: Bool = true
@@ -901,7 +958,47 @@ struct RAGSettings: Codable, Sendable {
     var contextBudgetCharacters: Int = 1500
     var autoExtractMemories: Bool = true
 
+    // MARK: Generation Hyperparameters
+
+    /// Temperature controls randomness (0 = focused, 2 = creative). Default 1.0.
+    var temperature: Double = 1.0
+    /// Sampling strategy for the main chat session.
+    var samplingMode: SamplingModeSetting = .topK
+    /// Top-K value: number of top tokens to sample from (used when samplingMode == .topK).
+    var topKValue: Int = 40
+    /// Top-P value: cumulative probability threshold (used when samplingMode == .topP).
+    var topPValue: Double = 0.9
+
     static let `default` = RAGSettings()
+
+    /// Backward-compatible decoding: old persisted settings without generation fields use defaults.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        memoryRetrievalEnabled = try container.decodeIfPresent(Bool.self, forKey: .memoryRetrievalEnabled) ?? true
+        knowledgeBaseRetrievalEnabled = try container.decodeIfPresent(Bool.self, forKey: .knowledgeBaseRetrievalEnabled) ?? true
+        maxMemoryResults = try container.decodeIfPresent(Int.self, forKey: .maxMemoryResults) ?? 2
+        maxDocumentChunks = try container.decodeIfPresent(Int.self, forKey: .maxDocumentChunks) ?? 3
+        contextBudgetCharacters = try container.decodeIfPresent(Int.self, forKey: .contextBudgetCharacters) ?? 1500
+        autoExtractMemories = try container.decodeIfPresent(Bool.self, forKey: .autoExtractMemories) ?? true
+        temperature = try container.decodeIfPresent(Double.self, forKey: .temperature) ?? 1.0
+        samplingMode = try container.decodeIfPresent(SamplingModeSetting.self, forKey: .samplingMode) ?? .topK
+        topKValue = try container.decodeIfPresent(Int.self, forKey: .topKValue) ?? 40
+        topPValue = try container.decodeIfPresent(Double.self, forKey: .topPValue) ?? 0.9
+    }
+
+    /// Build FoundationModels GenerationOptions from the current settings.
+    var chatGenerationOptions: GenerationOptions {
+        let sampling: GenerationOptions.SamplingMode
+        switch samplingMode {
+        case .greedy:
+            sampling = .greedy
+        case .topK:
+            sampling = .random(top: topKValue)
+        case .topP:
+            sampling = .random(probabilityThreshold: topPValue)
+        }
+        return GenerationOptions(temperature: temperature, sampling: sampling)
+    }
 }
 
 @Observable

@@ -1,4 +1,5 @@
 import Foundation
+import FoundationModels
 import PDFKit
 import Compression
 import SwiftData
@@ -93,7 +94,11 @@ struct DocumentChunk: Identifiable, Codable, Sendable {
     /// Optional for backward compatibility with chunks created before embeddings.
     var embedding: [Double]?
 
-    nonisolated init(id: UUID = UUID(), knowledgeBaseID: UUID, content: String, keywords: [String], locationLabel: String, index: Int, embedding: [Double]? = nil) {
+    /// LLM-generated 1-2 sentence summary of this chunk's content.
+    /// Used for dense context injection — summaries are ~5x smaller than raw chunks.
+    var summary: String?
+
+    nonisolated init(id: UUID = UUID(), knowledgeBaseID: UUID, content: String, keywords: [String], locationLabel: String, index: Int, embedding: [Double]? = nil, summary: String? = nil) {
         self.id = id
         self.knowledgeBaseID = knowledgeBaseID
         self.content = content
@@ -101,6 +106,7 @@ struct DocumentChunk: Identifiable, Codable, Sendable {
         self.locationLabel = locationLabel
         self.index = index
         self.embedding = embedding
+        self.summary = summary
     }
 }
 
@@ -452,6 +458,11 @@ final class KnowledgeBaseStore {
                             }
                         }
                     }
+
+                    // Regenerate the domain summary now that new content has been added
+                    Task { [weak self] in
+                        await self?.regenerateDomainSummary(for: job.domainID)
+                    }
                 case .failure(let reason):
                     ingestionQueue[idx].status = .failed(reason)
                 }
@@ -581,6 +592,11 @@ final class KnowledgeBaseStore {
             }
         }
 
+        // Generate chunk summaries using the on-device LLM.
+        // Each summary is 1-2 sentences — ~5x smaller than the raw chunk.
+        // This runs serially to avoid overwhelming the on-device model.
+        await generateChunkSummaries(for: &allChunks)
+
         // Build the KB metadata (persistence happens on the MainActor after return)
         let kb = KnowledgeBase(
             id: kbID,
@@ -592,6 +608,36 @@ final class KnowledgeBaseStore {
         )
 
         return .success(IngestionResult(kb: kb, chunks: allChunks))
+    }
+
+    /// Generate concise summaries for each chunk using the on-device LLM.
+    /// Runs during ingestion — one LLM call per chunk with greedy sampling for consistency.
+    nonisolated private static func generateChunkSummaries(for chunks: inout [DocumentChunk]) async {
+        // Only summarize chunks with enough content to warrant it
+        let minContentLength = 80
+        for i in chunks.indices {
+            let content = chunks[i].content
+            guard content.count >= minContentLength else { continue }
+
+            do {
+                let session = LanguageModelSession {
+                    """
+                    You are a concise summarizer. Given a text passage, write exactly 1-2 sentences \
+                    that capture the key facts and main point. Do not add commentary or opinions. \
+                    If the passage contains code, describe what the code does.
+                    """
+                }
+                let options = GenerationOptions(sampling: .greedy, maximumResponseTokens: 80)
+                let response = try await session.respond(to: content, options: options)
+                let summary = response.content.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !summary.isEmpty {
+                    chunks[i].summary = summary
+                }
+            } catch {
+                // Non-fatal — chunk still works without a summary
+                AppLogger.kbStore.warning("Chunk summary generation failed for chunk \(chunks[i].index): \(error.localizedDescription)")
+            }
+        }
     }
 
     // MARK: - Background-safe Extraction & Chunking (nonisolated static)
@@ -1319,11 +1365,43 @@ final class KnowledgeBaseStore {
 
         // Try semantic retrieval first
         if let queryVector = embeddingService.embed(query) {
-            return retrieveBySimilarity(queryVector: queryVector, query: query, domainID: domainID, limit: limit)
+            let results = retrieveBySimilarity(queryVector: queryVector, query: query, domainID: domainID, limit: limit)
+
+            // Cross-domain fallback: if the current domain yields no results and other domains
+            // have summaries, find the best-matching domain via embedding similarity and search there.
+            if results.isEmpty && domains.count > 1 {
+                if let bestDomain = bestDomainForQuery(queryVector: queryVector, excludingDomain: domainID) {
+                    return retrieveBySimilarity(queryVector: queryVector, query: query, domainID: bestDomain, limit: limit)
+                }
+            }
+
+            return results
         }
 
         // Fallback: keyword matching
         return retrieveByKeywords(query: query, domainID: domainID, limit: limit)
+    }
+
+    /// Find the domain whose summary best matches the query, excluding the given domain.
+    /// Returns nil if no domain has a summary or if no match exceeds the threshold.
+    private func bestDomainForQuery(queryVector: [Double], excludingDomain: UUID) -> UUID? {
+        let embeddingService = EmbeddingService.shared
+        guard embeddingService.isAvailable else { return nil }
+
+        var bestScore: Double = 0.3 // Minimum threshold
+        var bestDomainID: UUID?
+
+        for domain in domains where domain.id != excludingDomain {
+            guard let summary = domain.summary, !summary.isEmpty else { continue }
+            guard let summaryVector = embeddingService.embed(summary) else { continue }
+            let score = EmbeddingService.cosineSimilarity(queryVector, summaryVector)
+            if score > bestScore {
+                bestScore = score
+                bestDomainID = domain.id
+            }
+        }
+
+        return bestDomainID
     }
 
     /// Semantic retrieval using Accelerate-powered batch cosine similarity.
@@ -2011,6 +2089,69 @@ final class KnowledgeBaseStore {
                 do { try await actor.moveKnowledgeBase(kbID: kb.id, toDomainID: targetDomainID) }
                 catch { AppLogger.kbStore.error("Failed moving KB: \(error.localizedDescription)") }
             }
+        }
+    }
+
+    // MARK: - Domain Summary Generation
+
+    /// Regenerate the LLM-generated summary for a domain based on its knowledge bases.
+    /// Called after ingestion or KB deletion to keep the domain summary current.
+    func regenerateDomainSummary(for domainID: UUID) async {
+        let domainKBs = knowledgeBases(for: domainID)
+        guard !domainKBs.isEmpty else {
+            // No KBs — clear any existing summary
+            if let idx = domains.firstIndex(where: { $0.id == domainID }) {
+                domains[idx].summary = nil
+                if let actor = dbActor {
+                    Task { try? await actor.updateDomainSummary(id: domainID, summary: "") }
+                }
+            }
+            return
+        }
+
+        // Collect chunk summaries (or first sentence of content) for each KB to build an overview
+        var kbDescriptions: [String] = []
+        for kb in domainKBs {
+            var chunkPreviews: [String] = []
+            if let cached = chunkCache[kb.id] {
+                for chunk in cached.prefix(5) {
+                    // Prefer the summary if available, otherwise use a truncated content preview
+                    if let summary = chunk.summary, !summary.isEmpty {
+                        chunkPreviews.append(summary)
+                    } else {
+                        let preview = String(chunk.content.prefix(150))
+                        chunkPreviews.append(preview)
+                    }
+                }
+            }
+            let previews = chunkPreviews.joined(separator: " ")
+            kbDescriptions.append("\(kb.name): \(previews)")
+        }
+
+        let input = kbDescriptions.joined(separator: "\n---\n")
+
+        do {
+            let session = LanguageModelSession {
+                """
+                You are a knowledge base cataloger. Given descriptions of documents in a knowledge domain, \
+                write a concise 2-3 sentence summary of what this domain covers. \
+                Focus on the main topics, subject areas, and types of information available. \
+                Do not list individual documents — describe the domain as a whole.
+                """
+            }
+            let options = GenerationOptions(sampling: .greedy, maximumResponseTokens: 120)
+            let response = try await session.respond(to: input, options: options)
+            let summary = response.content.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            if !summary.isEmpty, let idx = domains.firstIndex(where: { $0.id == domainID }) {
+                domains[idx].summary = summary
+                if let actor = dbActor {
+                    try? await actor.updateDomainSummary(id: domainID, summary: summary)
+                }
+                AppLogger.kbStore.info("Generated domain summary for '\(domains[idx].name)': \(summary.prefix(80))...")
+            }
+        } catch {
+            AppLogger.kbStore.warning("Domain summary generation failed: \(error.localizedDescription)")
         }
     }
 }

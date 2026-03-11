@@ -140,6 +140,86 @@ struct SettingsView: View {
                     Text("More results use more of the limited context window.")
                 }
 
+                // MARK: Generation
+                Section {
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text("Temperature")
+                            Spacer()
+                            Text(String(format: "%.1f", store.ragSettings.temperature))
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
+                        }
+                        Slider(
+                            value: Binding(
+                                get: { store.ragSettings.temperature },
+                                set: { newValue in
+                                    store.ragSettings.temperature = newValue
+                                    store.applyRAGSettings()
+                                }
+                            ),
+                            in: 0...2,
+                            step: 0.1
+                        )
+                        Text(store.ragSettings.temperature < 0.5 ? "Focused and precise" : store.ragSettings.temperature > 1.5 ? "Highly creative" : "Balanced")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Picker("Sampling", selection: Binding(
+                        get: { store.ragSettings.samplingMode },
+                        set: { newValue in
+                            store.ragSettings.samplingMode = newValue
+                            store.applyRAGSettings()
+                        }
+                    )) {
+                        ForEach(SamplingModeSetting.allCases, id: \.self) { mode in
+                            Text(mode.label).tag(mode)
+                        }
+                    }
+
+                    if store.ragSettings.samplingMode == .topK {
+                        Stepper(
+                            "Top-K: \(store.ragSettings.topKValue)",
+                            value: Binding(
+                                get: { store.ragSettings.topKValue },
+                                set: { newValue in
+                                    store.ragSettings.topKValue = newValue
+                                    store.applyRAGSettings()
+                                }
+                            ),
+                            in: 1...100
+                        )
+                    }
+
+                    if store.ragSettings.samplingMode == .topP {
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack {
+                                Text("Top-P")
+                                Spacer()
+                                Text(String(format: "%.2f", store.ragSettings.topPValue))
+                                    .foregroundStyle(.secondary)
+                                    .monospacedDigit()
+                            }
+                            Slider(
+                                value: Binding(
+                                    get: { store.ragSettings.topPValue },
+                                    set: { newValue in
+                                        store.ragSettings.topPValue = newValue
+                                        store.applyRAGSettings()
+                                    }
+                                ),
+                                in: 0.1...1.0,
+                                step: 0.05
+                            )
+                        }
+                    }
+                } header: {
+                    Text("Generation")
+                } footer: {
+                    Text(store.ragSettings.samplingMode.description)
+                }
+
                 // MARK: System Prompt
                 Section {
                     TextField("e.g. You are a helpful coding assistant...", text: $defaultPromptDraft, axis: .vertical)
