@@ -704,7 +704,7 @@ final class ChatViewModel: Identifiable {
             let budget = maxContextChars - usedChars
             // Retrieve more chunks than usual — summaries are small, so we can fit more context
             let retrievalLimit = ragSettings.maxDocumentChunks * 2
-            let relevantChunks = kbStore.retrieve(for: userText, domainID: domainID, limit: retrievalLimit)
+            let relevantChunks = kbStore.retrieve(for: userText, domainID: domainID, limit: retrievalLimit, lexicalWeight: ragSettings.lexicalWeight)
             if !relevantChunks.isEmpty {
                 let kbLookup = Dictionary(uniqueKeysWithValues: kbStore.knowledgeBases.map { ($0.id, $0.name) })
                 var summaryTexts: [String] = []
@@ -968,6 +968,8 @@ struct RAGSettings: Codable, Sendable {
     var topKValue: Int = 40
     /// Top-P value: cumulative probability threshold (used when samplingMode == .topP).
     var topPValue: Double = 0.9
+    /// Weight given to BM25 lexical scores in hybrid retrieval (0 = pure dense, 1 = pure lexical).
+    var lexicalWeight: Float = 0.3
 
     static let `default` = RAGSettings()
 
@@ -984,6 +986,7 @@ struct RAGSettings: Codable, Sendable {
         samplingMode = try container.decodeIfPresent(SamplingModeSetting.self, forKey: .samplingMode) ?? .topK
         topKValue = try container.decodeIfPresent(Int.self, forKey: .topKValue) ?? 40
         topPValue = try container.decodeIfPresent(Double.self, forKey: .topPValue) ?? 0.9
+        lexicalWeight = try container.decodeIfPresent(Float.self, forKey: .lexicalWeight) ?? 0.3
     }
 
     /// Build FoundationModels GenerationOptions from the current settings.

@@ -1350,6 +1350,111 @@ final class KnowledgeBaseStore {
         }
     }
 
+    // MARK: - BM25 Lexical Scoring
+
+    /// Compute BM25 scores for all chunks in a domain against the given query.
+    /// Returns a dictionary of chunk UUID → BM25 score.
+    ///
+    /// BM25 parameters:
+    /// - k1 = 1.2 (term frequency saturation)
+    /// - b = 0.75 (length normalization)
+    ///
+    /// This is a simplified BM25 that uses our existing keyword cache as the
+    /// term-frequency source. Scores are normalized to [0, 1] for fusion with dense scores.
+    private func computeBM25Scores(query: String, domainID: UUID) -> [UUID: Float] {
+        // Ensure caches are built
+        if invertedKeywordIndex.isEmpty {
+            rebuildInvertedIndex()
+        }
+
+        let queryWords = SharedDataManager.tokenize(query)
+        guard !queryWords.isEmpty else { return [:] }
+
+        // Collect domain chunk IDs and compute average document length
+        let domainKBIDs = Set(knowledgeBases.filter { $0.effectiveDomainID == domainID }.map(\.id))
+        var domainChunkIDs: [UUID] = []
+        var totalWordCount: Double = 0
+
+        for (kbID, chunks) in chunkCache where domainKBIDs.contains(kbID) {
+            for chunk in chunks {
+                domainChunkIDs.append(chunk.id)
+                let words = chunkKeywordCache[chunk.id] ?? Set(chunk.keywords).union(SharedDataManager.tokenize(chunk.content))
+                if chunkKeywordCache[chunk.id] == nil {
+                    chunkKeywordCache[chunk.id] = words
+                }
+                totalWordCount += Double(words.count)
+            }
+        }
+
+        let n = Double(domainChunkIDs.count)
+        guard n > 0 else { return [:] }
+        let avgDL = totalWordCount / n
+
+        // BM25 parameters
+        let k1 = 1.2
+        let b = 0.75
+
+        // Compute IDF for each query term (using domain scope)
+        let domainChunkSet = Set(domainChunkIDs)
+        var termIDF: [String: Double] = [:]
+        for word in queryWords {
+            let docsContaining = invertedKeywordIndex[word]?.intersection(domainChunkSet).count ?? 0
+            // IDF with smoothing: log((N - n(t) + 0.5) / (n(t) + 0.5) + 1)
+            let idf = log((n - Double(docsContaining) + 0.5) / (Double(docsContaining) + 0.5) + 1.0)
+            termIDF[word] = idf
+        }
+
+        // Score each chunk
+        var scores: [UUID: Float] = [:]
+        var maxScore: Float = 0
+
+        for chunkID in domainChunkIDs {
+            guard let words = chunkKeywordCache[chunkID] else { continue }
+            let dl = Double(words.count)
+            var score: Double = 0
+
+            for queryWord in queryWords {
+                guard let idf = termIDF[queryWord] else { continue }
+
+                // Term frequency: 1 if word is present (our keyword sets are deduplicated)
+                // For exact matches, tf=1. For prefix matches, tf=0.5.
+                var tf: Double = 0
+                if words.contains(queryWord) {
+                    tf = 1.0
+                } else if queryWord.count >= 4 {
+                    // Prefix match for morphological variants
+                    for w in words where w.count >= 4 {
+                        if w.hasPrefix(queryWord) || queryWord.hasPrefix(w) {
+                            tf = 0.5
+                            break
+                        }
+                    }
+                }
+                guard tf > 0 else { continue }
+
+                // BM25 formula: IDF * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * dl / avgDL))
+                let numerator = tf * (k1 + 1.0)
+                let denominator = tf + k1 * (1.0 - b + b * dl / avgDL)
+                score += idf * (numerator / denominator)
+            }
+
+            if score > 0 {
+                let floatScore = Float(score)
+                scores[chunkID] = floatScore
+                maxScore = max(maxScore, floatScore)
+            }
+        }
+
+        // Normalize to [0, 1] for fusion with dense scores
+        if maxScore > 0 {
+            for (id, score) in scores {
+                scores[id] = score / maxScore
+            }
+        }
+
+        return scores
+    }
+
     /// Retrieve the most relevant document chunks for a query, scoped to a domain.
     ///
     /// **Primary path:** Batch cosine similarity via Accelerate/vDSP against the
@@ -1358,27 +1463,37 @@ final class KnowledgeBaseStore {
     ///
     /// **Fallback:** Keyword overlap (used when embedding assets aren't downloaded yet
     /// or chunks were imported before embeddings were available).
-    func retrieve(for query: String, domainID: UUID = KnowledgeDomain.generalID, limit: Int = 3) -> [DocumentChunk] {
+    func retrieve(for query: String, domainID: UUID = KnowledgeDomain.generalID, limit: Int = 3, lexicalWeight: Float = 0.3) -> [DocumentChunk] {
         ensureAllChunksLoaded()
 
         let embeddingService = EmbeddingService.shared
 
-        // Try semantic retrieval first
+        // Try hybrid retrieval (dense + lexical) first
         if let queryVector = embeddingService.embed(query) {
-            let results = retrieveBySimilarity(queryVector: queryVector, query: query, domainID: domainID, limit: limit)
+            // Compute BM25 lexical scores for score fusion
+            let bm25Scores = computeBM25Scores(query: query, domainID: domainID)
+
+            let results = retrieveBySimilarity(
+                queryVector: queryVector, query: query, domainID: domainID,
+                limit: limit, bm25Scores: bm25Scores, lexicalWeight: lexicalWeight
+            )
 
             // Cross-domain fallback: if the current domain yields no results and other domains
             // have summaries, find the best-matching domain via embedding similarity and search there.
             if results.isEmpty && domains.count > 1 {
                 if let bestDomain = bestDomainForQuery(queryVector: queryVector, excludingDomain: domainID) {
-                    return retrieveBySimilarity(queryVector: queryVector, query: query, domainID: bestDomain, limit: limit)
+                    let crossBM25 = computeBM25Scores(query: query, domainID: bestDomain)
+                    return retrieveBySimilarity(
+                        queryVector: queryVector, query: query, domainID: bestDomain,
+                        limit: limit, bm25Scores: crossBM25, lexicalWeight: lexicalWeight
+                    )
                 }
             }
 
             return results
         }
 
-        // Fallback: keyword matching
+        // Fallback: keyword matching (when embeddings unavailable)
         return retrieveByKeywords(query: query, domainID: domainID, limit: limit)
     }
 
@@ -1415,7 +1530,7 @@ final class KnowledgeBaseStore {
     /// 2. **Semantic re-rank:** Score only the candidate subset using cosine similarity.
     ///
     /// This avoids scoring thousands of irrelevant chunks while maintaining recall.
-    private func retrieveBySimilarity(queryVector: [Double], query: String, domainID: UUID, limit: Int) -> [DocumentChunk] {
+    private func retrieveBySimilarity(queryVector: [Double], query: String, domainID: UUID, limit: Int, bm25Scores: [UUID: Float] = [:], lexicalWeight: Float = 0.3) -> [DocumentChunk] {
         // Ensure the per-domain embedding matrix is built
         if embeddingMatrices[domainID] == nil {
             rebuildEmbeddingMatrix(for: domainID)
@@ -1429,31 +1544,44 @@ final class KnowledgeBaseStore {
 
         // Two-phase for large corpora
         if totalChunks >= 200 {
-            return twoPhaseRetrieval(queryVector: queryVector, query: query, domainID: domainID, limit: limit, matrix: matrix)
+            return twoPhaseRetrieval(queryVector: queryVector, query: query, domainID: domainID, limit: limit, matrix: matrix, bm25Scores: bm25Scores, lexicalWeight: lexicalWeight)
         }
 
         // Full matrix scan for small corpora — fast enough with Accelerate
-        return fullMatrixRetrieval(queryVector: queryVector, limit: limit, matrix: matrix)
+        return fullMatrixRetrieval(queryVector: queryVector, limit: limit, matrix: matrix, bm25Scores: bm25Scores, lexicalWeight: lexicalWeight)
     }
 
     /// Full matrix batch dot product — scores all chunks at once via Float32 BLAS.
     /// Since embeddings are pre-normalized, dot product = cosine similarity.
-    private func fullMatrixRetrieval(queryVector: [Double], limit: Int, matrix: EmbeddingMatrix) -> [DocumentChunk] {
+    /// When BM25 scores are provided, fuses dense and lexical scores for hybrid retrieval.
+    private func fullMatrixRetrieval(queryVector: [Double], limit: Int, matrix: EmbeddingMatrix, bm25Scores: [UUID: Float] = [:], lexicalWeight: Float = 0.3) -> [DocumentChunk] {
         let floatQuery = EmbeddingMatrix.prepareQuery(queryVector, dimension: matrix.dimension)
 
-        let similarities = EmbeddingService.batchDotProduct(
+        var similarities = EmbeddingService.batchDotProduct(
             query: floatQuery,
             matrix: matrix.data,
             count: matrix.rowCount,
             dimension: matrix.dimension
         )
 
+        // Fuse dense + lexical scores when BM25 data is available
+        if !bm25Scores.isEmpty {
+            let denseWeight: Float = 1.0 - lexicalWeight
+            for i in 0 ..< similarities.count {
+                let mapping = matrix.rowMap[i]
+                let chunk = chunkCache[mapping.knowledgeBaseID]?[mapping.chunkIndex]
+                let bm25 = chunk.flatMap { bm25Scores[$0.id] } ?? 0
+                // Hybrid score: weighted combination of dense cosine similarity and BM25
+                similarities[i] = denseWeight * similarities[i] + lexicalWeight * bm25
+            }
+        }
+
         // Top-K selection using partial sort (faster than full sort for small K)
-        return topK(similarities: similarities, matrix: matrix, limit: limit, threshold: 0.3)
+        return topK(similarities: similarities, matrix: matrix, limit: limit, threshold: 0.2)
     }
 
-    /// Two-phase retrieval: keyword pre-filter → semantic re-rank.
-    private func twoPhaseRetrieval(queryVector: [Double], query: String, domainID: UUID, limit: Int, matrix: EmbeddingMatrix) -> [DocumentChunk] {
+    /// Two-phase retrieval: keyword pre-filter → hybrid (dense + lexical) re-rank.
+    private func twoPhaseRetrieval(queryVector: [Double], query: String, domainID: UUID, limit: Int, matrix: EmbeddingMatrix, bm25Scores: [UUID: Float] = [:], lexicalWeight: Float = 0.3) -> [DocumentChunk] {
         // Build inverted index if needed
         if invertedKeywordIndex.isEmpty {
             rebuildInvertedIndex()
@@ -1480,7 +1608,7 @@ final class KnowledgeBaseStore {
         // (the query might use different vocabulary than the documents)
         let minCandidates = max(limit * 3, 20)
         if candidateChunkIDs.count < minCandidates {
-            return fullMatrixRetrieval(queryVector: queryVector, limit: limit, matrix: matrix)
+            return fullMatrixRetrieval(queryVector: queryVector, limit: limit, matrix: matrix, bm25Scores: bm25Scores, lexicalWeight: lexicalWeight)
         }
 
         // Phase 2: Build a smaller Float32 matrix from candidates and score
@@ -1502,17 +1630,28 @@ final class KnowledgeBaseStore {
         }
 
         guard !subRowMap.isEmpty else {
-            return fullMatrixRetrieval(queryVector: queryVector, limit: limit, matrix: matrix)
+            return fullMatrixRetrieval(queryVector: queryVector, limit: limit, matrix: matrix, bm25Scores: bm25Scores, lexicalWeight: lexicalWeight)
         }
 
         let floatQuery = EmbeddingMatrix.prepareQuery(queryVector, dimension: dim)
 
-        let similarities = EmbeddingService.batchDotProduct(
+        var similarities = EmbeddingService.batchDotProduct(
             query: floatQuery,
             matrix: subMatrix,
             count: subRowMap.count,
             dimension: dim
         )
+
+        // Fuse dense + lexical scores for the candidate subset
+        if !bm25Scores.isEmpty {
+            let denseWeight: Float = 1.0 - lexicalWeight
+            for i in 0 ..< similarities.count {
+                let mapping = subRowMap[i]
+                let chunk = chunkCache[mapping.knowledgeBaseID]?[mapping.chunkIndex]
+                let bm25 = chunk.flatMap { bm25Scores[$0.id] } ?? 0
+                similarities[i] = denseWeight * similarities[i] + lexicalWeight * bm25
+            }
+        }
 
         // Use the sub-matrix row map for resolution
         let subEmbeddingMatrix = EmbeddingMatrix(
@@ -1522,7 +1661,7 @@ final class KnowledgeBaseStore {
             rowMap: subRowMap
         )
 
-        return topK(similarities: similarities, matrix: subEmbeddingMatrix, limit: limit, threshold: 0.3)
+        return topK(similarities: similarities, matrix: subEmbeddingMatrix, limit: limit, threshold: 0.2)
     }
 
     /// Extract the top-K results from a Float32 similarity array using partial sort.

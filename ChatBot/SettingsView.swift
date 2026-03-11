@@ -134,10 +134,33 @@ struct SettingsView: View {
                         ),
                         in: 1...5
                     )
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text("Keyword Boost")
+                            Spacer()
+                            Text(String(format: "%.0f%%", store.ragSettings.lexicalWeight * 100))
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
+                        }
+                        Slider(
+                            value: Binding(
+                                get: { Float(store.ragSettings.lexicalWeight) },
+                                set: { newValue in
+                                    store.ragSettings.lexicalWeight = Float(newValue)
+                                    store.applyRAGSettings()
+                                }
+                            ),
+                            in: 0...0.5,
+                            step: 0.05
+                        )
+                        Text(store.ragSettings.lexicalWeight < 0.1 ? "Semantic only" : store.ragSettings.lexicalWeight > 0.4 ? "Strong keyword matching" : "Balanced hybrid")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 } header: {
                     Text("Retrieval")
                 } footer: {
-                    Text("More results use more of the limited context window.")
+                    Text("More results use more of the limited context window. Keyword Boost blends exact term matching (BM25) with semantic search — higher values help find specific terms like acronyms, names, or codes.")
                 }
 
                 // MARK: Generation
