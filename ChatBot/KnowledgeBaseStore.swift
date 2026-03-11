@@ -10,12 +10,14 @@ enum DocumentType: String, Codable, CaseIterable, Sendable {
     case pdf
     case epub
     case text
+    case markdown
 
     var icon: String {
         switch self {
         case .pdf: return "doc.richtext"
         case .epub: return "book"
         case .text: return "doc.text"
+        case .markdown: return "text.badge.star"
         }
     }
 
@@ -24,6 +26,7 @@ enum DocumentType: String, Codable, CaseIterable, Sendable {
         case .pdf: return "PDF"
         case .epub: return "ePUB"
         case .text: return "Text"
+        case .markdown: return "Markdown"
         }
     }
 }
@@ -499,13 +502,14 @@ final class KnowledgeBaseStore {
         url: URL
     ) async -> IngestionOutcome {
         let ext = url.pathExtension.lowercased()
-        guard ext == "pdf" || ext == "epub" || ext == "txt" else {
+        guard ext == "pdf" || ext == "epub" || ext == "txt" || ext == "md" || ext == "markdown" else {
             return .failure("Unsupported: .\(ext)")
         }
 
         let docType: DocumentType
         if ext == "pdf" { docType = .pdf }
         else if ext == "epub" { docType = .epub }
+        else if ext == "md" || ext == "markdown" { docType = .markdown }
         else { docType = .text }
 
         let fileSize = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int64) ?? 0
@@ -517,6 +521,13 @@ final class KnowledgeBaseStore {
             sections = extractTextFromPDFBackground(at: url)
         } else if docType == .epub {
             sections = (try? extractTextFromEPUBBackground(at: url)) ?? []
+        } else if docType == .markdown {
+            if let textContent = try? String(contentsOf: url, encoding: .utf8),
+               !textContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                sections = extractSectionsFromMarkdown(textContent)
+            } else {
+                sections = []
+            }
         } else {
             // Plain text file
             if let textContent = try? String(contentsOf: url, encoding: .utf8),
@@ -531,18 +542,31 @@ final class KnowledgeBaseStore {
             return .failure("No text content found")
         }
 
-        // Chunk all sections (CPU-heavy)
+        // Chunk all sections (CPU-heavy).
+        // Markdown uses structure-aware chunking; other types use general paragraph-based chunking.
         var allChunks: [DocumentChunk] = []
         var chunkIndex = 0
 
-        for section in sections {
-            let sectionChunks = chunkTextBackground(
-                section.text,
-                locationLabel: section.label,
-                knowledgeBaseID: kbID,
-                startIndex: &chunkIndex
-            )
-            allChunks.append(contentsOf: sectionChunks)
+        if docType == .markdown {
+            for section in sections {
+                let sectionChunks = chunkMarkdownSectionBackground(
+                    section.text,
+                    locationLabel: section.label,
+                    knowledgeBaseID: kbID,
+                    startIndex: &chunkIndex
+                )
+                allChunks.append(contentsOf: sectionChunks)
+            }
+        } else {
+            for section in sections {
+                let sectionChunks = chunkTextBackground(
+                    section.text,
+                    locationLabel: section.label,
+                    knowledgeBaseID: kbID,
+                    startIndex: &chunkIndex
+                )
+                allChunks.append(contentsOf: sectionChunks)
+            }
         }
 
         guard !allChunks.isEmpty else {
@@ -711,6 +735,244 @@ final class KnowledgeBaseStore {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    // MARK: - Markdown Extraction & Chunking
+
+    /// Parse a Markdown document into sections based on heading hierarchy.
+    /// Each section gets a descriptive label derived from the heading path
+    /// (e.g. "Installation > Prerequisites") for better retrieval context.
+    nonisolated private static func extractSectionsFromMarkdown(_ text: String) -> [(label: String, text: String)] {
+        let lines = text.components(separatedBy: "\n")
+        var sections: [(label: String, text: String)] = []
+        var currentLabel = "Introduction"
+        var currentLines: [String] = []
+
+        // Track the heading hierarchy for breadcrumb labels
+        var headingStack: [(level: Int, title: String)] = []
+
+        for line in lines {
+            // Detect ATX-style headings: # Title, ## Title, etc.
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if let headingMatch = parseMarkdownHeading(trimmed) {
+                // Flush the current section
+                let sectionText = currentLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+                if !sectionText.isEmpty {
+                    sections.append((currentLabel, sectionText))
+                }
+
+                // Update heading stack: pop any headings at the same or deeper level
+                while let last = headingStack.last, last.level >= headingMatch.level {
+                    headingStack.removeLast()
+                }
+                headingStack.append((headingMatch.level, headingMatch.title))
+
+                // Build breadcrumb label from heading stack
+                currentLabel = headingStack.map(\.title).joined(separator: " > ")
+                currentLines = []
+            } else {
+                currentLines.append(line)
+            }
+        }
+
+        // Flush final section
+        let finalText = currentLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        if !finalText.isEmpty {
+            sections.append((currentLabel, finalText))
+        }
+
+        // If no headings were found, return the whole document as a single section
+        if sections.isEmpty {
+            let whole = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !whole.isEmpty {
+                sections.append(("Full Text", whole))
+            }
+        }
+
+        return sections
+    }
+
+    /// Parse a Markdown ATX heading line (e.g. "## My Title") into its level and title.
+    /// Returns nil if the line is not a heading.
+    nonisolated private static func parseMarkdownHeading(_ line: String) -> (level: Int, title: String)? {
+        guard line.hasPrefix("#") else { return nil }
+        var level = 0
+        for char in line {
+            if char == "#" { level += 1 }
+            else { break }
+        }
+        guard level >= 1, level <= 6 else { return nil }
+        let title = String(line.dropFirst(level)).trimmingCharacters(in: .whitespaces)
+        guard !title.isEmpty else { return nil }
+        return (level, title)
+    }
+
+    /// Strip Markdown formatting syntax for cleaner text used in keyword extraction.
+    /// Preserves the readable text content but removes: headings markers, bold/italic,
+    /// links, images, code fences, and HTML tags.
+    nonisolated private static func stripMarkdownFormatting(_ text: String) -> String {
+        text
+            // Remove code fences (```...```) — keep the code content
+            .replacingOccurrences(of: "```[a-zA-Z]*\\n?", with: "", options: .regularExpression)
+            // Remove inline code backticks
+            .replacingOccurrences(of: "`([^`]+)`", with: "$1", options: .regularExpression)
+            // Remove images: ![alt](url)
+            .replacingOccurrences(of: "!\\[[^\\]]*\\]\\([^)]*\\)", with: "", options: .regularExpression)
+            // Convert links [text](url) to just text
+            .replacingOccurrences(of: "\\[([^\\]]+)\\]\\([^)]*\\)", with: "$1", options: .regularExpression)
+            // Remove bold **text** or __text__
+            .replacingOccurrences(of: "\\*\\*([^*]+)\\*\\*", with: "$1", options: .regularExpression)
+            .replacingOccurrences(of: "__([^_]+)__", with: "$1", options: .regularExpression)
+            // Remove italic *text* or _text_ (single markers)
+            .replacingOccurrences(of: "(?<![*])\\*([^*]+)\\*(?![*])", with: "$1", options: .regularExpression)
+            // Remove heading markers
+            .replacingOccurrences(of: "^#{1,6}\\s+", with: "", options: .regularExpression)
+            // Remove blockquote markers
+            .replacingOccurrences(of: "^>\\s?", with: "", options: [.regularExpression, .anchorsMatchLines])
+            // Remove horizontal rules
+            .replacingOccurrences(of: "^[-*_]{3,}$", with: "", options: [.regularExpression, .anchorsMatchLines])
+            // Remove HTML tags
+            .replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Structure-aware Markdown chunking: respects block boundaries (paragraphs,
+    /// code blocks, lists) rather than splitting purely by character count.
+    ///
+    /// Key differences from general chunking:
+    /// - Code blocks (``` fenced) are never split mid-block
+    /// - Paragraph boundaries are preserved as chunk boundaries
+    /// - Keywords are extracted from stripped Markdown (no syntax noise)
+    /// - Overlap uses the last complete paragraph instead of raw character slicing
+    nonisolated private static func chunkMarkdownSectionBackground(
+        _ text: String,
+        locationLabel: String,
+        knowledgeBaseID: UUID,
+        startIndex: inout Int
+    ) -> [DocumentChunk] {
+        let config = chunkingConfig
+        var chunks: [DocumentChunk] = []
+
+        // Split into logical blocks: paragraphs and fenced code blocks
+        let blocks = splitMarkdownIntoBlocks(text)
+
+        var currentChunk = ""
+        var lastBlock = ""  // Track last block for paragraph-aligned overlap
+
+        for block in blocks {
+            let trimmed = block.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+
+            if currentChunk.count + trimmed.count + 2 > config.targetCharacters
+                && currentChunk.count >= config.minChunkCharacters {
+                // Emit current chunk
+                let strippedForKeywords = stripMarkdownFormatting(currentChunk)
+                let keywords = Array(SharedDataManager.extractKeywords(from: strippedForKeywords, limit: 8))
+                chunks.append(DocumentChunk(
+                    knowledgeBaseID: knowledgeBaseID,
+                    content: currentChunk.trimmingCharacters(in: .whitespacesAndNewlines),
+                    keywords: keywords,
+                    locationLabel: locationLabel,
+                    index: startIndex
+                ))
+                startIndex += 1
+
+                // Paragraph-aligned overlap: start new chunk with the last complete block
+                if lastBlock.count <= config.overlapCharacters {
+                    currentChunk = lastBlock + "\n\n" + trimmed
+                } else {
+                    currentChunk = trimmed
+                }
+            } else {
+                if !currentChunk.isEmpty { currentChunk += "\n\n" }
+                currentChunk += trimmed
+            }
+            lastBlock = trimmed
+        }
+
+        // Emit remaining text
+        let remaining = currentChunk.trimmingCharacters(in: .whitespacesAndNewlines)
+        if remaining.count >= config.minChunkCharacters {
+            let strippedForKeywords = stripMarkdownFormatting(remaining)
+            let keywords = Array(SharedDataManager.extractKeywords(from: strippedForKeywords, limit: 8))
+            chunks.append(DocumentChunk(
+                knowledgeBaseID: knowledgeBaseID,
+                content: remaining,
+                keywords: keywords,
+                locationLabel: locationLabel,
+                index: startIndex
+            ))
+            startIndex += 1
+        } else if !remaining.isEmpty, let last = chunks.indices.last {
+            // Merge short tail into last chunk
+            let merged = chunks[last].content + "\n\n" + remaining
+            let strippedForKeywords = stripMarkdownFormatting(merged)
+            chunks[last] = DocumentChunk(
+                knowledgeBaseID: knowledgeBaseID,
+                content: merged,
+                keywords: Array(SharedDataManager.extractKeywords(from: strippedForKeywords, limit: 8)),
+                locationLabel: chunks[last].locationLabel,
+                index: chunks[last].index
+            )
+        }
+
+        return chunks
+    }
+
+    /// Split Markdown text into logical blocks, keeping fenced code blocks intact.
+    /// Regular paragraphs are split on double newlines; code fences are preserved whole.
+    nonisolated private static func splitMarkdownIntoBlocks(_ text: String) -> [String] {
+        var blocks: [String] = []
+        let lines = text.components(separatedBy: "\n")
+        var currentBlock = ""
+        var inCodeFence = false
+
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+
+            if trimmed.hasPrefix("```") {
+                if inCodeFence {
+                    // End of code fence — emit the whole code block as one block
+                    currentBlock += "\n" + line
+                    blocks.append(currentBlock)
+                    currentBlock = ""
+                    inCodeFence = false
+                } else {
+                    // Start of code fence — flush any preceding text first
+                    let pending = currentBlock.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !pending.isEmpty {
+                        // Split pending text on double newlines (paragraph boundaries)
+                        let paragraphs = pending.components(separatedBy: "\n\n")
+                            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+                        blocks.append(contentsOf: paragraphs)
+                    }
+                    currentBlock = line
+                    inCodeFence = true
+                }
+            } else if inCodeFence {
+                currentBlock += "\n" + line
+            } else if trimmed.isEmpty {
+                // Paragraph boundary
+                let pending = currentBlock.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !pending.isEmpty {
+                    blocks.append(pending)
+                    currentBlock = ""
+                }
+            } else {
+                if !currentBlock.isEmpty { currentBlock += "\n" }
+                currentBlock += line
+            }
+        }
+
+        // Flush final block
+        let pending = currentBlock.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !pending.isEmpty {
+            blocks.append(pending)
+        }
+
+        return blocks
+    }
+
+    // MARK: - ZIP Extraction
+
     nonisolated private static func extractZIPBackground(at url: URL, to destination: URL) throws -> [String] {
         let fileData = try Data(contentsOf: url)
         var extractedPaths: [String] = []
@@ -793,6 +1055,8 @@ final class KnowledgeBaseStore {
     }
 
     /// Background-safe chunking (nonisolated static).
+    /// Uses paragraph-aligned overlap instead of raw character slicing to avoid
+    /// cutting mid-word/mid-sentence, which degrades embedding quality.
     nonisolated private static func chunkTextBackground(
         _ text: String,
         locationLabel: String,
@@ -805,6 +1069,7 @@ final class KnowledgeBaseStore {
             .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
 
         var currentChunk = ""
+        var lastParagraph = ""  // Track last paragraph for clean overlap
 
         for paragraph in paragraphs {
             let trimmed = paragraph.trimmingCharacters(in: .whitespaces)
@@ -820,13 +1085,20 @@ final class KnowledgeBaseStore {
                 ))
                 startIndex += 1
 
-                let overlapStart = max(0, currentChunk.count - config.overlapCharacters)
-                let overlapIdx = currentChunk.index(currentChunk.startIndex, offsetBy: overlapStart)
-                currentChunk = String(currentChunk[overlapIdx...]) + "\n\n" + trimmed
+                // Paragraph-aligned overlap: use the last complete paragraph instead of
+                // slicing at a raw character offset (which can cut mid-word/sentence).
+                if lastParagraph.count <= config.overlapCharacters {
+                    currentChunk = lastParagraph + "\n\n" + trimmed
+                } else {
+                    // Last paragraph itself exceeds overlap budget — use sentence-boundary fallback
+                    let overlapText = sentenceBoundaryOverlap(lastParagraph, maxChars: config.overlapCharacters)
+                    currentChunk = overlapText + "\n\n" + trimmed
+                }
             } else {
                 if !currentChunk.isEmpty { currentChunk += "\n\n" }
                 currentChunk += trimmed
             }
+            lastParagraph = trimmed
         }
 
         let remaining = currentChunk.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -855,6 +1127,47 @@ final class KnowledgeBaseStore {
         return chunks
     }
 
+    /// Extract the last complete sentence(s) from a paragraph, up to maxChars.
+    /// Falls back to word-boundary slicing if no sentence boundary is found.
+    nonisolated private static func sentenceBoundaryOverlap(_ text: String, maxChars: Int) -> String {
+        guard text.count > maxChars else { return text }
+
+        // Look for the last sentence boundary (. ! ? followed by space or end) within the tail
+        let tail = String(text.suffix(maxChars + 50))  // slight overshoot to find boundary
+        let sentenceEndings = CharacterSet(charactersIn: ".!?")
+
+        // Scan from the start of tail to find a sentence boundary
+        var bestCut = tail.startIndex
+        var foundBoundary = false
+        for i in tail.indices {
+            let char = tail[i]
+            if char.unicodeScalars.allSatisfy({ sentenceEndings.contains($0) }) {
+                let next = tail.index(after: i)
+                if next < tail.endIndex && tail[next] == " " {
+                    bestCut = next
+                    foundBoundary = true
+                } else if next == tail.endIndex {
+                    bestCut = next
+                    foundBoundary = true
+                }
+            }
+        }
+
+        if foundBoundary {
+            let result = String(tail[bestCut...]).trimmingCharacters(in: .whitespaces)
+            if !result.isEmpty && result.count <= maxChars { return result }
+        }
+
+        // Fallback: word-boundary slicing (find the first space from the overlap start)
+        let overlapStart = max(0, text.count - maxChars)
+        let startIdx = text.index(text.startIndex, offsetBy: overlapStart)
+        let tailSlice = text[startIdx...]
+        if let firstSpace = tailSlice.firstIndex(of: " ") {
+            return String(tailSlice[tailSlice.index(after: firstSpace)...])
+        }
+        return String(tailSlice)
+    }
+
     // MARK: - Chunking
 
     nonisolated private static let chunkingConfig = ChunkingConfig()
@@ -880,6 +1193,7 @@ final class KnowledgeBaseStore {
             .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
 
         var currentChunk = ""
+        var lastParagraph = ""
 
         for paragraph in paragraphs {
             let trimmed = paragraph.trimmingCharacters(in: .whitespaces)
@@ -896,14 +1210,18 @@ final class KnowledgeBaseStore {
                 ))
                 startIndex += 1
 
-                // Start new chunk with overlap from the tail of the previous
-                let overlapStart = max(0, currentChunk.count - config.overlapCharacters)
-                let overlapIdx = currentChunk.index(currentChunk.startIndex, offsetBy: overlapStart)
-                currentChunk = String(currentChunk[overlapIdx...]) + "\n\n" + trimmed
+                // Paragraph-aligned overlap instead of raw character slicing
+                if lastParagraph.count <= config.overlapCharacters {
+                    currentChunk = lastParagraph + "\n\n" + trimmed
+                } else {
+                    let overlapText = Self.sentenceBoundaryOverlap(lastParagraph, maxChars: config.overlapCharacters)
+                    currentChunk = overlapText + "\n\n" + trimmed
+                }
             } else {
                 if !currentChunk.isEmpty { currentChunk += "\n\n" }
                 currentChunk += trimmed
             }
+            lastParagraph = trimmed
         }
 
         // Emit remaining text

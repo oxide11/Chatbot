@@ -64,7 +64,7 @@ struct KnowledgeBaseListView: View {
                 }
                 .fileImporter(
                     isPresented: $showingImporter,
-                    allowedContentTypes: [.pdf, .epub, .plainText],
+                    allowedContentTypes: [.pdf, .epub, .plainText, UTType(filenameExtension: "md") ?? .plainText],
                     allowsMultipleSelection: true
                 ) { result in
                     if case .success(let urls) = result, !urls.isEmpty {
@@ -518,7 +518,7 @@ struct KnowledgeBaseDetailView: View {
         }
         .fileImporter(
             isPresented: $showingReimporter,
-            allowedContentTypes: [.pdf, .epub, .plainText],
+            allowedContentTypes: [.pdf, .epub, .plainText, UTType(filenameExtension: "md") ?? .plainText],
             allowsMultipleSelection: false
         ) { result in
             if case .success(let urls) = result, let url = urls.first {
