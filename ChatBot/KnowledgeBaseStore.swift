@@ -122,7 +122,7 @@ struct IngestionJob: Identifiable {
     /// Whether this job has finished (completed or failed).
     var isFinished: Bool {
         switch status {
-        case .completed, .failed: return true
+        case .completed, .completedWithWarnings, .failed: return true
         case .queued, .processing: return false
         }
     }
@@ -131,6 +131,8 @@ struct IngestionJob: Identifiable {
         case queued
         case processing
         case completed
+        /// Completed but with non-fatal issues (e.g. skipped pages/chapters, persistence failure).
+        case completedWithWarnings(String)
         case failed(String)
 
         var label: String {
@@ -138,6 +140,7 @@ struct IngestionJob: Identifiable {
             case .queued: return "Queued"
             case .processing: return "Processing…"
             case .completed: return "Done"
+            case .completedWithWarnings(let msg): return msg
             case .failed(let msg): return msg
             }
         }
@@ -147,7 +150,8 @@ struct IngestionJob: Identifiable {
             case .queued: return "clock"
             case .processing: return "arrow.trianglehead.2.clockwise"
             case .completed: return "checkmark.circle.fill"
-            case .failed: return "exclamationmark.triangle.fill"
+            case .completedWithWarnings: return "exclamationmark.triangle.fill"
+            case .failed: return "xmark.circle.fill"
             }
         }
 
@@ -156,6 +160,7 @@ struct IngestionJob: Identifiable {
             case .queued: return "secondary"
             case .processing: return "blue"
             case .completed: return "green"
+            case .completedWithWarnings: return "orange"
             case .failed: return "red"
             }
         }
@@ -437,35 +442,51 @@ final class KnowledgeBaseStore {
             if accessing { job.url.stopAccessingSecurityScopedResource() }
 
             // Update UI state back on MainActor
-            if let idx = ingestionQueue.firstIndex(where: { $0.id == job.id }) {
-                switch outcome {
-                case .success(var result):
-                    ingestionQueue[idx].status = .completed
-                    result.kb.domainID = job.domainID
-                    knowledgeBases.insert(result.kb, at: 0)
-                    chunkCache[result.kb.id] = result.chunks
-                    invalidateEmbeddingMatrix(for: job.domainID)
-                    invertedKeywordIndex.removeAll()
+            guard let idx = ingestionQueue.firstIndex(where: { $0.id == job.id }) else {
+                // Job was removed from queue during processing (race condition) — log and skip
+                AppLogger.kbStore.warning("Ingestion job \(job.fileName) completed but was removed from queue")
+                continue
+            }
 
-                    // Persist to SwiftData (fire-and-forget — in-memory state is already updated)
-                    if let actor = dbActor {
-                        let domainID = job.domainID
-                        Task {
-                            do {
-                                try await actor.insertKnowledgeBase(result.kb, chunks: result.chunks, domainID: domainID)
-                            } catch {
-                                AppLogger.kbStore.error("Failed persisting ingestion result: \(error.localizedDescription)")
-                            }
-                        }
-                    }
+            switch outcome {
+            case .success(var result):
+                result.kb.domainID = job.domainID
+                knowledgeBases.insert(result.kb, at: 0)
+                chunkCache[result.kb.id] = result.chunks
+                invalidateEmbeddingMatrix(for: job.domainID)
+                invertedKeywordIndex.removeAll()
 
-                    // Regenerate the domain summary now that new content has been added
-                    Task { [weak self] in
-                        await self?.regenerateDomainSummary(for: job.domainID)
-                    }
-                case .failure(let reason):
-                    ingestionQueue[idx].status = .failed(reason)
+                // Collect warnings for user display
+                var allWarnings = result.warnings
+
+                // Check if embeddings were expected but unavailable
+                if result.kb.embeddingModelID == nil {
+                    allWarnings.append("Semantic search unavailable — using keyword matching only")
                 }
+
+                // Persist to SwiftData — await result so we can surface failures
+                if let actor = dbActor {
+                    do {
+                        try await actor.insertKnowledgeBase(result.kb, chunks: result.chunks, domainID: job.domainID)
+                    } catch {
+                        allWarnings.append("Failed to save to database — data may not persist after restart")
+                        AppLogger.kbStore.error("Failed persisting ingestion result: \(error.localizedDescription)")
+                    }
+                }
+
+                if allWarnings.isEmpty {
+                    ingestionQueue[idx].status = .completed
+                } else {
+                    ingestionQueue[idx].status = .completedWithWarnings("Done (\(allWarnings.count) warning\(allWarnings.count == 1 ? "" : "s"))")
+                    AppLogger.kbStore.warning("Ingestion warnings for '\(job.fileName)': \(allWarnings.joined(separator: "; "))")
+                }
+
+                // Regenerate the domain summary now that new content has been added
+                Task { [weak self] in
+                    await self?.regenerateDomainSummary(for: job.domainID)
+                }
+            case .failure(let reason):
+                ingestionQueue[idx].status = .failed(reason)
             }
             updateOverallProgress()
         }
@@ -485,7 +506,7 @@ final class KnowledgeBaseStore {
         var completed = 0.0
         for job in ingestionQueue {
             switch job.status {
-            case .completed, .failed: completed += 1.0
+            case .completed, .completedWithWarnings, .failed: completed += 1.0
             case .processing: completed += 0.5
             case .queued: break
             }
@@ -499,6 +520,8 @@ final class KnowledgeBaseStore {
     private struct IngestionResult: Sendable {
         var kb: KnowledgeBase
         let chunks: [DocumentChunk]
+        /// Non-fatal warnings collected during extraction (e.g. skipped pages/chapters).
+        var warnings: [String] = []
     }
 
     /// Outcome of a background ingestion job.
@@ -525,13 +548,25 @@ final class KnowledgeBaseStore {
 
         let fileSize = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int64) ?? 0
         let kbID = UUID()
+        var warnings: [String] = []
 
         // Extract text (CPU-heavy)
         let sections: [(label: String, text: String)]
         if docType == .pdf {
+            let pdfDoc = PDFDocument(url: url)
+            let totalPages = pdfDoc?.pageCount ?? 0
             sections = extractTextFromPDFBackground(at: url)
+            if totalPages > 0 && sections.count < totalPages {
+                let skipped = totalPages - sections.count
+                warnings.append("\(skipped) of \(totalPages) page\(skipped == 1 ? "" : "s") had no extractable text")
+            }
         } else if docType == .epub {
-            sections = (try? extractTextFromEPUBBackground(at: url)) ?? []
+            if let result = try? extractTextFromEPUBBackground(at: url) {
+                sections = result
+            } else {
+                warnings.append("EPUB extraction encountered errors — some chapters may be missing")
+                sections = []
+            }
         } else if docType == .markdown {
             if let textContent = try? String(contentsOf: url, encoding: .utf8),
                !textContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -607,7 +642,7 @@ final class KnowledgeBaseStore {
             embeddingModelID: embeddingService.isAvailable ? embeddingService.modelIdentifier : nil
         )
 
-        return .success(IngestionResult(kb: kb, chunks: allChunks))
+        return .success(IngestionResult(kb: kb, chunks: allChunks, warnings: warnings))
     }
 
     /// Generate concise summaries for each chunk using the on-device LLM.
@@ -1922,59 +1957,69 @@ final class KnowledgeBaseStore {
 
             if accessing { job.url.stopAccessingSecurityScopedResource() }
 
-            if let idx = ingestionQueue.firstIndex(where: { $0.id == job.id }) {
-                switch outcome {
-                case .success(let result):
-                    ingestionQueue[idx].status = .completed
+            guard let idx = ingestionQueue.firstIndex(where: { $0.id == job.id }) else {
+                AppLogger.kbStore.warning("Re-import job for '\(job.fileName)' completed but was removed from queue")
+                isProcessing = false
+                return
+            }
 
-                    // Replace chunks for existing KB
-                    if let kbIndex = knowledgeBases.firstIndex(where: { $0.id == kb.id }) {
-                        // Clean old keyword caches
-                        if let oldChunks = chunkCache[kb.id] {
-                            for chunk in oldChunks {
-                                chunkKeywordCache.removeValue(forKey: chunk.id)
-                            }
-                        }
+            switch outcome {
+            case .success(let result):
+                var allWarnings = result.warnings
 
-                        // Re-key chunks to use the existing KB ID
-                        let rekeyedChunks = result.chunks.map { original in
-                            DocumentChunk(
-                                knowledgeBaseID: kb.id,
-                                content: original.content,
-                                keywords: original.keywords,
-                                locationLabel: original.locationLabel,
-                                index: original.index,
-                                embedding: original.embedding
-                            )
-                        }
-
-                        chunkCache[kb.id] = rekeyedChunks
-                        knowledgeBases[kbIndex].chunkCount = rekeyedChunks.count
-                        knowledgeBases[kbIndex].updatedAt = Date()
-                        knowledgeBases[kbIndex].embeddingModelID = result.kb.embeddingModelID
-
-                        invalidateEmbeddingMatrix(for: kb.effectiveDomainID)
-                        invertedKeywordIndex.removeAll()
-
-                        // Persist to SwiftData
-                        if let actor = dbActor {
-                            Task {
-                                do {
-                                    try await actor.replaceChunks(
-                                        for: kb.id,
-                                        newChunks: rekeyedChunks,
-                                        embeddingModelID: result.kb.embeddingModelID
-                                    )
-                                } catch {
-                                    AppLogger.kbStore.error("Failed persisting re-import: \(error.localizedDescription)")
-                                }
-                            }
+                // Replace chunks for existing KB
+                if let kbIndex = knowledgeBases.firstIndex(where: { $0.id == kb.id }) {
+                    // Clean old keyword caches
+                    if let oldChunks = chunkCache[kb.id] {
+                        for chunk in oldChunks {
+                            chunkKeywordCache.removeValue(forKey: chunk.id)
                         }
                     }
 
-                case .failure(let reason):
-                    ingestionQueue[idx].status = .failed(reason)
+                    // Re-key chunks to use the existing KB ID
+                    let rekeyedChunks = result.chunks.map { original in
+                        DocumentChunk(
+                            knowledgeBaseID: kb.id,
+                            content: original.content,
+                            keywords: original.keywords,
+                            locationLabel: original.locationLabel,
+                            index: original.index,
+                            embedding: original.embedding
+                        )
+                    }
+
+                    chunkCache[kb.id] = rekeyedChunks
+                    knowledgeBases[kbIndex].chunkCount = rekeyedChunks.count
+                    knowledgeBases[kbIndex].updatedAt = Date()
+                    knowledgeBases[kbIndex].embeddingModelID = result.kb.embeddingModelID
+
+                    invalidateEmbeddingMatrix(for: kb.effectiveDomainID)
+                    invertedKeywordIndex.removeAll()
+
+                    // Persist to SwiftData — await to surface failures
+                    if let actor = dbActor {
+                        do {
+                            try await actor.replaceChunks(
+                                for: kb.id,
+                                newChunks: rekeyedChunks,
+                                embeddingModelID: result.kb.embeddingModelID
+                            )
+                        } catch {
+                            allWarnings.append("Failed to save to database — data may not persist after restart")
+                            AppLogger.kbStore.error("Failed persisting re-import: \(error.localizedDescription)")
+                        }
+                    }
                 }
+
+                if allWarnings.isEmpty {
+                    ingestionQueue[idx].status = .completed
+                } else {
+                    ingestionQueue[idx].status = .completedWithWarnings("Done (\(allWarnings.count) warning\(allWarnings.count == 1 ? "" : "s"))")
+                    AppLogger.kbStore.warning("Re-import warnings for '\(job.fileName)': \(allWarnings.joined(separator: "; "))")
+                }
+
+            case .failure(let reason):
+                ingestionQueue[idx].status = .failed(reason)
             }
             isProcessing = false
         }

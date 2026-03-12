@@ -145,8 +145,11 @@ struct KnowledgeBaseListView: View {
                                     case .completed:
                                         Image(systemName: "checkmark.circle.fill")
                                             .foregroundStyle(.green)
-                                    case .failed:
+                                    case .completedWithWarnings:
                                         Image(systemName: "exclamationmark.triangle.fill")
+                                            .foregroundStyle(.orange)
+                                    case .failed:
+                                        Image(systemName: "xmark.circle.fill")
                                             .foregroundStyle(.red)
                                     case .queued:
                                         Image(systemName: "clock")
@@ -236,6 +239,11 @@ struct KnowledgeBaseListView: View {
                                                     fromByteCount: knowledgeBaseStore.storageSize(for: kb),
                                                     countStyle: .file
                                                 ))
+                                                if kb.embeddingModelID == nil || kb.embeddingModelID?.isEmpty == true {
+                                                    Text("\u{00B7}")
+                                                    Label("Keyword only", systemImage: "textformat.abc")
+                                                        .foregroundStyle(.orange)
+                                                }
                                             }
                                             .font(.caption2)
                                             .foregroundStyle(.tertiary)
