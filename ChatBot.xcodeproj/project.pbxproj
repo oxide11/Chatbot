@@ -6,6 +6,10 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		332BE4C32FA00D4200EF9AD4 /* SwiftMath in Frameworks */ = {isa = PBXBuildFile; productRef = 332BE4C22FA00D4200EF9AD4 /* SwiftMath */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXContainerItemProxy section */
 		CC000001AAAA000000000001 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -39,6 +43,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				332BE4C32FA00D4200EF9AD4 /* SwiftMath in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -90,6 +95,7 @@
 			);
 			name = ChatBot;
 			packageProductDependencies = (
+				332BE4C22FA00D4200EF9AD4 /* SwiftMath */,
 			);
 			productName = ChatBot;
 			productReference = 338D653D2F4373E4006B4143 /* ChatBot.app */;
@@ -146,6 +152,9 @@
 			);
 			mainGroup = 338D65342F4373E4006B4143;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				332BE4C12FA00D4200EF9AD4 /* XCRemoteSwiftPackageReference "SwiftMath" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 338D653E2F4373E4006B4143 /* Products */;
 			projectDirPath = "";
@@ -501,6 +510,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		332BE4C12FA00D4200EF9AD4 /* XCRemoteSwiftPackageReference "SwiftMath" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/mgriebling/SwiftMath";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.7.3;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		332BE4C22FA00D4200EF9AD4 /* SwiftMath */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 332BE4C12FA00D4200EF9AD4 /* XCRemoteSwiftPackageReference "SwiftMath" */;
+			productName = SwiftMath;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 338D65352F4373E4006B4143 /* Project object */;
 }
