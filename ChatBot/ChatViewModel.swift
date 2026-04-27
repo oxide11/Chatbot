@@ -607,6 +607,7 @@ final class ConversationStore {
     let wikiStore = WikiStore()
     let wikiEngine: WikiEngine
     let knowledgeBaseStore = KnowledgeBaseStore()
+    let providers = ProviderRegistry()
     var ragSettings: RAGSettings = .default
     var defaultSystemPrompt: String = ChatViewModel.defaultInstructions
     let orchestrator = AgentOrchestrator()
