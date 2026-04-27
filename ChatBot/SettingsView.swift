@@ -15,6 +15,7 @@ struct SettingsView: View {
     @State private var showingKnowledgeBases = false
     @State private var showingWorkers = false
     @State private var defaultPromptDraft = ""
+    @State private var openingProvider: ChatProviderID?
 
     var body: some View {
         NavigationStack {
@@ -83,6 +84,26 @@ struct SettingsView: View {
                     Text("Intelligence")
                 } footer: {
                     Text("Wiki pages are extracted from conversations. Knowledge bases are imported documents. Workers are specialized AI personas for task delegation.")
+                }
+
+                // MARK: Providers
+                Section {
+                    ForEach(ChatProviderID.allCases) { id in
+                        Button {
+                            openingProvider = id
+                        } label: {
+                            ProviderRow(
+                                id: id,
+                                isConfigured: store.providers.isConfigured(id),
+                                isDefault: store.providers.defaultProviderID == id
+                            )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                } header: {
+                    Text("Providers")
+                } footer: {
+                    Text("Apple Intelligence runs on-device with no key required. Connect Anthropic, OpenAI, or Gemini to route chats through their cloud APIs. Keys are stored in the Keychain.")
                 }
 
                 // MARK: Retrieval
@@ -239,6 +260,9 @@ struct SettingsView: View {
             }
             .sheet(isPresented: $showingWorkers) {
                 WorkerLibraryView(orchestrator: store.orchestrator)
+            }
+            .sheet(item: $openingProvider) { id in
+                ProviderDetailView(id: id, registry: store.providers)
             }
         }
         .presentationDragIndicator(.visible)

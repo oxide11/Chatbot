@@ -45,35 +45,11 @@ struct ChatDetailView: View {
         #if os(macOS)
         .toolbar {
             ToolbarItem(placement: .automatic) {
-                DomainPickerMenu(
-                    domains: viewModel.knowledgeBaseStore?.domains ?? [],
-                    selectedDomainID: Binding(
-                        get: { viewModel.domainID },
-                        set: { newID in
-                            viewModel.domainID = newID
-                            viewModel.notifyChanged()
-                        }
-                    )
-                )
-            }
-            ToolbarItem(placement: .automatic) {
                 chatMenu
             }
         }
         #else
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                DomainPickerMenu(
-                    domains: viewModel.knowledgeBaseStore?.domains ?? [],
-                    selectedDomainID: Binding(
-                        get: { viewModel.domainID },
-                        set: { newID in
-                            viewModel.domainID = newID
-                            viewModel.notifyChanged()
-                        }
-                    )
-                )
-            }
             ToolbarItem(placement: .topBarTrailing) {
                 chatMenu
             }
@@ -99,6 +75,26 @@ struct ChatDetailView: View {
 
     private var chatMenu: some View {
         Menu {
+            let domains = viewModel.knowledgeBaseStore?.domains ?? []
+            if !domains.isEmpty {
+                Picker(selection: Binding(
+                    get: { viewModel.domainID },
+                    set: { newID in
+                        viewModel.domainID = newID
+                        viewModel.notifyChanged()
+                    }
+                )) {
+                    ForEach(domains) { domain in
+                        Text(domain.name).tag(domain.id)
+                    }
+                } label: {
+                    Label("Domain", systemImage: "square.stack.3d.up")
+                }
+                .pickerStyle(.menu)
+
+                Divider()
+            }
+
             Button {
                 systemPromptDraft = viewModel.customSystemPrompt ?? ""
                 showingSystemPrompt = true
