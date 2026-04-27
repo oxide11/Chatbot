@@ -64,6 +64,29 @@ extension ChatProvider {
         }
         return result
     }
+
+    /// Make a tiny end-to-end request to verify the credential is valid
+    /// and the provider responds. Returns a short echo string suitable
+    /// for showing in the Settings UI as a success message.
+    /// Throws ChatProviderError (or another error) on failure — the
+    /// caller should surface it verbatim.
+    func validate() async throws -> String {
+        let history = [ProviderMessage(role: .user, content: "Reply with just the word OK.")]
+        let options = ProviderGenerationOptions(maxOutputTokens: 16, temperature: 0)
+        let reply = try await respond(
+            history: history,
+            systemPrompt: nil,
+            options: options
+        )
+        let trimmed = reply.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            throw ChatProviderError.invalidResponse(
+                status: 200,
+                message: "Provider returned an empty response. Streaming may not be working."
+            )
+        }
+        return trimmed
+    }
 }
 
 // MARK: - Errors

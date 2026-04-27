@@ -111,6 +111,39 @@ enum ChatProviderID: String, CaseIterable, Codable, Hashable, Identifiable, Send
 
     /// Account name used with KeychainManager.
     var keychainAccount: String { "provider.\(rawValue)" }
+
+    /// Default model id sent to the provider. Can be overridden per-provider
+    /// via ProviderRegistry.modelID(for:) — the value below is the fallback.
+    var defaultModelID: String {
+        switch self {
+        case .foundationModels: return "" // unused
+        case .anthropic:        return "claude-sonnet-4-5"
+        case .openAI:           return "gpt-4.1"
+        case .gemini:           return "gemini-2.5-pro"
+        }
+    }
+
+    /// Suggestions a Picker can offer. Free-text override is always allowed
+    /// in case Anthropic / OpenAI / Google ship a new alias before we update.
+    var modelSuggestions: [String] {
+        switch self {
+        case .foundationModels: return []
+        case .anthropic:
+            return [
+                "claude-sonnet-4-5",
+                "claude-opus-4-1",
+                "claude-haiku-4-5",
+                "claude-sonnet-4-6",
+                "claude-opus-4-7"
+            ]
+        case .openAI:
+            return ["gpt-4.1", "gpt-4o", "o4-mini"]
+        case .gemini:
+            return ["gemini-2.5-pro", "gemini-2.5-flash"]
+        }
+    }
+
+    var modelDefaultsKey: String { "provider_model_\(rawValue)" }
 }
 
 // MARK: - Provider Tasks
@@ -254,6 +287,27 @@ final class ProviderRegistry {
         taskOverrides[task] != nil
     }
 
+    // MARK: - Model selection
+
+    /// User-overridable model id for a provider, or the provider's built-in
+    /// default if nothing has been chosen.
+    func modelID(for id: ChatProviderID) -> String {
+        if let stored = UserDefaults.standard.string(forKey: id.modelDefaultsKey),
+           !stored.isEmpty {
+            return stored
+        }
+        return id.defaultModelID
+    }
+
+    func setModelID(_ modelID: String, for id: ChatProviderID) {
+        let trimmed = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty || trimmed == id.defaultModelID {
+            UserDefaults.standard.removeObject(forKey: id.modelDefaultsKey)
+        } else {
+            UserDefaults.standard.set(trimmed, forKey: id.modelDefaultsKey)
+        }
+    }
+
     // MARK: - Resolution
 
     /// Build a `ChatProvider` for the given id if a key is stored.
@@ -267,7 +321,7 @@ final class ProviderRegistry {
         case .anthropic:
             guard let key = KeychainManager.getAPIKey(for: id.keychainAccount),
                   !key.isEmpty else { return nil }
-            return AnthropicProvider(apiKey: key)
+            return AnthropicProvider(apiKey: key, model: modelID(for: id))
         case .openAI, .gemini:
             // Implementations to follow.
             return nil

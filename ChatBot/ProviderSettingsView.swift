@@ -67,6 +67,18 @@ struct ProviderDetailView: View {
     @State private var saveError: String?
     @State private var confirmDelete = false
 
+    @State private var modelDraft: String = ""
+
+    /// nil = idle, .running, .success(echo), .failure(message)
+    @State private var testStatus: TestStatus = .idle
+
+    enum TestStatus: Equatable {
+        case idle
+        case running
+        case success(String)
+        case failure(String)
+    }
+
     private var isConfigured: Bool { registry.isConfigured(id) }
     private var isDefault: Bool { registry.defaultProviderID == id }
 
@@ -95,6 +107,8 @@ struct ProviderDetailView: View {
 
                 if id.requiresAPIKey {
                     keySection
+                    modelSection
+                    testSection
                     if isConfigured {
                         defaultSection
                         deleteSection
@@ -205,6 +219,124 @@ struct ProviderDetailView: View {
             if isConfigured && keyDraft.isEmpty {
                 keyDraft = ""
             }
+            if modelDraft.isEmpty {
+                modelDraft = registry.modelID(for: id)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var modelSection: some View {
+        Section {
+            Picker("Suggested", selection: Binding(
+                get: { modelDraft },
+                set: { newValue in
+                    modelDraft = newValue
+                    registry.setModelID(newValue, for: id)
+                    testStatus = .idle
+                }
+            )) {
+                ForEach(id.modelSuggestions, id: \.self) { suggestion in
+                    Text(suggestion).tag(suggestion)
+                }
+                if !id.modelSuggestions.contains(modelDraft) && !modelDraft.isEmpty {
+                    Text(modelDraft).tag(modelDraft)
+                }
+            }
+            .pickerStyle(.menu)
+
+            HStack {
+                Text("Custom")
+                    .foregroundStyle(.secondary)
+                #if os(iOS) || os(tvOS) || os(visionOS)
+                TextField(id.defaultModelID, text: Binding(
+                    get: { modelDraft },
+                    set: { newValue in
+                        modelDraft = newValue
+                        registry.setModelID(newValue, for: id)
+                        testStatus = .idle
+                    }
+                ))
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .multilineTextAlignment(.trailing)
+                .font(.system(.body, design: .monospaced))
+                #else
+                TextField(id.defaultModelID, text: Binding(
+                    get: { modelDraft },
+                    set: { newValue in
+                        modelDraft = newValue
+                        registry.setModelID(newValue, for: id)
+                        testStatus = .idle
+                    }
+                ))
+                .multilineTextAlignment(.trailing)
+                .font(.system(.body, design: .monospaced))
+                #endif
+            }
+        } header: {
+            Text("Model")
+        } footer: {
+            Text("If your key works but the model returns an error, the alias may have changed. Try another from the picker or paste the exact id from the provider's docs.")
+        }
+    }
+
+    @ViewBuilder
+    private var testSection: some View {
+        Section {
+            Button {
+                runTest()
+            } label: {
+                HStack {
+                    Label("Test Connection", systemImage: "antenna.radiowaves.left.and.right")
+                    Spacer()
+                    switch testStatus {
+                    case .idle:
+                        EmptyView()
+                    case .running:
+                        ProgressView().controlSize(.small)
+                    case .success:
+                        Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                    case .failure:
+                        Image(systemName: "xmark.octagon.fill").foregroundStyle(.red)
+                    }
+                }
+            }
+            .buttonStyle(.glass)
+            .disabled(testStatus == .running || effectiveKey.isEmpty)
+
+            switch testStatus {
+            case .success(let echo):
+                Label {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Connected").font(.callout.weight(.medium))
+                        Text("Reply: \u{201C}\(echo)\u{201D}")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+                } icon: {
+                    Image(systemName: "checkmark.seal.fill").foregroundStyle(.green)
+                }
+            case .failure(let detail):
+                Label {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Test failed").font(.callout.weight(.medium))
+                        Text(detail)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                            .textSelection(.enabled)
+                    }
+                } icon: {
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red)
+                }
+            default:
+                EmptyView()
+            }
+        } header: {
+            Text("Diagnostics")
+        } footer: {
+            Text("Tests with a 16-token request to confirm the key, model, and network path all work end-to-end. Errors are shown verbatim from the provider so you can copy them when filing a bug.")
         }
     }
 
@@ -250,6 +382,54 @@ struct ProviderDetailView: View {
             dismiss()
         } catch {
             saveError = error.localizedDescription
+        }
+    }
+
+    // MARK: - Test connection
+
+    /// The key the test should use: prefer the in-flight draft if the user
+    /// is editing, otherwise fall back to the stored key so already-saved
+    /// providers can be tested without re-entering anything.
+    private var effectiveKey: String {
+        let draft = keyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !draft.isEmpty { return draft }
+        return KeychainManager.getAPIKey(for: id.keychainAccount) ?? ""
+    }
+
+    private func runTest() {
+        let key = effectiveKey
+        guard !key.isEmpty else {
+            testStatus = .failure("Enter an API key first.")
+            return
+        }
+        let modelID = registry.modelID(for: id)
+        testStatus = .running
+
+        Task {
+            do {
+                let provider = try makeProvider(for: id, key: key, model: modelID)
+                let echo = try await provider.validate()
+                await MainActor.run { testStatus = .success(echo) }
+            } catch {
+                let detail = (error as? LocalizedError)?.errorDescription
+                    ?? error.localizedDescription
+                await MainActor.run { testStatus = .failure(detail) }
+            }
+        }
+    }
+
+    private func makeProvider(
+        for id: ChatProviderID,
+        key: String,
+        model: String
+    ) throws -> ChatProvider {
+        switch id {
+        case .anthropic:
+            return AnthropicProvider(apiKey: key, model: model)
+        case .openAI, .gemini:
+            throw ChatProviderError.providerUnavailable(id)
+        case .foundationModels:
+            throw ChatProviderError.providerUnavailable(id)
         }
     }
 }
