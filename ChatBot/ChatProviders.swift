@@ -166,4 +166,22 @@ final class ProviderRegistry {
         defaultProviderID = id
         UserDefaults.standard.set(id.rawValue, forKey: defaultsKey)
     }
+
+    /// Build a `ChatProvider` for the given id if a key is stored.
+    /// Returns nil for `foundationModels` (handled by the local
+    /// LanguageModelSession path) or for providers without a key /
+    /// without an implementation yet.
+    func resolve(_ id: ChatProviderID) -> ChatProvider? {
+        switch id {
+        case .foundationModels:
+            return nil
+        case .anthropic:
+            guard let key = KeychainManager.getAPIKey(for: id.keychainAccount),
+                  !key.isEmpty else { return nil }
+            return AnthropicProvider(apiKey: key)
+        case .openAI, .gemini:
+            // Implementations to follow.
+            return nil
+        }
+    }
 }

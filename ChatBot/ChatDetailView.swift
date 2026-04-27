@@ -75,6 +75,28 @@ struct ChatDetailView: View {
 
     private var chatMenu: some View {
         Menu {
+            let registry = viewModel.providerRegistry
+            let configured = registry?.configuredIDs ?? [.foundationModels]
+            if let registry, configured.count > 1 {
+                Picker(selection: Binding(
+                    get: { viewModel.providerID },
+                    set: { newID in
+                        viewModel.providerID = newID
+                        viewModel.checkAvailability()
+                        viewModel.notifyChanged()
+                    }
+                )) {
+                    ForEach(ChatProviderID.allCases.filter { configured.contains($0) }) { id in
+                        Label(id.shortName, systemImage: id.iconSystemName).tag(id)
+                    }
+                } label: {
+                    Label("Provider", systemImage: registry.defaultProviderID.iconSystemName)
+                }
+                .pickerStyle(.menu)
+
+                Divider()
+            }
+
             let domains = viewModel.knowledgeBaseStore?.domains ?? []
             if !domains.isEmpty {
                 Picker(selection: Binding(
