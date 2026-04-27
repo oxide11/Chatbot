@@ -340,7 +340,7 @@ extension WikiEngine {
                 pagesCreated: pagesCreated,
                 pagesMerged: pagesMerged
             )
-            await onProgress(progress)
+            onProgress(progress)
         }
 
         AppLogger.wiki.info("Document extraction done: \(pagesCreated) created, \(pagesMerged) merged across \(chunks.count) chunks (\(sourceName))")

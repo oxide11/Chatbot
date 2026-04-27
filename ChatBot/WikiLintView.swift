@@ -581,7 +581,7 @@ private struct MissingPageView: View {
 
     var body: some View {
         Form {
-            if let target = finding.linkTarget {
+            if finding.linkTarget != nil {
                 Section("Concept") {
                     TextField("Title", text: $draftTitle)
                     TextField("Body", text: $draftBody, axis: .vertical)
