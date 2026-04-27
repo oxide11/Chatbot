@@ -43,6 +43,29 @@ protocol ChatProvider: Sendable {
     ) -> AsyncThrowingStream<String, Error>
 }
 
+// MARK: - Convenience
+
+extension ChatProvider {
+    /// Collect a streamed reply into a single string. Used by callers that
+    /// don't need incremental updates (e.g. wiki extraction, lint reviews).
+    func respond(
+        history: [ProviderMessage],
+        systemPrompt: String?,
+        options: ProviderGenerationOptions
+    ) async throws -> String {
+        var result = ""
+        for try await delta in streamReply(
+            history: history,
+            systemPrompt: systemPrompt,
+            options: options
+        ) {
+            try Task.checkCancellation()
+            result += delta
+        }
+        return result
+    }
+}
+
 // MARK: - Errors
 
 enum ChatProviderError: LocalizedError {

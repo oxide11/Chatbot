@@ -107,6 +107,17 @@ struct SettingsView: View {
                     Text("Apple Intelligence runs on-device with no key required. Connect Anthropic, OpenAI, or Gemini to route chats through their cloud APIs. Keys are stored in the Keychain.")
                 }
 
+                // MARK: Routing
+                Section {
+                    ForEach(ProviderTask.allCases, id: \.self) { task in
+                        TaskRoutingRow(task: task, registry: store.providers)
+                    }
+                } header: {
+                    Text("Routing")
+                } footer: {
+                    Text("Bind each task to a specific provider. Useful for keeping chat on-device while sending wiki extraction and lint review to a higher-quality remote model. \u{201C}Use Default\u{201D} falls back to the default above.")
+                }
+
                 // MARK: Retrieval
                 Section {
                     Toggle("Wiki Retrieval", isOn: Binding(

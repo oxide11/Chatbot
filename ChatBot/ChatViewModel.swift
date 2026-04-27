@@ -765,6 +765,8 @@ final class ConversationStore {
     init() {
         self.wikiEngine = WikiEngine(wikiStore: wikiStore)
         self.wikiLinter = WikiLinter(wikiStore: wikiStore)
+        self.wikiEngine.providerRegistry = providers
+        self.wikiLinter.providerRegistry = providers
         SharedDataManager.migrateIfNeeded()
         loadRAGSettings()
         loadDefaultSystemPrompt()
@@ -847,7 +849,9 @@ final class ConversationStore {
 
     func createConversation() -> ChatViewModel {
         let conversation = ChatViewModel()
-        conversation.providerID = providers.defaultProviderID
+        // Seed from the routing rule for chat — falls back to the global
+        // default if the user hasn't pinned a chat-specific provider.
+        conversation.providerID = providers.providerID(for: .chat)
         conversation.providerRegistry = providers
         conversation.checkAvailability()
         conversation.wikiEngine = wikiEngine

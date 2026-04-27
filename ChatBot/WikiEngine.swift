@@ -27,6 +27,11 @@ import os
 final class WikiEngine {
     let wikiStore: WikiStore
 
+    /// Set by ConversationStore. When the user has bound a remote provider
+    /// to the `.extraction` task, extraction calls route through it; otherwise
+    /// we fall back to the on-device LanguageModelSession path.
+    var providerRegistry: ProviderRegistry?
+
     /// Whether wiki extraction is enabled.
     var extractionEnabled: Bool = true
 
@@ -56,23 +61,19 @@ final class WikiEngine {
         guard extractionEnabled else { return }
         guard !transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
 
-        let extractionSession = LanguageModelSession {
-            WikiExtractionPrompts.systemPrompt
-        }
-
         let prompt = WikiExtractionPrompts.extractionPrompt(
             transcript: transcript,
             existingPageTitles: wikiStore.pages.map(\.title)
         )
 
-        let options = GenerationOptions(
-            sampling: .greedy,
-            maximumResponseTokens: 500
-        )
-
         do {
-            let response = try await extractionSession.respond(to: prompt, options: options)
-            let extracted = WikiExtractionPrompts.parse(response.content)
+            let responseText = try await respondOnce(
+                systemPrompt: WikiExtractionPrompts.systemPrompt,
+                userPrompt: prompt,
+                maxTokens: 500,
+                task: .extraction
+            )
+            let extracted = WikiExtractionPrompts.parse(responseText)
 
             guard !extracted.isEmpty else {
                 AppLogger.wiki.debug("No knowledge extracted from '\(conversationTitle)'")
@@ -157,6 +158,37 @@ final class WikiEngine {
         return (context.trimmingCharacters(in: .whitespacesAndNewlines), includedCount)
     }
 
+    // MARK: - Provider Routing
+
+    /// Run a single prompt through whichever provider the user has bound
+    /// to `task`. Falls back to the on-device LanguageModelSession when no
+    /// remote provider is configured for the task. Used by both
+    /// extraction paths and the lint semantic pass.
+    func respondOnce(
+        systemPrompt: String,
+        userPrompt: String,
+        maxTokens: Int,
+        task: ProviderTask
+    ) async throws -> String {
+        if let provider = providerRegistry?.resolve(for: task) {
+            return try await provider.respond(
+                history: [ProviderMessage(role: .user, content: userPrompt)],
+                systemPrompt: systemPrompt,
+                options: ProviderGenerationOptions(
+                    maxOutputTokens: maxTokens,
+                    temperature: 1.0
+                )
+            )
+        }
+        let session = LanguageModelSession { systemPrompt }
+        let options = GenerationOptions(
+            sampling: .greedy,
+            maximumResponseTokens: maxTokens
+        )
+        let response = try await session.respond(to: userPrompt, options: options)
+        return response.content
+    }
+
     // MARK: - Merge Logic
 
     /// Merge new content into an existing page body.
@@ -234,13 +266,6 @@ extension WikiEngine {
         }
 
         let chunks = Self.chunkForExtraction(trimmed)
-        let session = LanguageModelSession {
-            WikiExtractionPrompts.systemPrompt
-        }
-        let options = GenerationOptions(
-            sampling: .greedy,
-            maximumResponseTokens: 600
-        )
 
         var pagesCreated = 0
         var pagesMerged = 0
@@ -266,8 +291,13 @@ extension WikiEngine {
             )
 
             do {
-                let response = try await session.respond(to: prompt, options: options)
-                let extracted = WikiExtractionPrompts.parse(response.content)
+                let responseText = try await respondOnce(
+                    systemPrompt: WikiExtractionPrompts.systemPrompt,
+                    userPrompt: prompt,
+                    maxTokens: 600,
+                    task: .extraction
+                )
+                let extracted = WikiExtractionPrompts.parse(responseText)
 
                 for item in extracted {
                     let referencedTitles = WikiExtractionPrompts.extractWikilinks(from: item.body)

@@ -113,6 +113,49 @@ enum ChatProviderID: String, CaseIterable, Codable, Hashable, Identifiable, Send
     var keychainAccount: String { "provider.\(rawValue)" }
 }
 
+// MARK: - Provider Tasks
+
+/// Where in the app a provider is invoked. Each task can route to a
+/// different provider, so e.g. you can keep chat on-device while sending
+/// extraction and lint to Claude.
+enum ProviderTask: String, CaseIterable, Hashable, Sendable {
+    /// Chat reply streaming.
+    case chat
+    /// Document → wiki extraction (one-shot, longer outputs, infrequent).
+    case extraction
+    /// Wiki lint semantic review (merge proposals, stub drafts, contradictions).
+    case lint
+
+    var displayName: String {
+        switch self {
+        case .chat:       return "Chat"
+        case .extraction: return "Wiki Extraction"
+        case .lint:       return "Wiki Lint Review"
+        }
+    }
+
+    var iconSystemName: String {
+        switch self {
+        case .chat:       return "bubble.left.and.bubble.right"
+        case .extraction: return "wand.and.stars"
+        case .lint:       return "checkmark.seal"
+        }
+    }
+
+    var blurb: String {
+        switch self {
+        case .chat:
+            return "Where every-turn replies stream from. On-device is fast, private, and offline."
+        case .extraction:
+            return "Document → wiki page extraction. Quality matters more than speed; runs infrequently."
+        case .lint:
+            return "Merge proposals and stub drafts during AI Review. Same — quality over speed."
+        }
+    }
+
+    var defaultsKey: String { "provider_id_for_\(rawValue)" }
+}
+
 // MARK: - Provider Registry
 
 /// Tracks which providers have credentials stored and which is the default
@@ -122,8 +165,12 @@ enum ChatProviderID: String, CaseIterable, Codable, Hashable, Identifiable, Send
 @Observable
 final class ProviderRegistry {
 
-    /// The provider used for new conversations.
+    /// The default provider for new conversations and any task that hasn't
+    /// been overridden.
     private(set) var defaultProviderID: ChatProviderID
+
+    /// Per-task overrides. Empty means "use the default for that task too."
+    private(set) var taskOverrides: [ProviderTask: ChatProviderID] = [:]
 
     /// Set of providers that are currently usable (built-in is always in here;
     /// remote providers appear once a key is stored).
@@ -134,6 +181,12 @@ final class ProviderRegistry {
     init() {
         let raw = UserDefaults.standard.string(forKey: defaultsKey) ?? ChatProviderID.foundationModels.rawValue
         self.defaultProviderID = ChatProviderID(rawValue: raw) ?? .foundationModels
+        for task in ProviderTask.allCases {
+            if let storedRaw = UserDefaults.standard.string(forKey: task.defaultsKey),
+               let id = ChatProviderID(rawValue: storedRaw) {
+                taskOverrides[task] = id
+            }
+        }
         refreshConfigured()
     }
 
@@ -144,6 +197,11 @@ final class ProviderRegistry {
 
     func refreshConfigured() {
         configuredIDs = Set(ChatProviderID.allCases.filter { isConfigured($0) })
+        // Drop overrides that point at providers no longer configured.
+        for (task, id) in taskOverrides where !configuredIDs.contains(id) {
+            taskOverrides.removeValue(forKey: task)
+            UserDefaults.standard.removeObject(forKey: task.defaultsKey)
+        }
     }
 
     func setAPIKey(_ key: String, for id: ChatProviderID) throws {
@@ -167,6 +225,37 @@ final class ProviderRegistry {
         UserDefaults.standard.set(id.rawValue, forKey: defaultsKey)
     }
 
+    // MARK: - Per-task routing
+
+    /// Effective provider for a task — override if set, otherwise the
+    /// global default.
+    func providerID(for task: ProviderTask) -> ChatProviderID {
+        if let overridden = taskOverrides[task], isConfigured(overridden) {
+            return overridden
+        }
+        return defaultProviderID
+    }
+
+    /// Bind a specific provider to a task. Pass nil to clear the override
+    /// and fall back to the global default.
+    func setProvider(_ id: ChatProviderID?, for task: ProviderTask) {
+        if let id, isConfigured(id) {
+            taskOverrides[task] = id
+            UserDefaults.standard.set(id.rawValue, forKey: task.defaultsKey)
+        } else {
+            taskOverrides.removeValue(forKey: task)
+            UserDefaults.standard.removeObject(forKey: task.defaultsKey)
+        }
+    }
+
+    /// True when the user has explicitly set a provider for this task
+    /// (regardless of whether it matches the default).
+    func hasOverride(for task: ProviderTask) -> Bool {
+        taskOverrides[task] != nil
+    }
+
+    // MARK: - Resolution
+
     /// Build a `ChatProvider` for the given id if a key is stored.
     /// Returns nil for `foundationModels` (handled by the local
     /// LanguageModelSession path) or for providers without a key /
@@ -183,5 +272,11 @@ final class ProviderRegistry {
             // Implementations to follow.
             return nil
         }
+    }
+
+    /// Resolve the active provider for a task. Returns nil if the task
+    /// should run on-device (Foundation Models).
+    func resolve(for task: ProviderTask) -> ChatProvider? {
+        resolve(providerID(for: task))
     }
 }
