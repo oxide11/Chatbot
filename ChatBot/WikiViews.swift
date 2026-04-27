@@ -180,6 +180,7 @@ struct WikiPageListView: View {
     var body: some View {
         NavigationStack(path: $path) {
             pageContent
+                .scrollEdgeEffectStyle(.soft, for: .top)
                 .navigationTitle("Wiki Pages")
                 #if os(iOS)
                 .navigationBarTitleDisplayMode(.inline)
@@ -197,10 +198,14 @@ struct WikiPageListView: View {
                     }
                     ToolbarItem(placement: .automatic) {
                         if !wikiStore.pages.isEmpty {
-                            Button(role: .destructive) {
-                                showingDeleteAllConfirmation = true
+                            Menu {
+                                Button(role: .destructive) {
+                                    showingDeleteAllConfirmation = true
+                                } label: {
+                                    Label("Clear All Pages", systemImage: "trash")
+                                }
                             } label: {
-                                Label("Clear All", systemImage: "trash")
+                                Label("More", systemImage: "ellipsis.circle")
                             }
                         }
                     }
@@ -224,6 +229,7 @@ struct WikiPageListView: View {
                     WikiPageEditorView(wikiStore: wikiStore)
                 }
         }
+        .presentationDragIndicator(.visible)
         #if os(macOS)
         .frame(minWidth: 460, idealWidth: 520, minHeight: 400, idealHeight: 560)
         #endif
@@ -240,8 +246,9 @@ struct WikiPageListView: View {
                 Button {
                     showingAddPage = true
                 } label: {
-                    Text("Add Wiki Page")
+                    Label("Add Wiki Page", systemImage: "plus")
                 }
+                .buttonStyle(.glassProminent)
             }
         } else {
             List {

@@ -427,14 +427,15 @@ struct ChatDetailView: View {
                         showScrollToBottom = false
                         scrollToBottom(proxy: proxy)
                     } label: {
-                        Image(systemName: "arrow.down.circle.fill")
-                            .font(.title2)
-                            .foregroundStyle(.secondary)
-                            .background(.ultraThickMaterial, in: .circle)
+                        Image(systemName: "arrow.down")
+                            .font(.title3.weight(.semibold))
+                            .foregroundStyle(.primary)
+                            .frame(width: 36, height: 36)
                     }
-                    .buttonStyle(.plain)
+                    .glassEffect(.regular.interactive(), in: .circle)
                     .padding(.bottom, 8)
                     .transition(.opacity.combined(with: .scale))
+                    .accessibilityLabel("Scroll to bottom")
                 }
             }
             .onScrollGeometryChange(for: Bool.self) { geo in
@@ -445,6 +446,7 @@ struct ChatDetailView: View {
                     showScrollToBottom = isScrolledUp
                 }
             }
+            .scrollEdgeEffectStyle(.soft, for: [.top, .bottom])
         }
     }
 

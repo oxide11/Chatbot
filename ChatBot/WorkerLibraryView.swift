@@ -31,6 +31,7 @@ struct WorkerLibraryView: View {
     var body: some View {
         NavigationStack {
             workerContent
+                .scrollEdgeEffectStyle(.soft, for: .top)
                 .navigationTitle("Workers")
                 #if os(iOS)
                 .navigationBarTitleDisplayMode(.inline)
@@ -43,9 +44,8 @@ struct WorkerLibraryView: View {
                         Button {
                             showingAddWorker = true
                         } label: {
-                            Image(systemName: "plus")
+                            Label("Add Worker", systemImage: "plus")
                         }
-                        .help("Add Worker")
                     }
                     ToolbarItem(placement: .automatic) {
                         Menu {
@@ -63,9 +63,8 @@ struct WorkerLibraryView: View {
                                 }
                             }
                         } label: {
-                            Image(systemName: "ellipsis.circle")
+                            Label("More Options", systemImage: "ellipsis.circle")
                         }
-                        .help("More Options")
                     }
                 }
                 .alert("Delete All Workers?", isPresented: $showingDeleteAllConfirmation) {
@@ -95,6 +94,7 @@ struct WorkerLibraryView: View {
                     WorkerEditorView(existing: worker, orchestrator: orchestrator)
                 }
         }
+        .presentationDragIndicator(.visible)
         #if os(macOS)
         .frame(minWidth: 460, idealWidth: 520, minHeight: 400, idealHeight: 560)
         #endif
@@ -108,14 +108,20 @@ struct WorkerLibraryView: View {
             } description: {
                 Text("Workers are specialized AI personas that the assistant can delegate tasks to.")
             } actions: {
-                VStack(spacing: 8) {
-                    Button("Restore Built-In Workers") {
+                VStack(spacing: 10) {
+                    Button {
                         BuiltInWorkers.addMissingPresets(in: modelContext)
                         orchestrator.refreshTools()
+                    } label: {
+                        Label("Restore Built-In Workers", systemImage: "arrow.counterclockwise")
                     }
-                    Button("Create Custom Worker") {
+                    .buttonStyle(.glassProminent)
+                    Button {
                         showingAddWorker = true
+                    } label: {
+                        Label("Create Custom Worker", systemImage: "plus")
                     }
+                    .buttonStyle(.glass)
                 }
             }
         } else {
