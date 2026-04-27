@@ -149,42 +149,39 @@ struct AnthropicProvider: ChatProvider {
 
     // MARK: - SSE
 
+    /// Parse the SSE stream by routing on the JSON `type` field inside each
+    /// `data:` payload. We deliberately ignore `event:` markers — every
+    /// data envelope from Anthropic carries its own `type`, and trusting
+    /// the JSON means weird buffering / missing event lines can't silently
+    /// produce empty replies.
     private func consumeSSE(
         bytes: URLSession.AsyncBytes,
         continuation: AsyncThrowingStream<String, Error>.Continuation
     ) async throws {
-        var currentEvent: String?
         let decoder = JSONDecoder()
+        var sawAnyDelta = false
 
         for try await line in bytes.lines {
             try Task.checkCancellation()
-            if line.isEmpty {
-                currentEvent = nil
-                continue
-            }
-            if line.hasPrefix("event:") {
-                currentEvent = line
-                    .dropFirst("event:".count)
-                    .trimmingCharacters(in: .whitespaces)
-                continue
-            }
             guard line.hasPrefix("data:") else { continue }
             let payload = line
                 .dropFirst("data:".count)
                 .trimmingCharacters(in: .whitespaces)
+            guard let data = payload.data(using: .utf8) else { continue }
 
-            switch currentEvent {
+            // Peek at type without committing to a full schema.
+            let type = (try? decoder.decode(AnthropicEnvelopeType.self, from: data).type) ?? ""
+            switch type {
             case "content_block_delta":
-                if let data = payload.data(using: .utf8),
-                   let event = try? decoder.decode(AnthropicDeltaEvent.self, from: data),
+                if let event = try? decoder.decode(AnthropicDeltaEvent.self, from: data),
                    let text = event.delta.text {
+                    sawAnyDelta = true
                     continuation.yield(text)
                 }
             case "message_stop":
                 return
             case "error":
-                if let data = payload.data(using: .utf8),
-                   let env = try? decoder.decode(AnthropicErrorEnvelope.self, from: data) {
+                if let env = try? decoder.decode(AnthropicErrorEnvelope.self, from: data) {
                     throw ChatProviderError.invalidResponse(
                         status: 0,
                         message: env.error.message
@@ -194,6 +191,16 @@ struct AnthropicProvider: ChatProvider {
             default:
                 continue
             }
+        }
+
+        // 200 OK but no text — usually a streaming-mode issue. Surface it
+        // instead of returning empty content so the chat doesn't appear
+        // to hang or quietly fail.
+        if !sawAnyDelta {
+            throw ChatProviderError.invalidResponse(
+                status: 200,
+                message: "Stream ended without any text content."
+            )
         }
     }
 }
@@ -212,6 +219,10 @@ private struct AnthropicRequestBody: Encodable {
 private struct AnthropicAPIMessage: Encodable {
     let role: String
     let content: String
+}
+
+private struct AnthropicEnvelopeType: Decodable {
+    let type: String
 }
 
 private struct AnthropicDeltaEvent: Decodable {
