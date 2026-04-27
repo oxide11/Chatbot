@@ -168,6 +168,7 @@ struct ContentView: View {
         #if os(iOS) || os(tvOS) || os(visionOS)
         .searchToolbarBehavior(.minimize)
         #endif
+        .scrollEdgeEffectStyle(.soft, for: .top)
         .navigationTitle("Chats")
         .toolbar {
             #if os(macOS)
@@ -260,6 +261,14 @@ struct ContentView: View {
                 Label("No Chat Selected", systemImage: "bubble.left.and.bubble.right")
             } description: {
                 Text("Select a conversation or create a new one.")
+            } actions: {
+                Button {
+                    _ = store.createConversation()
+                } label: {
+                    Label("New Chat", systemImage: "plus")
+                }
+                .buttonStyle(.glassProminent)
+                .keyboardShortcut("n", modifiers: .command)
             }
         }
     }

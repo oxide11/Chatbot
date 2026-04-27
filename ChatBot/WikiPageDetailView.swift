@@ -38,6 +38,7 @@ struct WikiPageDetailView: View {
             .padding(.vertical, 18)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .scrollEdgeEffectStyle(.soft, for: .top)
         .navigationTitle(page.title)
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)

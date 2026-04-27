@@ -89,6 +89,7 @@ struct DomainSettingsContent: View {
                 }
             }
         }
+        .scrollEdgeEffectStyle(.soft, for: .top)
         .navigationTitle("Knowledge Domains")
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
@@ -341,6 +342,7 @@ struct DomainDetailContent: View {
                 }
             }
         }
+        .scrollEdgeEffectStyle(.soft, for: .top)
         .navigationTitle(domain.name)
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)

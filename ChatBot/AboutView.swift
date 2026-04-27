@@ -17,20 +17,23 @@ struct AboutView: View {
     var body: some View {
         List {
             Section {
-                VStack(spacing: 12) {
+                VStack(spacing: 14) {
                     Image(systemName: "brain.head.profile")
-                        .font(.system(size: 56))
+                        .font(.system(size: 44, weight: .regular))
                         .foregroundStyle(.tint)
+                        .padding(20)
+                        .glassEffect(.regular.tint(.accentColor.opacity(0.25)), in: .circle)
 
                     Text(AppInfo.name)
-                        .font(.title.bold())
+                        .font(.title.weight(.semibold))
 
                     Text("v\(AppInfo.version) (\(AppInfo.build))")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        .monospacedDigit()
                 }
                 .frame(maxWidth: .infinity)
-                .padding(.vertical, 12)
+                .padding(.vertical, 16)
                 .listRowBackground(Color.clear)
             }
 
@@ -119,6 +122,7 @@ struct AboutView: View {
                 Text("No data ever leaves your device. \(AppInfo.name) requires Apple Intelligence to be enabled.")
             }
         }
+        .scrollEdgeEffectStyle(.soft, for: .top)
         .navigationTitle("About")
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)

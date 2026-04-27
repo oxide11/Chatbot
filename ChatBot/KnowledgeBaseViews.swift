@@ -26,6 +26,7 @@ struct KnowledgeBaseListView: View {
     var body: some View {
         NavigationStack {
             kbContent
+                .scrollEdgeEffectStyle(.soft, for: .top)
                 .navigationTitle("Knowledge Bases")
                 #if os(iOS)
                 .navigationBarTitleDisplayMode(.inline)
@@ -47,18 +48,20 @@ struct KnowledgeBaseListView: View {
                                 Label("Paste Text", systemImage: "doc.text")
                             }
                         } label: {
-                            Image(systemName: "plus")
+                            Label("Add Knowledge Base", systemImage: "plus")
                         }
-                        .help("Add Knowledge Base")
                     }
                     ToolbarItem(placement: .automatic) {
                         if !knowledgeBaseStore.knowledgeBases.isEmpty {
-                            Button(role: .destructive) {
-                                showingDeleteAllConfirmation = true
+                            Menu {
+                                Button(role: .destructive) {
+                                    showingDeleteAllConfirmation = true
+                                } label: {
+                                    Label("Delete All", systemImage: "trash")
+                                }
                             } label: {
-                                Image(systemName: "trash")
+                                Label("More", systemImage: "ellipsis.circle")
                             }
-                            .help("Delete All Knowledge Bases")
                         }
                     }
                 }
@@ -100,6 +103,7 @@ struct KnowledgeBaseListView: View {
                     TextInputSheet(knowledgeBaseStore: knowledgeBaseStore)
                 }
         }
+        .presentationDragIndicator(.visible)
         #if os(macOS)
         .frame(minWidth: 460, idealWidth: 520, minHeight: 400, idealHeight: 560)
         #endif
@@ -116,8 +120,9 @@ struct KnowledgeBaseListView: View {
                 Button {
                     showingImporter = true
                 } label: {
-                    Text("Import Documents")
+                    Label("Import Documents", systemImage: "doc.badge.plus")
                 }
+                .buttonStyle(.glassProminent)
             }
         } else {
             List {

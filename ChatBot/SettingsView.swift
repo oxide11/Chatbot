@@ -210,6 +210,7 @@ struct SettingsView: View {
                 }
             }
             .formStyle(.grouped)
+            .scrollEdgeEffectStyle(.soft, for: .top)
             .navigationTitle("Settings")
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
@@ -240,6 +241,7 @@ struct SettingsView: View {
                 WorkerLibraryView(orchestrator: store.orchestrator)
             }
         }
+        .presentationDragIndicator(.visible)
         #if os(macOS)
         .frame(minWidth: 480, idealWidth: 520, minHeight: 540, idealHeight: 600)
         #endif
