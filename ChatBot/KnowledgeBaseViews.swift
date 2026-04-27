@@ -16,6 +16,7 @@ import UIKit
 
 struct KnowledgeBaseListView: View {
     var knowledgeBaseStore: KnowledgeBaseStore
+    var wikiEngine: WikiEngine?
     @Environment(\.dismiss) private var dismiss
     @State private var showingImporter = false
     @State private var showingDeleteAllConfirmation = false
@@ -222,7 +223,7 @@ struct KnowledgeBaseListView: View {
                         Section {
                             ForEach(domainKBs) { kb in
                                 NavigationLink {
-                                    KnowledgeBaseDetailView(kb: kb, store: knowledgeBaseStore)
+                                    KnowledgeBaseDetailView(kb: kb, store: knowledgeBaseStore, wikiEngine: wikiEngine)
                                 } label: {
                                     HStack(spacing: 12) {
                                         Image(systemName: kb.documentType.icon)
@@ -363,6 +364,7 @@ struct TextInputSheet: View {
 struct KnowledgeBaseDetailView: View {
     let kb: KnowledgeBase
     var store: KnowledgeBaseStore
+    var wikiEngine: WikiEngine?
     @Environment(\.dismiss) private var dismiss
     @State private var showingDeleteConfirmation = false
     @State private var showingReimporter = false
@@ -370,6 +372,7 @@ struct KnowledgeBaseDetailView: View {
     @State private var renameDraft = ""
     @State private var exportURL: URL?
     @State private var showingExportShare = false
+    @State private var showingWikiExtraction = false
 
     var body: some View {
         List {
@@ -475,6 +478,16 @@ struct KnowledgeBaseDetailView: View {
         .navigationBarTitleDisplayMode(.inline)
         #endif
         .toolbar {
+            if wikiEngine != nil {
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        showingWikiExtraction = true
+                    } label: {
+                        Label("Extract to Wiki", systemImage: "wand.and.stars")
+                    }
+                    .disabled(kb.chunkCount == 0)
+                }
+            }
             ToolbarItem(placement: .primaryAction) {
                 Menu {
                     Button {
@@ -507,8 +520,19 @@ struct KnowledgeBaseDetailView: View {
                         Label("Delete", systemImage: "trash")
                     }
                 } label: {
-                    Image(systemName: "ellipsis.circle")
+                    Label("More", systemImage: "ellipsis.circle")
                 }
+            }
+        }
+        .sheet(isPresented: $showingWikiExtraction) {
+            if let wikiEngine {
+                WikiExtractionProgressView(
+                    sourceName: kb.name,
+                    document: kb,
+                    domainID: kb.domainID,
+                    wikiEngine: wikiEngine,
+                    knowledgeBaseStore: store
+                )
             }
         }
         .alert("Rename Knowledge Base", isPresented: $showingRenameAlert) {

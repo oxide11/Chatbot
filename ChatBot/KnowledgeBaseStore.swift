@@ -181,6 +181,11 @@ final class KnowledgeBaseStore {
 
     /// Batch ingestion queue
     private(set) var ingestionQueue: [IngestionJob] = []
+
+    /// Optional callback fired on the main actor after a document finishes
+    /// ingesting successfully. The owning store (typically ConversationStore)
+    /// uses this to optionally route the new document into wiki extraction.
+    var onIngestionCompleted: (@MainActor (KnowledgeBase) -> Void)?
     private var isQueueRunning = false
 
     private var chunkCache: [UUID: [DocumentChunk]] = [:]
@@ -485,6 +490,9 @@ final class KnowledgeBaseStore {
                 Task { [weak self] in
                     await self?.regenerateDomainSummary(for: job.domainID)
                 }
+
+                // Notify owner so it can optionally trigger wiki extraction.
+                onIngestionCompleted?(result.kb)
             case .failure(let reason):
                 ingestionQueue[idx].status = .failed(reason)
             }

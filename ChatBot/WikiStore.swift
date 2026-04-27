@@ -61,7 +61,8 @@ final class WikiStore {
         body: String,
         tags: [String],
         domainID: UUID?,
-        sourceConversationID: UUID?
+        sourceConversationID: UUID? = nil,
+        sourceDocumentID: UUID? = nil
     ) async -> WikiPage? {
         let page = WikiPage(
             id: UUID(),
@@ -71,6 +72,7 @@ final class WikiStore {
             createdAt: Date(),
             updatedAt: Date(),
             sourceConversationIDs: sourceConversationID.map { [$0] } ?? [],
+            sourceDocumentIDs: sourceDocumentID.map { [$0] } ?? [],
             linkedPageIDs: [],
             domainID: domainID,
             accessCount: 0,
@@ -95,7 +97,8 @@ final class WikiStore {
         body: String,
         tags: [String],
         linkedPageIDs: [UUID] = [],
-        sourceConversationID: UUID? = nil
+        sourceConversationID: UUID? = nil,
+        sourceDocumentID: UUID? = nil
     ) async {
         guard let actor else { return }
         do {
@@ -104,7 +107,8 @@ final class WikiStore {
                 body: body,
                 tags: tags,
                 linkedPageIDs: linkedPageIDs,
-                sourceConversationID: sourceConversationID
+                sourceConversationID: sourceConversationID,
+                sourceDocumentID: sourceDocumentID
             )
             await loadAll()
         } catch {

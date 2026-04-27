@@ -61,6 +61,56 @@ enum WikiExtractionPrompts {
         return prompt
     }
 
+    /// Build a document-mode extraction prompt. Tuned for monologue text
+    /// (papers, chapters, manuals, ePub sections) rather than dialogue.
+    /// Includes inline few-shot examples since the on-device 3B model
+    /// produces meaningfully better results when shown the desired shape.
+    static func documentExtractionPrompt(
+        text: String,
+        sourceName: String,
+        existingPageTitles: [String]
+    ) -> String {
+        var prompt = """
+        Read the document excerpt below and extract reusable knowledge into wiki pages.
+        Each page covers ONE concept, entity, definition, claim, procedure, or parameter.
+
+        Format your response using exactly this structure for each page:
+        ---PAGE---
+        TITLE: <concise page title>
+        TAGS: <comma-separated tags, lowercase>
+        BODY:
+        <2-6 bullet points or short paragraphs; under 100 words>
+        ---END---
+
+        Rules:
+        - Extract concrete, reusable facts: definitions, formulae, parameters, named entities, procedures, design rationale.
+        - Preserve exact terminology, numbers, and identifiers from the source.
+        - One topic per page. If the same concept appears later, return the same TITLE so it merges.
+        - Use [[Page Title]] to cross-reference other pages you create.
+        - Skip filler, transitions, and decorative prose.
+        - If nothing in this excerpt is worth keeping, respond with exactly: NONE
+
+        Example:
+        ---PAGE---
+        TITLE: Adam Optimizer
+        TAGS: optimizer, deep-learning, adaptive
+        BODY:
+        - Combines momentum and RMSProp; tracks first and second moment estimates of the gradient.
+        - Default hyperparameters: learning rate 1e-3, β₁=0.9, β₂=0.999, ε=1e-8.
+        - Uses bias-corrected estimates so early steps aren't biased toward zero.
+        - See [[RMSProp]], [[Momentum]] for component algorithms.
+        ---END---
+        """
+
+        if !existingPageTitles.isEmpty {
+            let titles = existingPageTitles.prefix(40).joined(separator: ", ")
+            prompt += "\n\nExisting wiki pages (reuse these titles when relevant): \(titles)"
+        }
+
+        prompt += "\n\nSource: \(sourceName)\n\nDocument excerpt:\n\(text)"
+        return prompt
+    }
+
     // MARK: - Parsing
 
     struct ExtractionResult {

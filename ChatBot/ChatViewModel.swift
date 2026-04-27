@@ -596,8 +596,24 @@ struct RAGSettings: Codable, Sendable {
     var maxDocumentChunks: Int = 3
     var contextBudgetCharacters: Int = 1500
     var autoExtractKnowledge: Bool = true
+    /// When true, every newly imported document is automatically run through
+    /// wiki extraction in addition to being chunked for RAG retrieval.
+    var autoExtractWikiFromDocuments: Bool = false
 
     static let `default` = RAGSettings()
+
+    /// Backward-compatible decoding for the wiki-from-documents toggle.
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        wikiRetrievalEnabled = try c.decodeIfPresent(Bool.self, forKey: .wikiRetrievalEnabled) ?? true
+        knowledgeBaseRetrievalEnabled = try c.decodeIfPresent(Bool.self, forKey: .knowledgeBaseRetrievalEnabled) ?? true
+        maxDocumentChunks = try c.decodeIfPresent(Int.self, forKey: .maxDocumentChunks) ?? 3
+        contextBudgetCharacters = try c.decodeIfPresent(Int.self, forKey: .contextBudgetCharacters) ?? 1500
+        autoExtractKnowledge = try c.decodeIfPresent(Bool.self, forKey: .autoExtractKnowledge) ?? true
+        autoExtractWikiFromDocuments = try c.decodeIfPresent(Bool.self, forKey: .autoExtractWikiFromDocuments) ?? false
+    }
 }
 
 @Observable
@@ -648,6 +664,30 @@ final class ConversationStore {
     /// Provide the SwiftData ModelContainer to the knowledge base store. Call from the view layer.
     func configureKnowledgeBaseStore(with modelContext: ModelContext) {
         knowledgeBaseStore.configure(with: modelContext.container)
+        knowledgeBaseStore.onIngestionCompleted = { [weak self] kb in
+            self?.autoExtractWikiIfEnabled(for: kb)
+        }
+    }
+
+    /// Auto-extract wiki pages from a freshly ingested document if the
+    /// "Auto-Extract from Documents" toggle is on. Runs detached.
+    private func autoExtractWikiIfEnabled(for kb: KnowledgeBase) {
+        guard ragSettings.autoExtractWikiFromDocuments else { return }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await BackgroundTask.run("Auto Wiki Extraction") {
+                let chunks = self.knowledgeBaseStore.allChunks(for: kb.id)
+                    .sorted { $0.index < $1.index }
+                let text = chunks.map(\.content).joined(separator: "\n\n")
+                guard !text.isEmpty else { return }
+                _ = await self.wikiEngine.extractKnowledgeFromDocument(
+                    text: text,
+                    sourceName: kb.name,
+                    sourceDocumentID: kb.id,
+                    domainID: kb.domainID
+                )
+            }
+        }
     }
 
     /// Provide the SwiftData ModelContainer to the wiki store. Call from the view layer.
