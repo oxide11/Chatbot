@@ -124,10 +124,18 @@ struct SettingsView: View {
                         }
                     ))
 
-                    Toggle("Auto-Extract Knowledge", isOn: Binding(
+                    Toggle("Auto-Extract from Conversations", isOn: Binding(
                         get: { store.ragSettings.autoExtractKnowledge },
                         set: { newValue in
                             store.ragSettings.autoExtractKnowledge = newValue
+                            store.applyRAGSettings()
+                        }
+                    ))
+
+                    Toggle("Auto-Extract from Documents", isOn: Binding(
+                        get: { store.ragSettings.autoExtractWikiFromDocuments },
+                        set: { newValue in
+                            store.ragSettings.autoExtractWikiFromDocuments = newValue
                             store.applyRAGSettings()
                         }
                     ))
@@ -146,7 +154,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Retrieval")
                 } footer: {
-                    Text("More results use more of the limited context window.")
+                    Text("Auto-Extract from Documents runs each newly imported PDF / ePub / text file through the LLM to populate wiki pages — long documents can take several minutes on-device.")
                 }
 
                 // MARK: System Prompt
@@ -256,7 +264,10 @@ struct SettingsView: View {
                 WikiPageListView(wikiStore: store.wikiStore, domains: store.knowledgeBaseStore.domains)
             }
             .sheet(isPresented: $showingKnowledgeBases) {
-                KnowledgeBaseListView(knowledgeBaseStore: store.knowledgeBaseStore)
+                KnowledgeBaseListView(
+                    knowledgeBaseStore: store.knowledgeBaseStore,
+                    wikiEngine: store.wikiEngine
+                )
             }
             .sheet(isPresented: $showingWorkers) {
                 WorkerLibraryView(orchestrator: store.orchestrator)

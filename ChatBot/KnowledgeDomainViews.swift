@@ -173,7 +173,7 @@ struct DomainDetailContent: View {
                 } else {
                     ForEach(domainKBs) { kb in
                         NavigationLink {
-                            KnowledgeBaseDetailView(kb: kb, store: store.knowledgeBaseStore)
+                            KnowledgeBaseDetailView(kb: kb, store: store.knowledgeBaseStore, wikiEngine: store.wikiEngine)
                         } label: {
                             HStack(spacing: 12) {
                                 Image(systemName: kb.documentType.icon)

@@ -63,7 +63,8 @@ actor WikiActor {
         body: String,
         tags: [String],
         linkedPageIDs: [UUID],
-        sourceConversationID: UUID?
+        sourceConversationID: UUID? = nil,
+        sourceDocumentID: UUID? = nil
     ) throws {
         let predicate = #Predicate<SDWikiPage> { $0.id == id }
         let descriptor = FetchDescriptor<SDWikiPage>(predicate: predicate)
@@ -79,6 +80,14 @@ actor WikiActor {
             if !ids.contains(convID) {
                 ids.append(convID)
                 sd.sourceConversationIDs = ids
+            }
+        }
+
+        if let docID = sourceDocumentID {
+            var ids = sd.sourceDocumentIDs
+            if !ids.contains(docID) {
+                ids.append(docID)
+                sd.sourceDocumentIDs = ids
             }
         }
 

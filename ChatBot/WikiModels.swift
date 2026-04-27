@@ -31,6 +31,9 @@ final class SDWikiPage {
     /// Which conversations contributed knowledge to this page.
     var sourceConversationIDsRaw: String
 
+    /// Which imported documents (KnowledgeBase entries) contributed knowledge to this page.
+    var sourceDocumentIDsRaw: String = "[]"
+
     /// IDs of other wiki pages this page references (simpler than self-referential relationships).
     var linkedPageIDsRaw: String
 
@@ -57,6 +60,11 @@ final class SDWikiPage {
         set { sourceConversationIDsRaw = encodeJSONArray(newValue) }
     }
 
+    var sourceDocumentIDs: [UUID] {
+        get { decodeJSONArray(sourceDocumentIDsRaw) }
+        set { sourceDocumentIDsRaw = encodeJSONArray(newValue) }
+    }
+
     var linkedPageIDs: [UUID] {
         get { decodeJSONArray(linkedPageIDsRaw) }
         set { linkedPageIDsRaw = encodeJSONArray(newValue) }
@@ -76,6 +84,7 @@ final class SDWikiPage {
         tags: [String] = [],
         domainID: UUID? = nil,
         sourceConversationIDs: [UUID] = [],
+        sourceDocumentIDs: [UUID] = [],
         linkedPageIDs: [UUID] = []
     ) {
         self.id = id
@@ -85,6 +94,7 @@ final class SDWikiPage {
         self.createdAt = Date()
         self.updatedAt = Date()
         self.sourceConversationIDsRaw = encodeJSONArray(sourceConversationIDs)
+        self.sourceDocumentIDsRaw = encodeJSONArray(sourceDocumentIDs)
         self.linkedPageIDsRaw = encodeJSONArray(linkedPageIDs)
         self.domainID = domainID
         self.accessCount = 0
@@ -101,6 +111,7 @@ final class SDWikiPage {
             tags: page.tags,
             domainID: page.domainID,
             sourceConversationIDs: page.sourceConversationIDs,
+            sourceDocumentIDs: page.sourceDocumentIDs,
             linkedPageIDs: page.linkedPageIDs
         )
         self.createdAt = page.createdAt
@@ -120,6 +131,7 @@ final class SDWikiPage {
             createdAt: createdAt,
             updatedAt: updatedAt,
             sourceConversationIDs: sourceConversationIDs,
+            sourceDocumentIDs: sourceDocumentIDs,
             linkedPageIDs: linkedPageIDs,
             domainID: domainID,
             accessCount: accessCount,
@@ -139,6 +151,7 @@ struct WikiPage: Identifiable, Codable, Hashable, Sendable {
     let createdAt: Date
     var updatedAt: Date
     var sourceConversationIDs: [UUID]
+    var sourceDocumentIDs: [UUID] = []
     var linkedPageIDs: [UUID]
     var domainID: UUID?
     var accessCount: Int
