@@ -2,12 +2,13 @@
 //  ChatBotTests.swift
 //  ChatBotTests
 //
-//  Unit tests for Knowledge Domains, Memory Store, Knowledge Base models,
+//  Unit tests for Knowledge Domains, Wiki Store, Knowledge Base models,
 //  SharedDataManager utilities, and EmbeddingService math.
 //
 
 import Testing
 import Foundation
+import SwiftData
 @testable import ChatBot
 
 // MARK: - Knowledge Domain Model Tests
@@ -374,278 +375,287 @@ struct EmbeddingServiceMathTests {
     }
 }
 
-// MARK: - MemoryEntry Model Tests
+// MARK: - WikiPage Model Tests
 
-@Suite("MemoryEntry Model")
-struct MemoryEntryModelTests {
+@Suite("WikiPage Model")
+struct WikiPageModelTests {
 
-    @Test("Keywords are lowercased on init")
-    func keywordsLowercased() {
-        let entry = MemoryEntry(
+    @Test("Tags are preserved through init")
+    func tagsPreserved() {
+        let page = WikiPage(
             id: UUID(),
-            content: "Test",
-            keywords: ["Swift", "CODING"],
-            sourceConversationTitle: "Test",
-            createdAt: Date()
+            title: "Test",
+            body: "Body",
+            tags: ["swift", "concurrency"],
+            createdAt: Date(),
+            updatedAt: Date(),
+            sourceConversationIDs: [],
+            linkedPageIDs: [],
+            domainID: nil,
+            accessCount: 0,
+            lastAccessedAt: Date(),
+            embedding: nil
         )
-        #expect(entry.keywords == ["swift", "coding"])
+        #expect(page.tags == ["swift", "concurrency"])
     }
 
     @Test("domainID defaults to nil")
     func domainIDDefaultsNil() {
-        let entry = MemoryEntry(
+        let page = WikiPage(
             id: UUID(),
-            content: "Test",
-            keywords: [],
-            sourceConversationTitle: "Test"
+            title: "Test",
+            body: "Body",
+            tags: [],
+            createdAt: Date(),
+            updatedAt: Date(),
+            sourceConversationIDs: [],
+            linkedPageIDs: [],
+            domainID: nil,
+            accessCount: 0,
+            lastAccessedAt: Date(),
+            embedding: nil
         )
-        #expect(entry.domainID == nil)
+        #expect(page.domainID == nil)
     }
 
     @Test("domainID can be set explicitly")
     func domainIDExplicit() {
         let domainID = UUID()
-        let entry = MemoryEntry(
+        let page = WikiPage(
             id: UUID(),
-            content: "Test",
-            keywords: [],
-            sourceConversationTitle: "Test",
-            domainID: domainID
+            title: "Test",
+            body: "Body",
+            tags: [],
+            createdAt: Date(),
+            updatedAt: Date(),
+            sourceConversationIDs: [],
+            linkedPageIDs: [],
+            domainID: domainID,
+            accessCount: 0,
+            lastAccessedAt: Date(),
+            embedding: nil
         )
-        #expect(entry.domainID == domainID)
+        #expect(page.domainID == domainID)
     }
 
-    @Test("MemoryEntry round-trips through Codable preserving domainID")
+    @Test("WikiPage round-trips through Codable preserving all fields")
     func codableRoundTripWithDomainID() throws {
         let domainID = UUID()
-        let original = MemoryEntry(
+        let convID = UUID()
+        let linkedID = UUID()
+        let original = WikiPage(
             id: UUID(),
-            content: "Remember this",
-            keywords: ["test"],
-            sourceConversationTitle: "Chat",
+            title: "Swift Concurrency",
+            body: "Structured concurrency in Swift.",
+            tags: ["swift", "concurrency"],
             createdAt: Date(),
-            embedding: [1.0, 2.0, 3.0],
-            domainID: domainID
+            updatedAt: Date(),
+            sourceConversationIDs: [convID],
+            linkedPageIDs: [linkedID],
+            domainID: domainID,
+            accessCount: 5,
+            lastAccessedAt: Date(),
+            embedding: [1.0, 2.0, 3.0]
         )
         let data = try JSONEncoder().encode(original)
-        let decoded = try JSONDecoder().decode(MemoryEntry.self, from: data)
+        let decoded = try JSONDecoder().decode(WikiPage.self, from: data)
         #expect(decoded.id == original.id)
-        #expect(decoded.content == original.content)
+        #expect(decoded.title == original.title)
+        #expect(decoded.body == original.body)
+        #expect(decoded.tags == ["swift", "concurrency"])
         #expect(decoded.domainID == domainID)
+        #expect(decoded.sourceConversationIDs == [convID])
+        #expect(decoded.linkedPageIDs == [linkedID])
+        #expect(decoded.accessCount == 5)
         #expect(decoded.embedding == [1.0, 2.0, 3.0])
     }
 
-    @Test("Backward-compatible decoding without domainID")
+    @Test("Backward-compatible decoding without optional fields")
     func backwardCompatibleDecoding() throws {
         let json = """
         {
             "id": "22222222-2222-2222-2222-222222222222",
-            "content": "Old memory",
-            "keywords": ["old"],
-            "sourceConversationTitle": "Legacy",
-            "createdAt": 0
+            "title": "Old Page",
+            "body": "Legacy content",
+            "tags": ["old"],
+            "createdAt": 0,
+            "updatedAt": 0,
+            "sourceConversationIDs": [],
+            "linkedPageIDs": [],
+            "accessCount": 0,
+            "lastAccessedAt": 0
         }
         """
         let data = json.data(using: .utf8)!
-        let decoded = try JSONDecoder().decode(MemoryEntry.self, from: data)
-        #expect(decoded.content == "Old memory")
+        let decoded = try JSONDecoder().decode(WikiPage.self, from: data)
+        #expect(decoded.title == "Old Page")
         #expect(decoded.domainID == nil)
+        #expect(decoded.embedding == nil)
     }
 
-    @Test("MemoryEntry is Hashable")
-    func hashable() {
-        let entry = MemoryEntry(
-            id: UUID(),
-            content: "Test",
-            keywords: [],
-            sourceConversationTitle: "Test"
+    @Test("WikiPage conforms to Identifiable")
+    func identifiable() {
+        let id = UUID()
+        let page = WikiPage(
+            id: id,
+            title: "Test",
+            body: "Body",
+            tags: [],
+            createdAt: Date(),
+            updatedAt: Date(),
+            sourceConversationIDs: [],
+            linkedPageIDs: [],
+            domainID: nil,
+            accessCount: 0,
+            lastAccessedAt: Date(),
+            embedding: nil
         )
-        var set: Set<MemoryEntry> = []
-        set.insert(entry)
-        #expect(set.contains(entry))
+        #expect(page.id == id)
     }
 }
 
-// MARK: - MemoryStore Tests
+// MARK: - WikiStore Tests
 
-@Suite("MemoryStore")
-struct MemoryStoreTests {
+@Suite("WikiStore")
+struct WikiStoreTests {
 
-    /// Create a MemoryStore with preloaded test data (bypassing disk).
-    private func makeStore(memories: [MemoryEntry]) -> MemoryStore {
-        let store = MemoryStore()
-        store.deleteAllMemories()
-        for m in memories {
-            // Use the full init to avoid embedding service dependency
-            store.addMemory(m.content, keywords: m.keywords, source: m.sourceConversationTitle, domainID: m.domainID ?? KnowledgeDomain.generalID)
-        }
+    private func makeStore() throws -> WikiStore {
+        let config = ModelConfiguration(isStoredInMemoryOnly: true)
+        let container = try ModelContainer(for: SDWikiPage.self, configurations: config)
+        let store = WikiStore()
+        store.configure(with: container)
         return store
     }
 
-    @Test("addMemory inserts at front")
-    func addMemoryInsertsAtFront() {
-        let store = MemoryStore()
-        store.deleteAllMemories()
-        store.addMemory("First", keywords: ["a"], source: "Test")
-        store.addMemory("Second", keywords: ["b"], source: "Test")
-        #expect(store.memories.count == 2)
-        #expect(store.memories[0].content == "Second")
-        #expect(store.memories[1].content == "First")
-        store.deleteAllMemories()
-    }
+    @Test("createPage inserts and loads page")
+    @MainActor
+    func createPageInserts() async throws {
+        let store = try makeStore()
 
-    @Test("addMemory rejects duplicates")
-    func addMemoryRejectsDuplicates() {
-        let store = MemoryStore()
-        store.deleteAllMemories()
-        store.addMemory("Same content", keywords: ["a"], source: "Test")
-        store.addMemory("Same content", keywords: ["b"], source: "Test2")
-        #expect(store.memories.count == 1)
-        store.deleteAllMemories()
-    }
-
-    @Test("addMemory enforces max capacity")
-    func addMemoryEnforcesCapacity() {
-        let store = MemoryStore()
-        store.deleteAllMemories()
-        for i in 0..<105 {
-            store.addMemory("Memory \(i)", keywords: [], source: "Test")
-        }
-        #expect(store.memories.count == 100)
-        // Most recent should be first
-        #expect(store.memories[0].content == "Memory 104")
-        store.deleteAllMemories()
-    }
-
-    @Test("deleteMemory removes the correct entry")
-    func deleteMemory() {
-        let store = MemoryStore()
-        store.deleteAllMemories()
-        store.addMemory("Keep", keywords: [], source: "Test")
-        store.addMemory("Delete me", keywords: [], source: "Test")
-        let toDelete = store.memories.first { $0.content == "Delete me" }!
-        store.deleteMemory(toDelete)
-        #expect(store.memories.count == 1)
-        #expect(store.memories[0].content == "Keep")
-        store.deleteAllMemories()
-    }
-
-    @Test("deleteAllMemories clears everything")
-    func deleteAll() {
-        let store = MemoryStore()
-        store.addMemory("One", keywords: [], source: "Test")
-        store.addMemory("Two", keywords: [], source: "Test")
-        store.deleteAllMemories()
-        #expect(store.memories.isEmpty)
-    }
-
-    @Test("memories(for:) filters by domain")
-    func memoriesForDomain() {
-        let store = MemoryStore()
-        store.deleteAllMemories()
-        let medicalID = UUID()
-        store.addMemory("General fact", keywords: [], source: "Test", domainID: KnowledgeDomain.generalID)
-        store.addMemory("Medical fact", keywords: [], source: "Test", domainID: medicalID)
-        store.addMemory("Another general", keywords: [], source: "Test", domainID: KnowledgeDomain.generalID)
-
-        let generalMemories = store.memories(for: KnowledgeDomain.generalID)
-        let medicalMemories = store.memories(for: medicalID)
-
-        #expect(generalMemories.count == 2)
-        #expect(medicalMemories.count == 1)
-        #expect(medicalMemories[0].content == "Medical fact")
-        store.deleteAllMemories()
-    }
-
-    @Test("memories with nil domainID are treated as General")
-    func nilDomainTreatedAsGeneral() {
-        let store = MemoryStore()
-        store.deleteAllMemories()
-        // The addMemory method always passes a domainID, so we test the filter directly
-        let entry = MemoryEntry(
-            id: UUID(),
-            content: "Legacy entry",
-            keywords: [],
-            sourceConversationTitle: "Old",
-            domainID: nil
+        let page = await store.createPage(
+            title: "Test Page",
+            body: "Content here",
+            tags: ["test"],
+            domainID: nil,
+            sourceConversationID: nil
         )
-        // Verify the filter logic
-        let effectiveID = entry.domainID ?? KnowledgeDomain.generalID
-        #expect(effectiveID == KnowledgeDomain.generalID)
-        store.deleteAllMemories()
+        #expect(page != nil)
+        #expect(store.pages.count == 1)
+        #expect(store.pages[0].title == "Test Page")
     }
 
-    @Test("moveMemory changes domain")
-    func moveMemory() {
-        let store = MemoryStore()
-        store.deleteAllMemories()
-        let newDomainID = UUID()
-        store.addMemory("Movable", keywords: ["test"], source: "Test", domainID: KnowledgeDomain.generalID)
+    @Test("deletePage removes the correct page")
+    @MainActor
+    func deletePage() async throws {
+        let store = try makeStore()
 
-        let entry = store.memories[0]
-        #expect((entry.domainID ?? KnowledgeDomain.generalID) == KnowledgeDomain.generalID)
+        await store.createPage(title: "Keep", body: "A", tags: [], domainID: nil, sourceConversationID: nil)
+        let toDelete = await store.createPage(title: "Delete Me", body: "B", tags: [], domainID: nil, sourceConversationID: nil)
+        #expect(store.pages.count == 2)
 
-        store.moveMemory(entry, toDomain: newDomainID)
-
-        #expect(store.memories[0].domainID == newDomainID)
-        #expect(store.memories(for: KnowledgeDomain.generalID).isEmpty)
-        #expect(store.memories(for: newDomainID).count == 1)
-        store.deleteAllMemories()
+        await store.deletePage(id: toDelete!.id)
+        #expect(store.pages.count == 1)
+        #expect(store.pages[0].title == "Keep")
     }
 
-    @Test("moveMemory preserves content and embedding")
-    func moveMemoryPreservesData() {
-        let store = MemoryStore()
-        store.deleteAllMemories()
-        store.addMemory("Test content", keywords: ["key"], source: "Src", domainID: KnowledgeDomain.generalID)
+    @Test("deleteAllPages clears everything")
+    @MainActor
+    func deleteAll() async throws {
+        let store = try makeStore()
 
-        let entry = store.memories[0]
-        let originalContent = entry.content
-        let originalKeywords = entry.keywords
-        let originalEmbedding = entry.embedding
+        await store.createPage(title: "One", body: "A", tags: [], domainID: nil, sourceConversationID: nil)
+        await store.createPage(title: "Two", body: "B", tags: [], domainID: nil, sourceConversationID: nil)
+        #expect(store.pages.count == 2)
 
-        let newDomain = UUID()
-        store.moveMemory(entry, toDomain: newDomain)
-
-        let moved = store.memories[0]
-        #expect(moved.content == originalContent)
-        #expect(moved.keywords == originalKeywords)
-        #expect(moved.embedding == originalEmbedding)
-        #expect(moved.domainID == newDomain)
-        store.deleteAllMemories()
+        await store.deleteAllPages()
+        #expect(store.pages.isEmpty)
     }
 
-    @Test("updateMemory preserves domainID")
-    func updateMemoryPreservesDomain() {
-        let store = MemoryStore()
-        store.deleteAllMemories()
+    @Test("pages(forDomain:) filters by domain")
+    @MainActor
+    func pagesForDomain() async throws {
+        let store = try makeStore()
+        let medicalID = UUID()
+
+        await store.createPage(title: "General Fact", body: "A", tags: [], domainID: KnowledgeDomain.generalID, sourceConversationID: nil)
+        await store.createPage(title: "Medical Fact", body: "B", tags: [], domainID: medicalID, sourceConversationID: nil)
+        await store.createPage(title: "Another General", body: "C", tags: [], domainID: KnowledgeDomain.generalID, sourceConversationID: nil)
+
+        let generalPages = store.pages(forDomain: KnowledgeDomain.generalID)
+        let medicalPages = store.pages(forDomain: medicalID)
+
+        #expect(generalPages.count == 2)
+        #expect(medicalPages.count == 1)
+        #expect(medicalPages[0].title == "Medical Fact")
+    }
+
+    @Test("pages with nil domainID are treated as General")
+    @MainActor
+    func nilDomainTreatedAsGeneral() async throws {
+        let store = try makeStore()
+
+        await store.createPage(title: "No Domain", body: "A", tags: [], domainID: nil, sourceConversationID: nil)
+
+        let generalPages = store.pages(forDomain: KnowledgeDomain.generalID)
+        #expect(generalPages.count == 1)
+        #expect(generalPages[0].title == "No Domain")
+    }
+
+    @Test("findPageByTitle finds exact match case-insensitively")
+    @MainActor
+    func findByTitle() async throws {
+        let store = try makeStore()
+
+        await store.createPage(title: "Swift Concurrency", body: "Content", tags: [], domainID: nil, sourceConversationID: nil)
+
+        #expect(store.findPageByTitle("Swift Concurrency") != nil)
+        #expect(store.findPageByTitle("swift concurrency") != nil)
+        #expect(store.findPageByTitle("Nonexistent") == nil)
+    }
+
+    @Test("findPages(withTag:) filters by tag")
+    @MainActor
+    func findByTag() async throws {
+        let store = try makeStore()
+
+        await store.createPage(title: "Page A", body: "A", tags: ["swift", "ios"], domainID: nil, sourceConversationID: nil)
+        await store.createPage(title: "Page B", body: "B", tags: ["python"], domainID: nil, sourceConversationID: nil)
+
+        let swiftPages = store.findPages(withTag: "swift")
+        #expect(swiftPages.count == 1)
+        #expect(swiftPages[0].title == "Page A")
+
+        let pythonPages = store.findPages(withTag: "python")
+        #expect(pythonPages.count == 1)
+        #expect(pythonPages[0].title == "Page B")
+    }
+
+    @Test("updatePage changes body and tags")
+    @MainActor
+    func updatePage() async throws {
+        let store = try makeStore()
+
+        let page = await store.createPage(title: "Original", body: "Old body", tags: ["old"], domainID: nil, sourceConversationID: nil)
+        await store.updatePage(id: page!.id, body: "New body", tags: ["new"])
+
+        let updated = store.pages.first { $0.id == page!.id }
+        #expect(updated?.body == "New body")
+        #expect(updated?.tags == ["new"])
+    }
+
+    @Test("updatePage preserves domainID")
+    @MainActor
+    func updatePreservesDomain() async throws {
+        let store = try makeStore()
         let domainID = UUID()
-        store.addMemory("Original", keywords: ["old"], source: "Test", domainID: domainID)
 
-        let entry = store.memories[0]
-        store.updateMemory(entry, content: "Updated", keywords: ["new"])
+        let page = await store.createPage(title: "Test", body: "Old", tags: ["old"], domainID: domainID, sourceConversationID: nil)
+        await store.updatePage(id: page!.id, body: "Updated", tags: ["new"])
 
-        let updated = store.memories[0]
-        #expect(updated.content == "Updated")
-        #expect(updated.keywords == ["new"])
-        #expect(updated.domainID == domainID)
-        store.deleteAllMemories()
-    }
-
-    @Test("updateMemory with same content preserves embedding")
-    func updateMemorySameContentPreservesEmbedding() {
-        let store = MemoryStore()
-        store.deleteAllMemories()
-        store.addMemory("Content", keywords: ["a"], source: "Test")
-
-        let entry = store.memories[0]
-        let originalEmbedding = entry.embedding
-
-        store.updateMemory(entry, content: "Content", keywords: ["b"])
-
-        let updated = store.memories[0]
-        #expect(updated.embedding == originalEmbedding)
-        store.deleteAllMemories()
+        let updated = store.pages.first { $0.id == page!.id }
+        #expect(updated?.body == "Updated")
+        #expect(updated?.tags == ["new"])
+        #expect(updated?.domainID == domainID)
     }
 }
 

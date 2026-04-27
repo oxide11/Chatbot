@@ -24,6 +24,9 @@ nonisolated enum AppLogger {
     /// Chat view model (conversation, context, RAG).
     nonisolated static let chat = Logger(subsystem: "com.polygoncyber.Engram", category: "Chat")
 
+    /// Wiki engine operations (extraction, injection, page management).
+    nonisolated static let wiki = Logger(subsystem: "com.polygoncyber.Engram", category: "Wiki")
+
     /// General app lifecycle events.
     nonisolated static let app = Logger(subsystem: "com.polygoncyber.Engram", category: "App")
 }

@@ -11,7 +11,7 @@ struct SettingsView: View {
     var store: ConversationStore
     @Environment(\.dismiss) private var dismiss
     @State private var showingDeleteAllConfirmation = false
-    @State private var showingMemories = false
+    @State private var showingWikiPages = false
     @State private var showingKnowledgeBases = false
     @State private var showingWorkers = false
     @State private var defaultPromptDraft = ""
@@ -33,12 +33,12 @@ struct SettingsView: View {
                     }
 
                     Button {
-                        showingMemories = true
+                        showingWikiPages = true
                     } label: {
                         HStack {
-                            Label("Memories", systemImage: "brain")
+                            Label("Wiki Pages", systemImage: "book.pages")
                             Spacer()
-                            Text("\(store.memoryStore.memories.count)")
+                            Text("\(store.wikiPageCount)")
                                 .foregroundStyle(.secondary)
                             Image(systemName: "chevron.right")
                                 .font(.caption.weight(.semibold))
@@ -82,15 +82,15 @@ struct SettingsView: View {
                 } header: {
                     Text("Intelligence")
                 } footer: {
-                    Text("Memories are extracted from conversations. Knowledge bases are imported documents. Workers are specialized AI personas for task delegation.")
+                    Text("Wiki pages are extracted from conversations. Knowledge bases are imported documents. Workers are specialized AI personas for task delegation.")
                 }
 
                 // MARK: Retrieval
                 Section {
-                    Toggle("Memory Retrieval", isOn: Binding(
-                        get: { store.ragSettings.memoryRetrievalEnabled },
+                    Toggle("Wiki Retrieval", isOn: Binding(
+                        get: { store.ragSettings.wikiRetrievalEnabled },
                         set: { newValue in
-                            store.ragSettings.memoryRetrievalEnabled = newValue
+                            store.ragSettings.wikiRetrievalEnabled = newValue
                             store.applyRAGSettings()
                         }
                     ))
@@ -103,25 +103,13 @@ struct SettingsView: View {
                         }
                     ))
 
-                    Toggle("Auto-Extract Memories", isOn: Binding(
-                        get: { store.ragSettings.autoExtractMemories },
+                    Toggle("Auto-Extract Knowledge", isOn: Binding(
+                        get: { store.ragSettings.autoExtractKnowledge },
                         set: { newValue in
-                            store.ragSettings.autoExtractMemories = newValue
+                            store.ragSettings.autoExtractKnowledge = newValue
                             store.applyRAGSettings()
                         }
                     ))
-
-                    Stepper(
-                        "Memory results: \(store.ragSettings.maxMemoryResults)",
-                        value: Binding(
-                            get: { store.ragSettings.maxMemoryResults },
-                            set: { newValue in
-                                store.ragSettings.maxMemoryResults = newValue
-                                store.applyRAGSettings()
-                            }
-                        ),
-                        in: 1...10
-                    )
 
                     Stepper(
                         "Document chunks: \(store.ragSettings.maxDocumentChunks)",
@@ -134,137 +122,10 @@ struct SettingsView: View {
                         ),
                         in: 1...5
                     )
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack {
-                            Text("Keyword Boost")
-                            Spacer()
-                            Text(String(format: "%.0f%%", store.ragSettings.lexicalWeight * 100))
-                                .foregroundStyle(.secondary)
-                                .monospacedDigit()
-                        }
-                        Slider(
-                            value: Binding(
-                                get: { Float(store.ragSettings.lexicalWeight) },
-                                set: { newValue in
-                                    store.ragSettings.lexicalWeight = Float(newValue)
-                                    store.applyRAGSettings()
-                                }
-                            ),
-                            in: 0...0.5,
-                            step: 0.05
-                        )
-                        Text(store.ragSettings.lexicalWeight < 0.1 ? "Semantic only" : store.ragSettings.lexicalWeight > 0.4 ? "Strong keyword matching" : "Balanced hybrid")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack {
-                            Text("Memory Recency")
-                            Spacer()
-                            Text(String(format: "%.0f%%", store.ragSettings.recencyWeight * 100))
-                                .foregroundStyle(.secondary)
-                                .monospacedDigit()
-                        }
-                        Slider(
-                            value: Binding(
-                                get: { Float(store.ragSettings.recencyWeight) },
-                                set: { newValue in
-                                    store.ragSettings.recencyWeight = Float(newValue)
-                                    store.applyRAGSettings()
-                                }
-                            ),
-                            in: 0...0.4,
-                            step: 0.05
-                        )
-                        Text(store.ragSettings.recencyWeight < 0.05 ? "Age ignored" : store.ragSettings.recencyWeight > 0.3 ? "Strongly prefer recent" : "Balanced")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
                 } header: {
                     Text("Retrieval")
                 } footer: {
-                    Text("More results use more of the limited context window. Keyword Boost blends exact term matching with semantic search. Memory Recency favors recently stored memories over older ones (45-day half-life).")
-                }
-
-                // MARK: Generation
-                Section {
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack {
-                            Text("Temperature")
-                            Spacer()
-                            Text(String(format: "%.1f", store.ragSettings.temperature))
-                                .foregroundStyle(.secondary)
-                                .monospacedDigit()
-                        }
-                        Slider(
-                            value: Binding(
-                                get: { store.ragSettings.temperature },
-                                set: { newValue in
-                                    store.ragSettings.temperature = newValue
-                                    store.applyRAGSettings()
-                                }
-                            ),
-                            in: 0...2,
-                            step: 0.1
-                        )
-                        Text(store.ragSettings.temperature < 0.5 ? "Focused and precise" : store.ragSettings.temperature > 1.5 ? "Highly creative" : "Balanced")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-
-                    Picker("Sampling", selection: Binding(
-                        get: { store.ragSettings.samplingMode },
-                        set: { newValue in
-                            store.ragSettings.samplingMode = newValue
-                            store.applyRAGSettings()
-                        }
-                    )) {
-                        ForEach(SamplingModeSetting.allCases, id: \.self) { mode in
-                            Text(mode.label).tag(mode)
-                        }
-                    }
-
-                    if store.ragSettings.samplingMode == .topK {
-                        Stepper(
-                            "Top-K: \(store.ragSettings.topKValue)",
-                            value: Binding(
-                                get: { store.ragSettings.topKValue },
-                                set: { newValue in
-                                    store.ragSettings.topKValue = newValue
-                                    store.applyRAGSettings()
-                                }
-                            ),
-                            in: 1...100
-                        )
-                    }
-
-                    if store.ragSettings.samplingMode == .topP {
-                        VStack(alignment: .leading, spacing: 4) {
-                            HStack {
-                                Text("Top-P")
-                                Spacer()
-                                Text(String(format: "%.2f", store.ragSettings.topPValue))
-                                    .foregroundStyle(.secondary)
-                                    .monospacedDigit()
-                            }
-                            Slider(
-                                value: Binding(
-                                    get: { store.ragSettings.topPValue },
-                                    set: { newValue in
-                                        store.ragSettings.topPValue = newValue
-                                        store.applyRAGSettings()
-                                    }
-                                ),
-                                in: 0.1...1.0,
-                                step: 0.05
-                            )
-                        }
-                    }
-                } header: {
-                    Text("Generation")
-                } footer: {
-                    Text(store.ragSettings.samplingMode.description)
+                    Text("More results use more of the limited context window.")
                 }
 
                 // MARK: System Prompt
@@ -292,9 +153,9 @@ struct SettingsView: View {
                     }
 
                     HStack {
-                        Label("Memories", systemImage: "brain")
+                        Label("Wiki Pages", systemImage: "book.pages")
                         Spacer()
-                        Text("\(store.memoryStore.memories.count) \u{00B7} \(ByteCountFormatter.string(fromByteCount: Int64(store.memoryDataSize), countStyle: .file))")
+                        Text("\(store.wikiPageCount) pages")
                             .foregroundStyle(.secondary)
                     }
 
@@ -367,10 +228,10 @@ struct SettingsView: View {
                 }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text("This will permanently delete all conversations. Memories and knowledge bases will be kept.")
+                Text("This will permanently delete all conversations. Wiki pages and knowledge bases will be kept.")
             }
-            .sheet(isPresented: $showingMemories) {
-                MemoryListView(memoryStore: store.memoryStore, domains: store.knowledgeBaseStore.domains)
+            .sheet(isPresented: $showingWikiPages) {
+                WikiPageListView(wikiStore: store.wikiStore, domains: store.knowledgeBaseStore.domains)
             }
             .sheet(isPresented: $showingKnowledgeBases) {
                 KnowledgeBaseListView(knowledgeBaseStore: store.knowledgeBaseStore)

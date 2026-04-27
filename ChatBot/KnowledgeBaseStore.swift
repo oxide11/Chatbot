@@ -669,8 +669,8 @@ final class KnowledgeBaseStore {
                     chunks[i].summary = summary
                 }
             } catch {
-                // Non-fatal — chunk still works without a summary
-                AppLogger.kbStore.warning("Chunk summary generation failed for chunk \(chunks[i].index): \(error.localizedDescription)")
+                let chunkIndex = chunks[i].index
+                AppLogger.kbStore.warning("Chunk summary generation failed for chunk \(chunkIndex): \(error.localizedDescription)")
             }
         }
     }
@@ -907,9 +907,9 @@ final class KnowledgeBaseStore {
             // Remove heading markers
             .replacingOccurrences(of: "^#{1,6}\\s+", with: "", options: .regularExpression)
             // Remove blockquote markers
-            .replacingOccurrences(of: "^>\\s?", with: "", options: [.regularExpression, .anchorsMatchLines])
+            .replacingOccurrences(of: "(?m)^>\\s?", with: "", options: .regularExpression)
             // Remove horizontal rules
-            .replacingOccurrences(of: "^[-*_]{3,}$", with: "", options: [.regularExpression, .anchorsMatchLines])
+            .replacingOccurrences(of: "(?m)^[-*_]{3,}$", with: "", options: .regularExpression)
             // Remove HTML tags
             .replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1663,7 +1663,7 @@ final class KnowledgeBaseStore {
         // Phase 2: Build a smaller Float32 matrix from candidates and score
         let dim = matrix.dimension
         var subMatrix: [Float] = []
-        var subRowMap: [(UUID, Int)] = []
+        var subRowMap: [(knowledgeBaseID: UUID, chunkIndex: Int)] = []
 
         subMatrix.reserveCapacity(candidateChunkIDs.count * dim)
 
@@ -2347,7 +2347,7 @@ final class KnowledgeBaseStore {
                 if let actor = dbActor {
                     try? await actor.updateDomainSummary(id: domainID, summary: summary)
                 }
-                AppLogger.kbStore.info("Generated domain summary for '\(domains[idx].name)': \(summary.prefix(80))...")
+                AppLogger.kbStore.info("Generated domain summary for '\(self.domains[idx].name)': \(summary.prefix(80))...")
             }
         } catch {
             AppLogger.kbStore.warning("Domain summary generation failed: \(error.localizedDescription)")
