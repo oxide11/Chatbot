@@ -672,7 +672,12 @@ struct MessageBubble: View {
 
     @ViewBuilder
     private var messageContent: some View {
-        if let attributed = try? AttributedString(markdown: message.content, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)) {
+        if message.role == .assistant {
+            RichContentView(message.content)
+        } else if let attributed = try? AttributedString(
+            markdown: message.content,
+            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        ) {
             Text(attributed)
                 .textSelection(.enabled)
         } else {
