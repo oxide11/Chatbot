@@ -1,81 +1,67 @@
 //
-//  MemoryViews.swift
+//  WikiViews.swift
 //  ChatBot
 //
-//  Memory list, editor, and flow layout for keyword pills.
+//  Wiki page browser, editor, and flow layout for tag pills.
 //
 
 import SwiftUI
 
-// MARK: - Memory Editor View (Add & Edit)
+// MARK: - Wiki Page Editor View (Add & Edit)
 
-struct MemoryEditorView: View {
-    var memoryStore: MemoryStore
-    var existing: MemoryEntry?
-    /// Domain to assign new memories to (ignored when editing).
-    var domainID: UUID = KnowledgeDomain.generalID
+struct WikiPageEditorView: View {
+    var wikiStore: WikiStore
+    var existing: WikiPage?
+    var domainID: UUID?
     @Environment(\.dismiss) private var dismiss
-    @State private var content = ""
-    @State private var keywordsText = ""
-    @State private var autoKeywords: [String] = []
+    @State private var title = ""
+    @State private var pageBody = ""
+    @State private var tagsText = ""
 
     private var isEditing: Bool { existing != nil }
-    private var title: String { isEditing ? "Edit Memory" : "New Memory" }
+    private var viewTitle: String { isEditing ? "Edit Wiki Page" : "New Wiki Page" }
 
     var body: some View {
         NavigationStack {
             Form {
                 Section {
-                    TextField("What would you like to remember?", text: $content, axis: .vertical)
-                        .lineLimit(3...10)
-                        .onChange(of: content) {
-                            updateAutoKeywords()
-                        }
+                    TextField("Page title", text: $title)
                 } header: {
-                    Text("Content")
+                    Text("Title")
+                }
+
+                Section {
+                    TextField("Page content", text: $pageBody, axis: .vertical)
+                        .lineLimit(3...10)
+                } header: {
+                    Text("Body")
                 }
 
                 Section {
                     #if os(iOS) || os(tvOS) || os(visionOS)
-                    TextField("swift, coding, preference", text: $keywordsText)
+                    TextField("swift, coding, preference", text: $tagsText)
                         .textInputAutocapitalization(.never)
                     #else
-                    TextField("swift, coding, preference", text: $keywordsText)
+                    TextField("swift, coding, preference", text: $tagsText)
                     #endif
                 } header: {
-                    Text("Keywords")
+                    Text("Tags")
                 } footer: {
-                    if keywordsText.trimmingCharacters(in: .whitespaces).isEmpty {
-                        if !autoKeywords.isEmpty {
-                            VStack(alignment: .leading, spacing: 6) {
-                                Text("Auto-detected keywords:")
-                                FlowLayout(spacing: 4) {
-                                    ForEach(autoKeywords, id: \.self) { keyword in
-                                        Text(keyword)
-                                            .font(.caption2)
-                                            .padding(.horizontal, 8)
-                                            .padding(.vertical, 3)
-                                            .background(.fill.tertiary, in: .capsule)
-                                    }
-                                }
-                            }
-                        } else {
-                            Text("Leave blank to auto-detect from content.")
-                        }
-                    }
+                    Text("Comma-separated. Leave blank to auto-detect from content.")
                 }
 
-                if isEditing, let entry = existing {
+                if isEditing, let page = existing {
                     Section {
-                        LabeledContent("Source", value: entry.sourceConversationTitle)
-                        LabeledContent("Created", value: entry.createdAt.formatted(date: .abbreviated, time: .shortened))
+                        LabeledContent("Created", value: page.createdAt.formatted(date: .abbreviated, time: .shortened))
+                        LabeledContent("Updated", value: page.updatedAt.formatted(date: .abbreviated, time: .shortened))
+                        LabeledContent("Accessed", value: "\(page.accessCount) times")
                     } header: {
                         Text("Info")
                     }
                 }
             }
             .formStyle(.grouped)
-            .navigationTitle(title)
+            .navigationTitle(viewTitle)
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
             #endif
@@ -86,53 +72,56 @@ struct MemoryEditorView: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Save") { save() }
                         .bold()
-                        .disabled(content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .disabled(title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                  || pageBody.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
             }
             .onAppear {
-                if let entry = existing {
-                    content = entry.content
-                    keywordsText = entry.keywords.joined(separator: ", ")
+                if let page = existing {
+                    title = page.title
+                    pageBody = page.body
+                    tagsText = page.tags.joined(separator: ", ")
                 }
-                updateAutoKeywords()
             }
         }
         .presentationDetents([.medium, .large])
     }
 
-    private func updateAutoKeywords() {
-        let text = content.trimmingCharacters(in: .whitespacesAndNewlines)
-        if text.count > 10 {
-            autoKeywords = SharedDataManager.extractKeywords(from: text, limit: 5)
-        } else {
-            autoKeywords = []
-        }
-    }
-
     private func save() {
-        let trimmedContent = content.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedContent.isEmpty else { return }
+        let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedBody = pageBody.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTitle.isEmpty, !trimmedBody.isEmpty else { return }
 
-        let keywords: [String]
-        let trimmedKeywords = keywordsText.trimmingCharacters(in: .whitespaces)
-        if trimmedKeywords.isEmpty {
-            keywords = SharedDataManager.extractKeywords(from: trimmedContent, limit: 5)
+        let tags: [String]
+        let trimmedTags = tagsText.trimmingCharacters(in: .whitespaces)
+        if trimmedTags.isEmpty {
+            tags = SharedDataManager.extractKeywords(from: "\(trimmedTitle) \(trimmedBody)", limit: 5)
         } else {
-            keywords = trimmedKeywords.components(separatedBy: ",")
+            tags = trimmedTags.components(separatedBy: ",")
                 .map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
                 .filter { !$0.isEmpty }
         }
 
-        if let entry = existing {
-            memoryStore.updateMemory(entry, content: trimmedContent, keywords: keywords)
+        if let page = existing {
+            Task {
+                await wikiStore.updatePage(id: page.id, body: trimmedBody, tags: tags)
+            }
         } else {
-            memoryStore.addMemory(trimmedContent, keywords: keywords, source: "Manual Entry", domainID: domainID)
+            Task {
+                await wikiStore.createPage(
+                    title: trimmedTitle,
+                    body: trimmedBody,
+                    tags: tags,
+                    domainID: domainID,
+                    sourceConversationID: nil
+                )
+            }
         }
         dismiss()
     }
 }
 
-// MARK: - Flow Layout (for keyword pills)
+// MARK: - Flow Layout (for tag pills)
 
 struct FlowLayout: Layout {
     var spacing: CGFloat = 4
@@ -173,20 +162,20 @@ struct FlowLayout: Layout {
     }
 }
 
-// MARK: - Memory List View
+// MARK: - Wiki Page List View
 
-struct MemoryListView: View {
-    var memoryStore: MemoryStore
+struct WikiPageListView: View {
+    var wikiStore: WikiStore
     var domains: [KnowledgeDomain] = []
     @Environment(\.dismiss) private var dismiss
     @State private var showingDeleteAllConfirmation = false
-    @State private var showingAddMemory = false
-    @State private var editingMemory: MemoryEntry?
+    @State private var showingAddPage = false
+    @State private var editingPage: WikiPage?
 
     var body: some View {
         NavigationStack {
-            memoryContent
-                .navigationTitle("Memories")
+            pageContent
+                .navigationTitle("Wiki Pages")
                 #if os(iOS)
                 .navigationBarTitleDisplayMode(.inline)
                 #endif
@@ -196,36 +185,36 @@ struct MemoryListView: View {
                     }
                     ToolbarItem(placement: .primaryAction) {
                         Button {
-                            showingAddMemory = true
+                            showingAddPage = true
                         } label: {
                             Image(systemName: "plus")
                         }
-                        .help("Add Memory")
+                        .help("Add Wiki Page")
                     }
                     ToolbarItem(placement: .automatic) {
-                        if !memoryStore.memories.isEmpty {
+                        if !wikiStore.pages.isEmpty {
                             Button(role: .destructive) {
                                 showingDeleteAllConfirmation = true
                             } label: {
                                 Image(systemName: "trash")
                             }
-                            .help("Clear All Memories")
+                            .help("Clear All Wiki Pages")
                         }
                     }
                 }
-                .alert("Clear All Memories?", isPresented: $showingDeleteAllConfirmation) {
+                .alert("Clear All Wiki Pages?", isPresented: $showingDeleteAllConfirmation) {
                     Button("Clear All", role: .destructive) {
-                        memoryStore.deleteAllMemories()
+                        Task { await wikiStore.deleteAllPages() }
                     }
                     Button("Cancel", role: .cancel) {}
                 } message: {
-                    Text("This will permanently delete all saved memories.")
+                    Text("This will permanently delete all wiki pages.")
                 }
-                .sheet(isPresented: $showingAddMemory) {
-                    MemoryEditorView(memoryStore: memoryStore)
+                .sheet(isPresented: $showingAddPage) {
+                    WikiPageEditorView(wikiStore: wikiStore)
                 }
-                .sheet(item: $editingMemory) { memory in
-                    MemoryEditorView(memoryStore: memoryStore, existing: memory)
+                .sheet(item: $editingPage) { page in
+                    WikiPageEditorView(wikiStore: wikiStore, existing: page)
                 }
         }
         #if os(macOS)
@@ -234,39 +223,44 @@ struct MemoryListView: View {
     }
 
     @ViewBuilder
-    private var memoryContent: some View {
-        if memoryStore.memories.isEmpty {
+    private var pageContent: some View {
+        if wikiStore.pages.isEmpty {
             ContentUnavailableView {
-                Label("No Memories", systemImage: "brain")
+                Label("No Wiki Pages", systemImage: "book.pages")
             } description: {
-                Text("Memories are automatically created when conversations get long, or you can add them manually.")
+                Text("Wiki pages are automatically created from conversations, or you can add them manually.")
             } actions: {
                 Button {
-                    showingAddMemory = true
+                    showingAddPage = true
                 } label: {
-                    Text("Add Memory")
+                    Text("Add Wiki Page")
                 }
             }
         } else {
             List {
                 ForEach(domains.isEmpty ? [KnowledgeDomain.general()] : domains) { domain in
-                    let domainMemories = memoryStore.memories(for: domain.id)
-                    if !domainMemories.isEmpty {
+                    let domainPages = wikiStore.pages(forDomain: domain.id)
+                    if !domainPages.isEmpty {
                         Section {
-                            ForEach(domainMemories) { memory in
+                            ForEach(domainPages) { page in
                                 Button {
-                                    editingMemory = memory
+                                    editingPage = page
                                 } label: {
                                     VStack(alignment: .leading, spacing: 6) {
-                                        Text(memory.content)
+                                        Text(page.title)
+                                            .font(.headline)
+                                            .foregroundStyle(.primary)
+                                            .lineLimit(1)
+
+                                        Text(page.body)
                                             .font(.body)
                                             .foregroundStyle(.primary)
                                             .lineLimit(3)
 
-                                        if !memory.keywords.isEmpty {
+                                        if !page.tags.isEmpty {
                                             HStack(spacing: 4) {
-                                                ForEach(memory.keywords.prefix(4), id: \.self) { keyword in
-                                                    Text(keyword)
+                                                ForEach(page.tags.prefix(4), id: \.self) { tag in
+                                                    Text(tag)
                                                         .font(.caption2)
                                                         .padding(.horizontal, 6)
                                                         .padding(.vertical, 2)
@@ -276,9 +270,9 @@ struct MemoryListView: View {
                                         }
 
                                         HStack(spacing: 4) {
-                                            Text(memory.sourceConversationTitle)
+                                            Text("Updated \(page.updatedAt, style: .relative) ago")
                                             Text("\u{00B7}")
-                                            Text(memory.createdAt, style: .relative)
+                                            Text("\(page.accessCount) accesses")
                                         }
                                         .font(.caption2)
                                         .foregroundStyle(.tertiary)
@@ -288,34 +282,16 @@ struct MemoryListView: View {
                                 }
                                 .contextMenu {
                                     Button {
-                                        editingMemory = memory
+                                        editingPage = page
                                     } label: {
                                         Label("Edit", systemImage: "pencil")
                                     }
 
-                                    if domains.count > 1 {
-                                        Menu {
-                                            ForEach(domains.filter { $0.id != (memory.domainID ?? KnowledgeDomain.generalID) }) { targetDomain in
-                                                Button(targetDomain.name) {
-                                                    memoryStore.moveMemory(memory, toDomain: targetDomain.id)
-                                                }
-                                            }
-                                        } label: {
-                                            Label("Move to Domain", systemImage: "arrow.right.square")
-                                        }
-                                    }
-
                                     Button(role: .destructive) {
-                                        memoryStore.deleteMemory(memory)
+                                        Task { await wikiStore.deletePage(id: page.id) }
                                     } label: {
                                         Label("Delete", systemImage: "trash")
                                     }
-                                }
-                            }
-                            .onDelete { offsets in
-                                let toDelete = offsets.map { domainMemories[$0] }
-                                for entry in toDelete {
-                                    memoryStore.deleteMemory(entry)
                                 }
                             }
                         } header: {

@@ -16,11 +16,7 @@ struct AskChatBotIntent: AppIntent {
 
     func perform() async throws -> some IntentResult & ProvidesDialog {
         let session = LanguageModelSession {
-            """
-            You are Engram, a helpful on-device AI assistant answering a voice query via Siri. \
-            Keep your response brief (1-3 sentences) since it will be spoken aloud. \
-            Answer directly and conversationally. If the question is ambiguous, give the most likely answer.
-            """
+            "You are a helpful, friendly assistant. Be concise."
         }
 
         let response = try await session.respond(to: question)
@@ -28,47 +24,41 @@ struct AskChatBotIntent: AppIntent {
     }
 }
 
-// MARK: - Save Memory Intent
+// MARK: - Save to Wiki Intent
 
-struct SaveMemoryIntent: AppIntent {
-    static let title: LocalizedStringResource = "Save a Memory"
-    static let description = IntentDescription("Save a piece of information to Engram's memory for future reference.")
+struct SaveToWikiIntent: AppIntent {
+    static let title: LocalizedStringResource = "Save to Wiki"
+    static let description = IntentDescription("Save a piece of information to Engram's wiki for future reference.")
+
+    @Parameter(title: "Title")
+    var pageTitle: String
 
     @Parameter(title: "Content")
     var content: String
 
-    @Parameter(title: "Keywords", default: "")
-    var keywordsText: String
+    @Parameter(title: "Tags", default: "")
+    var tagsText: String
 
     static var parameterSummary: some ParameterSummary {
-        Summary("Save \(\.$content) to Engram memory") {
-            \.$keywordsText
+        Summary("Save \(\.$pageTitle) to Engram wiki") {
+            \.$content
+            \.$tagsText
         }
     }
 
     @MainActor
     func perform() async throws -> some IntentResult & ProvidesDialog {
-        let keywords: [String]
-        if keywordsText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            keywords = SharedDataManager.extractKeywords(from: content, limit: 5)
+        let tags: [String]
+        if tagsText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            tags = SharedDataManager.extractKeywords(from: "\(pageTitle) \(content)", limit: 5)
         } else {
-            keywords = keywordsText.components(separatedBy: ",")
+            tags = tagsText.components(separatedBy: ",")
                 .map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
                 .filter { !$0.isEmpty }
         }
 
-        let entry = MemoryEntry(content: content, keywords: keywords, sourceConversationTitle: "Siri Shortcut")
-        var memories = SharedDataManager.loadMemoriesFromFile()
-        guard !memories.contains(where: { $0.content == content }) else {
-            return .result(dialog: "This memory already exists.")
-        }
-        memories.insert(entry, at: 0)
-        if memories.count > 100 {
-            memories = Array(memories.prefix(100))
-        }
-        SharedDataManager.saveMemoriesToFile(memories)
-
-        return .result(dialog: "Memory saved with \(keywords.count) keywords.")
+        SharedDataManager.savePendingWikiPage(title: pageTitle, body: content, tags: tags)
+        return .result(dialog: "Wiki page '\(pageTitle)' saved with \(tags.count) tags.")
     }
 }
 
@@ -86,12 +76,12 @@ struct ChatBotShortcuts: AppShortcutsProvider {
         )
 
         AppShortcut(
-            intent: SaveMemoryIntent(),
+            intent: SaveToWikiIntent(),
             phrases: [
-                "Save a memory in \(.applicationName)"
+                "Save to wiki in \(.applicationName)"
             ],
-            shortTitle: "Save Memory",
-            systemImageName: "brain"
+            shortTitle: "Save to Wiki",
+            systemImageName: "book.pages"
         )
     }
 }

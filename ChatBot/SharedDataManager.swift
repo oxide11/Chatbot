@@ -12,13 +12,11 @@ enum SharedDataManager {
 
     // MARK: - Keys
 
-    static let memoriesKey = "saved_memories"
     static let conversationsKey = "saved_conversations"
     static let pendingSharedTextKey = "pending_shared_text"
     static let pendingSharedActionKey = "pending_shared_action"
 
     // Legacy keys (pre-App Group, in UserDefaults.standard)
-    static let legacyMemoriesKey = "saved_memories"
     static let legacyConversationsKey = "saved_conversations"
 
     // MARK: - Shared Action
@@ -26,22 +24,6 @@ enum SharedDataManager {
     enum SharedAction: String, Codable {
         case saveAsMemory
         case startConversation
-    }
-
-    // MARK: - Memories
-
-    static func loadMemories() -> [MemoryEntry] {
-        guard let data = sharedDefaults.data(forKey: memoriesKey),
-              let decoded = try? JSONDecoder().decode([MemoryEntry].self, from: data) else {
-            return []
-        }
-        return decoded
-    }
-
-    static func saveMemories(_ memories: [MemoryEntry]) {
-        if let encoded = try? JSONEncoder().encode(memories) {
-            sharedDefaults.set(encoded, forKey: memoriesKey)
-        }
     }
 
     // MARK: - Conversations
@@ -83,13 +65,6 @@ enum SharedDataManager {
     static func migrateIfNeeded() {
         let standard = UserDefaults.standard
 
-        // Migrate memories
-        if let legacyData = standard.data(forKey: legacyMemoriesKey),
-           sharedDefaults.data(forKey: memoriesKey) == nil {
-            sharedDefaults.set(legacyData, forKey: memoriesKey)
-            standard.removeObject(forKey: legacyMemoriesKey)
-        }
-
         // Migrate conversations
         if let legacyData = standard.data(forKey: legacyConversationsKey),
            sharedDefaults.data(forKey: conversationsKey) == nil {
@@ -113,7 +88,6 @@ enum SharedDataManager {
     ]
 
     /// Tokenize text into significant words, filtering stop words.
-    /// Used by MemoryStore, KnowledgeBaseStore, and keyword extraction.
     nonisolated static func tokenize(_ text: String) -> Set<String> {
         let words = text.lowercased()
             .components(separatedBy: CharacterSet.alphanumerics.inverted)
@@ -188,14 +162,8 @@ enum SharedDataManager {
         documentsURL?.appendingPathComponent("chunks", isDirectory: true)
     }
 
-    /// Memories file for file-based memory persistence.
-    nonisolated static var memoriesFileURL: URL? {
-        documentsURL?.appendingPathComponent("memories.json")
-    }
-
     /// Ensure the file-based storage directories exist.
-    /// Safe to call from any thread. Only creates the Documents directory
-    /// (used for memories.json). Knowledge base chunks now use SwiftData.
+    /// Safe to call from any thread.
     nonisolated static func ensureDirectoriesExist() {
         guard let docsURL = documentsURL else {
             AppLogger.sharedData.error("Cannot resolve Documents URL — ensureDirectoriesExist() skipped")
@@ -213,71 +181,29 @@ enum SharedDataManager {
         }
     }
 
-    // MARK: - File-based Memory Persistence
-    //
-    // Memories are now stored as a JSON file instead of UserDefaults
-    // to avoid the ~1MB size limit (embeddings are large).
-    // Embeddings are stripped on save and recomputed on load.
+    // MARK: - Pending Wiki Page (from Siri Intent)
 
-    /// A lightweight version of MemoryEntry without the embedding vector,
-    /// used for compact on-disk storage.
-    private struct StoredMemory: Codable {
-        let id: UUID
-        let content: String
-        let keywords: [String]
-        let sourceConversationTitle: String
-        let createdAt: Date
-        let domainID: UUID?
+    private static let pendingWikiPageKey = "pending_wiki_page"
+
+    struct PendingWikiPage: Codable {
+        let title: String
+        let body: String
+        let tags: [String]
     }
 
-    static func loadMemoriesFromFile() -> [MemoryEntry] {
-        ensureDirectoriesExist()
-
-        // Try file-based storage first
-        if let url = memoriesFileURL,
-           let data = try? Data(contentsOf: url),
-           let stored = try? JSONDecoder().decode([StoredMemory].self, from: data) {
-            return stored.map { s in
-                MemoryEntry(
-                    id: s.id,
-                    content: s.content,
-                    keywords: s.keywords,
-                    sourceConversationTitle: s.sourceConversationTitle,
-                    createdAt: s.createdAt,
-                    embedding: nil,  // Recomputed lazily or on access
-                    domainID: s.domainID
-                )
-            }
+    static func savePendingWikiPage(title: String, body: String, tags: [String]) {
+        let pending = PendingWikiPage(title: title, body: body, tags: tags)
+        if let data = try? JSONEncoder().encode(pending) {
+            sharedDefaults.set(data, forKey: pendingWikiPageKey)
         }
-
-        // Fall back to legacy UserDefaults (one-time migration)
-        if let data = sharedDefaults.data(forKey: memoriesKey),
-           let decoded = try? JSONDecoder().decode([MemoryEntry].self, from: data) {
-            // Migrate to file and remove from UserDefaults
-            saveMemoriesToFile(decoded)
-            sharedDefaults.removeObject(forKey: memoriesKey)
-            return decoded
-        }
-
-        return []
     }
 
-    static func saveMemoriesToFile(_ memories: [MemoryEntry]) {
-        ensureDirectoriesExist()
-        guard let url = memoriesFileURL else { return }
-
-        // Strip embeddings for compact storage — they'll be recomputed on load
-        let stored = memories.map { m in
-            StoredMemory(
-                id: m.id,
-                content: m.content,
-                keywords: m.keywords,
-                sourceConversationTitle: m.sourceConversationTitle,
-                createdAt: m.createdAt,
-                domainID: m.domainID
-            )
+    static func consumePendingWikiPage() -> PendingWikiPage? {
+        guard let data = sharedDefaults.data(forKey: pendingWikiPageKey),
+              let pending = try? JSONDecoder().decode(PendingWikiPage.self, from: data) else {
+            return nil
         }
-
-        try? JSONEncoder().encode(stored).write(to: url)
+        sharedDefaults.removeObject(forKey: pendingWikiPageKey)
+        return pending
     }
 }

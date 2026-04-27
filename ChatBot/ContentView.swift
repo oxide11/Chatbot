@@ -102,7 +102,7 @@ struct ContentView: View {
             store.conversations.first?.checkAvailability()
             store.configureOrchestrator(with: modelContext)
             store.configureKnowledgeBaseStore(with: modelContext)
-            // Ensure embedding model assets are downloaded for semantic RAG
+            store.configureWikiStore(with: modelContext)
             EmbeddingService.shared.requestAssetsIfNeeded()
         }
     }
