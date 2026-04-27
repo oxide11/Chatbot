@@ -14,6 +14,7 @@ struct SettingsView: View {
     @State private var showingWikiPages = false
     @State private var showingKnowledgeBases = false
     @State private var showingWorkers = false
+    @State private var showingWikiLint = false
     @State private var defaultPromptDraft = ""
     @State private var openingProvider: ChatProviderID?
 
@@ -157,6 +158,80 @@ struct SettingsView: View {
                     Text("Auto-Extract from Documents runs each newly imported PDF / ePub / text file through the LLM to populate wiki pages — long documents can take several minutes on-device.")
                 }
 
+                // MARK: Wiki Maintenance
+                Section {
+                    Button {
+                        showingWikiLint = true
+                    } label: {
+                        HStack {
+                            Label("Lint Wiki", systemImage: "wand.and.stars.inverse")
+                            Spacer()
+                            if store.wikiLinter.report.activeCount > 0 {
+                                Text("\(store.wikiLinter.report.activeCount)")
+                                    .font(.caption.weight(.medium))
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 2)
+                                    .background(.orange.opacity(0.18), in: .capsule)
+                                    .foregroundStyle(.orange)
+                            }
+                            Image(systemName: "chevron.right")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.tertiary)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+
+                    Toggle("Lint After Extractions", isOn: Binding(
+                        get: { store.ragSettings.lintAfterExtractions },
+                        set: { newValue in
+                            store.ragSettings.lintAfterExtractions = newValue
+                            store.applyRAGSettings()
+                        }
+                    ))
+
+                    Toggle("Daily Background Lint", isOn: Binding(
+                        get: { store.ragSettings.dailyBackgroundLintEnabled },
+                        set: { newValue in
+                            store.ragSettings.dailyBackgroundLintEnabled = newValue
+                            store.applyRAGSettings()
+                            WikiLintScheduler.shared.reschedule(enabled: newValue)
+                        }
+                    ))
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text("Duplicate Sensitivity")
+                            Spacer()
+                            Text(String(format: "%.0f%%", store.ragSettings.lintSimilarityThreshold * 100))
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
+                        }
+                        Slider(
+                            value: Binding(
+                                get: { store.ragSettings.lintSimilarityThreshold },
+                                set: { newValue in
+                                    store.ragSettings.lintSimilarityThreshold = newValue
+                                    store.applyRAGSettings()
+                                }
+                            ),
+                            in: 0.7...0.95,
+                            step: 0.01
+                        )
+                        Text(store.ragSettings.lintSimilarityThreshold > 0.9
+                             ? "Conservative — only near-identical pairs flagged"
+                             : (store.ragSettings.lintSimilarityThreshold < 0.78
+                                ? "Aggressive — more candidates, more noise"
+                                : "Balanced"))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                } header: {
+                    Text("Wiki Maintenance")
+                } footer: {
+                    Text("Lint surfaces broken links, orphans, duplicates, stale and missing pages. AI Review (inside Lint Wiki) drafts merge / stub proposals. Nothing is changed without your confirmation.")
+                }
+
                 // MARK: System Prompt
                 Section {
                     TextField("e.g. You are a helpful coding assistant...", text: $defaultPromptDraft, axis: .vertical)
@@ -274,6 +349,9 @@ struct SettingsView: View {
             }
             .sheet(item: $openingProvider) { id in
                 ProviderDetailView(id: id, registry: store.providers)
+            }
+            .sheet(isPresented: $showingWikiLint) {
+                WikiLintView(linter: store.wikiLinter, wikiStore: store.wikiStore)
             }
         }
         .presentationDragIndicator(.visible)
