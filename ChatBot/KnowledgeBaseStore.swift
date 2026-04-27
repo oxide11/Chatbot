@@ -185,7 +185,7 @@ final class KnowledgeBaseStore {
     /// Optional callback fired on the main actor after a document finishes
     /// ingesting successfully. The owning store (typically ConversationStore)
     /// uses this to optionally route the new document into wiki extraction.
-    var onIngestionCompleted: (@MainActor (KnowledgeBase) -> Void)?
+    @ObservationIgnored var onIngestionCompleted: (@MainActor @Sendable (KnowledgeBase) -> Void)?
     private var isQueueRunning = false
 
     private var chunkCache: [UUID: [DocumentChunk]] = [:]

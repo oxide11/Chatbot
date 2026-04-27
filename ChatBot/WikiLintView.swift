@@ -669,12 +669,12 @@ private struct OrphanView: View {
     var body: some View {
         SimplePageActionView(
             page: wikiStore.pages.first { $0.id == finding.primaryPageID },
-            primaryAction: ("Keep — Add Inbound Links Later", "checkmark.circle", false) {
+            primaryAction: ("Keep — Add Inbound Links Later", "checkmark.circle", false, {
                 Task { await linter.apply(.dismiss, to: finding); onClose() }
-            },
-            destructiveAction: ("Delete Page", "trash") {
+            }),
+            destructiveAction: ("Delete Page", "trash", {
                 Task { await linter.apply(.deletePrimary, to: finding); onClose() }
-            }
+            })
         )
     }
 }
@@ -688,12 +688,12 @@ private struct StalePageView: View {
     var body: some View {
         SimplePageActionView(
             page: wikiStore.pages.first { $0.id == finding.primaryPageID },
-            primaryAction: ("Keep — Mark Reviewed", "hand.thumbsup", false) {
+            primaryAction: ("Keep — Mark Reviewed", "hand.thumbsup", false, {
                 Task { await linter.apply(.dismiss, to: finding); onClose() }
-            },
-            destructiveAction: ("Delete Stale Page", "trash") {
+            }),
+            destructiveAction: ("Delete Stale Page", "trash", {
                 Task { await linter.apply(.deletePrimary, to: finding); onClose() }
-            }
+            })
         )
     }
 }
@@ -707,9 +707,9 @@ private struct DeadEndView: View {
     var body: some View {
         SimplePageActionView(
             page: wikiStore.pages.first { $0.id == finding.primaryPageID },
-            primaryAction: ("Keep — I'll Add Links", "checkmark.circle", false) {
+            primaryAction: ("Keep — I'll Add Links", "checkmark.circle", false, {
                 Task { await linter.apply(.dismiss, to: finding); onClose() }
-            },
+            }),
             destructiveAction: nil
         )
     }
@@ -767,11 +767,19 @@ private struct SimplePageActionView: View {
             }
 
             Section {
-                Button(action: primaryAction.action) {
-                    Label(primaryAction.label, systemImage: primaryAction.icon)
-                        .frame(maxWidth: .infinity)
+                if primaryAction.prominent {
+                    Button(action: primaryAction.action) {
+                        Label(primaryAction.label, systemImage: primaryAction.icon)
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.glassProminent)
+                } else {
+                    Button(action: primaryAction.action) {
+                        Label(primaryAction.label, systemImage: primaryAction.icon)
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.glass)
                 }
-                .buttonStyle(primaryAction.prominent ? .glassProminent : .glass)
 
                 if let destructive = destructiveAction {
                     Button(role: .destructive, action: destructive.action) {

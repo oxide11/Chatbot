@@ -32,7 +32,7 @@ struct WikiExtractionProgressView: View {
 
                 Image(systemName: summary == nil ? "wand.and.stars" : (summary?.cancelled == true ? "stop.circle" : "checkmark.seal.fill"))
                     .font(.system(size: 48))
-                    .foregroundStyle(summary?.cancelled == true ? .secondary : .tint)
+                    .foregroundStyle(summary?.cancelled == true ? AnyShapeStyle(.secondary) : AnyShapeStyle(.tint))
                     .symbolEffect(.bounce, value: progress.chunkIndex)
 
                 Text(headline)
