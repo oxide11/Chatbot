@@ -131,7 +131,7 @@ final class SDWikiPage {
 
 // MARK: - Lightweight Transfer Struct
 
-struct WikiPage: Identifiable, Codable, Sendable {
+struct WikiPage: Identifiable, Codable, Hashable, Sendable {
     let id: UUID
     var title: String
     var body: String

@@ -12,6 +12,7 @@ import SwiftUI
 struct WikiPageEditorView: View {
     var wikiStore: WikiStore
     var existing: WikiPage?
+    var seedTitle: String?
     var domainID: UUID?
     @Environment(\.dismiss) private var dismiss
     @State private var title = ""
@@ -35,6 +36,8 @@ struct WikiPageEditorView: View {
                         .lineLimit(3...10)
                 } header: {
                     Text("Body")
+                } footer: {
+                    Text("Supports markdown, `$inline$` math, `$$display$$` math, code fences, and `[[wikilinks]]`.")
                 }
 
                 Section {
@@ -81,6 +84,8 @@ struct WikiPageEditorView: View {
                     title = page.title
                     pageBody = page.body
                     tagsText = page.tags.joined(separator: ", ")
+                } else if let seed = seedTitle, title.isEmpty {
+                    title = seed
                 }
             }
         }
@@ -168,12 +173,12 @@ struct WikiPageListView: View {
     var wikiStore: WikiStore
     var domains: [KnowledgeDomain] = []
     @Environment(\.dismiss) private var dismiss
+    @State private var path: [WikiPage] = []
     @State private var showingDeleteAllConfirmation = false
     @State private var showingAddPage = false
-    @State private var editingPage: WikiPage?
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
             pageContent
                 .navigationTitle("Wiki Pages")
                 #if os(iOS)
@@ -187,20 +192,25 @@ struct WikiPageListView: View {
                         Button {
                             showingAddPage = true
                         } label: {
-                            Image(systemName: "plus")
+                            Label("Add Wiki Page", systemImage: "plus")
                         }
-                        .help("Add Wiki Page")
                     }
                     ToolbarItem(placement: .automatic) {
                         if !wikiStore.pages.isEmpty {
                             Button(role: .destructive) {
                                 showingDeleteAllConfirmation = true
                             } label: {
-                                Image(systemName: "trash")
+                                Label("Clear All", systemImage: "trash")
                             }
-                            .help("Clear All Wiki Pages")
                         }
                     }
+                }
+                .navigationDestination(for: WikiPage.self) { destination in
+                    WikiPageDetailView(
+                        page: destination,
+                        wikiStore: wikiStore,
+                        pushPage: { path.append($0) }
+                    )
                 }
                 .alert("Clear All Wiki Pages?", isPresented: $showingDeleteAllConfirmation) {
                     Button("Clear All", role: .destructive) {
@@ -212,9 +222,6 @@ struct WikiPageListView: View {
                 }
                 .sheet(isPresented: $showingAddPage) {
                     WikiPageEditorView(wikiStore: wikiStore)
-                }
-                .sheet(item: $editingPage) { page in
-                    WikiPageEditorView(wikiStore: wikiStore, existing: page)
                 }
         }
         #if os(macOS)
@@ -243,48 +250,14 @@ struct WikiPageListView: View {
                     if !domainPages.isEmpty {
                         Section {
                             ForEach(domainPages) { page in
-                                Button {
-                                    editingPage = page
-                                } label: {
-                                    VStack(alignment: .leading, spacing: 6) {
-                                        Text(page.title)
-                                            .font(.headline)
-                                            .foregroundStyle(.primary)
-                                            .lineLimit(1)
-
-                                        Text(page.body)
-                                            .font(.body)
-                                            .foregroundStyle(.primary)
-                                            .lineLimit(3)
-
-                                        if !page.tags.isEmpty {
-                                            HStack(spacing: 4) {
-                                                ForEach(page.tags.prefix(4), id: \.self) { tag in
-                                                    Text(tag)
-                                                        .font(.caption2)
-                                                        .padding(.horizontal, 6)
-                                                        .padding(.vertical, 2)
-                                                        .background(.fill.tertiary, in: .capsule)
-                                                }
-                                            }
-                                        }
-
-                                        HStack(spacing: 4) {
-                                            Text("Updated \(page.updatedAt, style: .relative) ago")
-                                            Text("\u{00B7}")
-                                            Text("\(page.accessCount) accesses")
-                                        }
-                                        .font(.caption2)
-                                        .foregroundStyle(.tertiary)
-                                        .lineLimit(1)
-                                    }
-                                    .padding(.vertical, 2)
+                                NavigationLink(value: page) {
+                                    WikiPageRow(page: page)
                                 }
                                 .contextMenu {
                                     Button {
-                                        editingPage = page
+                                        path.append(page)
                                     } label: {
-                                        Label("Edit", systemImage: "pencil")
+                                        Label("Open", systemImage: "doc.text")
                                     }
 
                                     Button(role: .destructive) {
@@ -301,5 +274,48 @@ struct WikiPageListView: View {
                 }
             }
         }
+    }
+}
+
+// MARK: - Wiki Page Row
+
+private struct WikiPageRow: View {
+    let page: WikiPage
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(page.title)
+                .font(.headline)
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+
+            Text(page.body)
+                .font(.body)
+                .foregroundStyle(.primary)
+                .lineLimit(2)
+
+            if !page.tags.isEmpty {
+                HStack(spacing: 4) {
+                    ForEach(page.tags.prefix(4), id: \.self) { tag in
+                        Text(tag)
+                            .font(.caption2)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(.fill.tertiary, in: .capsule)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+
+            HStack(spacing: 4) {
+                Text("Updated \(page.updatedAt, style: .relative) ago")
+                Text("\u{00B7}")
+                Text("\(page.accessCount) access\(page.accessCount == 1 ? "" : "es")")
+            }
+            .font(.caption2)
+            .foregroundStyle(.tertiary)
+            .lineLimit(1)
+        }
+        .padding(.vertical, 2)
     }
 }
