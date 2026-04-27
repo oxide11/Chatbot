@@ -20,6 +20,10 @@ import FoundationModels
 final class WikiLinter {
     let wikiStore: WikiStore
 
+    /// Set by ConversationStore. Routes the semantic pass to whichever
+    /// provider the user has bound to the `.lint` task.
+    var providerRegistry: ProviderRegistry?
+
     /// Latest report. Replaced wholesale by each lint run.
     private(set) var report: WikiLintReport = .empty
 
@@ -200,16 +204,12 @@ final class WikiLinter {
         }
 
         report.semanticReviewProgress = .init(processed: 0, total: candidates.count)
-        let session = LanguageModelSession {
-            "You review a personal wiki for duplicates, missing pages, and contradictions."
-        }
-        let options = GenerationOptions(sampling: .greedy, maximumResponseTokens: 400)
 
         for (idx, findingIndex) in candidates.enumerated() {
             if Task.isCancelled { break }
             let finding = report.findings[findingIndex]
             do {
-                let suggestion = try await suggestion(for: finding, session: session, options: options)
+                let suggestion = try await suggestion(for: finding)
                 report.findings[findingIndex].suggestion = suggestion
             } catch {
                 AppLogger.wiki.error("Semantic lint failed for \(finding.kind.rawValue): \(error.localizedDescription)")
@@ -219,16 +219,31 @@ final class WikiLinter {
         }
     }
 
-    private func suggestion(
-        for finding: WikiLintFinding,
-        session: LanguageModelSession,
-        options: GenerationOptions
-    ) async throws -> WikiLintSuggestion {
+    private static let semanticSystemPrompt =
+        "You review a personal wiki for duplicates, missing pages, and contradictions."
+
+    /// Run a single LLM round-trip routed through whichever provider is
+    /// bound to the `.lint` task. Falls back to LanguageModelSession when
+    /// no remote provider is configured.
+    private func respondOnce(prompt: String, maxTokens: Int) async throws -> String {
+        if let provider = providerRegistry?.resolve(for: .lint) {
+            return try await provider.respond(
+                history: [ProviderMessage(role: .user, content: prompt)],
+                systemPrompt: Self.semanticSystemPrompt,
+                options: ProviderGenerationOptions(maxOutputTokens: maxTokens, temperature: 1.0)
+            )
+        }
+        let session = LanguageModelSession { Self.semanticSystemPrompt }
+        let options = GenerationOptions(sampling: .greedy, maximumResponseTokens: maxTokens)
+        return try await session.respond(to: prompt, options: options).content
+    }
+
+    private func suggestion(for finding: WikiLintFinding) async throws -> WikiLintSuggestion {
         switch finding.kind {
         case .duplicateCandidate:
-            return try await mergeSuggestion(for: finding, session: session, options: options)
+            return try await mergeSuggestion(for: finding)
         case .missingPage:
-            return try await stubSuggestion(for: finding, session: session, options: options)
+            return try await stubSuggestion(for: finding)
         case .contradiction:
             return .noAction(rationale: "Manual review required.")
         default:
@@ -236,11 +251,7 @@ final class WikiLinter {
         }
     }
 
-    private func mergeSuggestion(
-        for finding: WikiLintFinding,
-        session: LanguageModelSession,
-        options: GenerationOptions
-    ) async throws -> WikiLintSuggestion {
+    private func mergeSuggestion(for finding: WikiLintFinding) async throws -> WikiLintSuggestion {
         guard
             let a = wikiStore.pages.first(where: { $0.id == finding.primaryPageID }),
             let secID = finding.secondaryPageID,
@@ -270,7 +281,7 @@ final class WikiLinter {
         \(b.body)
         """
 
-        let response = try await session.respond(to: prompt, options: options).content
+        let response = try await respondOnce(prompt: prompt, maxTokens: 400)
         if response.trimmingCharacters(in: .whitespacesAndNewlines)
             .uppercased().contains("KEEP_BOTH") {
             return .noAction(rationale: "Pages are related but distinct.")
@@ -281,11 +292,7 @@ final class WikiLinter {
         return .noAction(rationale: "Could not parse a merge proposal.")
     }
 
-    private func stubSuggestion(
-        for finding: WikiLintFinding,
-        session: LanguageModelSession,
-        options: GenerationOptions
-    ) async throws -> WikiLintSuggestion {
+    private func stubSuggestion(for finding: WikiLintFinding) async throws -> WikiLintSuggestion {
         guard let target = finding.linkTarget,
               let referencer = wikiStore.pages.first(where: { $0.id == finding.primaryPageID }) else {
             return .noAction(rationale: "Missing context.")
@@ -309,7 +316,7 @@ final class WikiLinter {
         \(referencer.body)
         """
 
-        let response = try await session.respond(to: prompt, options: options).content
+        let response = try await respondOnce(prompt: prompt, maxTokens: 400)
         if response.trimmingCharacters(in: .whitespacesAndNewlines)
             .uppercased().contains("SKIP") {
             return .noAction(rationale: "Insufficient context to draft a stub.")

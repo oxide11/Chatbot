@@ -253,3 +253,69 @@ struct ProviderDetailView: View {
         }
     }
 }
+
+// MARK: - Task Routing Row
+
+/// One row in Settings → Routing. Lets the user pick which provider runs
+/// a given task (chat, extraction, lint), or fall back to the default.
+struct TaskRoutingRow: View {
+    let task: ProviderTask
+    var registry: ProviderRegistry
+
+    var body: some View {
+        let configured = ChatProviderID.allCases.filter { registry.configuredIDs.contains($0) }
+        let activeID = registry.providerID(for: task)
+        let hasOverride = registry.hasOverride(for: task)
+
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 12) {
+                Image(systemName: task.iconSystemName)
+                    .font(.body)
+                    .foregroundStyle(activeID.iconTint)
+                    .frame(width: 28, height: 28)
+                    .background(activeID.iconTint.opacity(0.15), in: .rect(cornerRadius: 7))
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(task.displayName).font(.body)
+                    Text(task.blurb)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+
+                Spacer(minLength: 8)
+
+                Picker("", selection: Binding(
+                    get: { activeID },
+                    set: { registry.setProvider($0, for: task) }
+                )) {
+                    ForEach(configured) { id in
+                        Label(id.shortName, systemImage: id.iconSystemName).tag(id)
+                    }
+                }
+                .pickerStyle(.menu)
+                .labelsHidden()
+            }
+
+            if hasOverride {
+                Button {
+                    registry.setProvider(nil, for: task)
+                } label: {
+                    Label("Use Default (\(registry.defaultProviderID.shortName))",
+                          systemImage: "arrow.uturn.backward")
+                        .font(.caption)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.tint)
+                .padding(.leading, 40)
+            } else {
+                Label("Inheriting default (\(registry.defaultProviderID.shortName))",
+                      systemImage: "arrow.down.right")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .padding(.leading, 40)
+            }
+        }
+        .padding(.vertical, 4)
+    }
+}
