@@ -103,6 +103,9 @@ final class SDDocumentChunk {
     @Attribute(.externalStorage)
     var embeddingData: Data?
 
+    /// LLM-generated 1-2 sentence summary of this chunk's content.
+    var summary: String?
+
     /// Back-pointer to the parent knowledge base (inverse of SDKnowledgeBase.chunks).
     var knowledgeBase: SDKnowledgeBase?
 
@@ -130,6 +133,7 @@ final class SDDocumentChunk {
         locationLabel: String,
         index: Int,
         embedding: [Double]? = nil,
+        summary: String? = nil,
         knowledgeBase: SDKnowledgeBase? = nil
     ) {
         self.id = id
@@ -138,6 +142,7 @@ final class SDDocumentChunk {
         self.locationLabel = locationLabel
         self.index = index
         self.embeddingData = embedding?.asData
+        self.summary = summary
         self.knowledgeBase = knowledgeBase
     }
 
@@ -150,6 +155,7 @@ final class SDDocumentChunk {
             locationLabel: chunk.locationLabel,
             index: chunk.index,
             embedding: chunk.embedding,
+            summary: chunk.summary,
             knowledgeBase: knowledgeBase
         )
     }
@@ -163,7 +169,8 @@ final class SDDocumentChunk {
             keywords: keywords,
             locationLabel: locationLabel,
             index: index,
-            embedding: embedding
+            embedding: embedding,
+            summary: summary
         )
     }
 }

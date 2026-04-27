@@ -64,7 +64,7 @@ struct KnowledgeBaseListView: View {
                 }
                 .fileImporter(
                     isPresented: $showingImporter,
-                    allowedContentTypes: [.pdf, .epub, .plainText],
+                    allowedContentTypes: [.pdf, .epub, .plainText, UTType(filenameExtension: "md") ?? .plainText],
                     allowsMultipleSelection: true
                 ) { result in
                     if case .success(let urls) = result, !urls.isEmpty {
@@ -145,8 +145,11 @@ struct KnowledgeBaseListView: View {
                                     case .completed:
                                         Image(systemName: "checkmark.circle.fill")
                                             .foregroundStyle(.green)
-                                    case .failed:
+                                    case .completedWithWarnings:
                                         Image(systemName: "exclamationmark.triangle.fill")
+                                            .foregroundStyle(.orange)
+                                    case .failed:
+                                        Image(systemName: "xmark.circle.fill")
                                             .foregroundStyle(.red)
                                     case .queued:
                                         Image(systemName: "clock")
@@ -236,6 +239,11 @@ struct KnowledgeBaseListView: View {
                                                     fromByteCount: knowledgeBaseStore.storageSize(for: kb),
                                                     countStyle: .file
                                                 ))
+                                                if kb.embeddingModelID == nil || kb.embeddingModelID?.isEmpty == true {
+                                                    Text("\u{00B7}")
+                                                    Label("Keyword only", systemImage: "textformat.abc")
+                                                        .foregroundStyle(.orange)
+                                                }
                                             }
                                             .font(.caption2)
                                             .foregroundStyle(.tertiary)
@@ -518,7 +526,7 @@ struct KnowledgeBaseDetailView: View {
         }
         .fileImporter(
             isPresented: $showingReimporter,
-            allowedContentTypes: [.pdf, .epub, .plainText],
+            allowedContentTypes: [.pdf, .epub, .plainText, UTType(filenameExtension: "md") ?? .plainText],
             allowsMultipleSelection: false
         ) { result in
             if case .success(let urls) = result, let url = urls.first {

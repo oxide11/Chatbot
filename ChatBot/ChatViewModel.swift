@@ -103,37 +103,110 @@ final class MemoryStore {
 
     /// Retrieve memories relevant to a query, scoped to a domain.
     ///
-    /// **Primary path:** Embed the query and rank by cosine similarity.
+    /// **Primary path:** Hybrid retrieval — fuse cosine similarity (dense) with
+    /// BM25 lexical scoring, matching the knowledge-base retrieval approach.
     /// **Fallback:** Keyword overlap (for old memories without embeddings or when assets unavailable).
-    func retrieve(for query: String, domainID: UUID = KnowledgeDomain.generalID, limit: Int = 5) -> [MemoryEntry] {
+    func retrieve(for query: String, domainID: UUID = KnowledgeDomain.generalID, limit: Int = 5, lexicalWeight: Float = 0.3, recencyWeight: Float = 0.15) -> [MemoryEntry] {
         let domainMemories = memories.filter { ($0.domainID ?? KnowledgeDomain.generalID) == domainID }
+        guard !domainMemories.isEmpty else { return [] }
 
-        // Try semantic retrieval first
+        let queryWords = SharedDataManager.tokenize(query)
+
+        // Try hybrid retrieval (dense + lexical + recency) first
         if let queryVector = EmbeddingService.shared.embed(query) {
+            // Compute BM25 scores for the domain pool
+            let bm25Scores = lexicalWeight > 0 ? computeMemoryBM25(queryWords: queryWords, pool: domainMemories) : [:]
+
+            // Three-way weight allocation: dense + lexical + recency = 1.0
+            // Dense and lexical share the non-recency portion in their original ratio
+            let relevanceWeight: Float = 1.0 - recencyWeight
+            let denseWeight: Float = relevanceWeight * (1.0 - lexicalWeight)
+            let scaledLexicalWeight: Float = relevanceWeight * lexicalWeight
+
             let scored = domainMemories.compactMap { entry -> (MemoryEntry, Double)? in
                 guard let memVector = entry.embedding else { return nil }
-                let similarity = EmbeddingService.cosineSimilarity(queryVector, memVector)
-                guard similarity > 0.3 else { return nil }
+                let cosineSim = Float(EmbeddingService.cosineSimilarity(queryVector, memVector))
 
-                // Small recency tiebreaker
-                let ageInDays = max(1, -entry.createdAt.timeIntervalSinceNow / 86400)
-                let recencyBonus = 1.0 / log2(ageInDays + 1)
-                return (entry, similarity + recencyBonus * 0.02)
+                // Fuse dense + lexical + recency
+                let bm25 = bm25Scores[entry.id] ?? 0
+                let decay = Self.timeDecay(for: entry.createdAt)
+                let finalScore = denseWeight * cosineSim + scaledLexicalWeight * bm25 + recencyWeight * decay
+
+                guard finalScore > 0.15 else { return nil }
+                return (entry, Double(finalScore))
             }
 
             let results = scored.sorted { $0.1 > $1.1 }.prefix(limit).map { $0.0 }
             if !results.isEmpty { return results }
         }
 
-        // Fallback: keyword matching
-        return retrieveByKeywords(query: query, from: domainMemories, limit: limit)
+        // Fallback: keyword matching with recency
+        return retrieveByKeywords(query: query, from: domainMemories, limit: limit, recencyWeight: recencyWeight)
+    }
+
+    /// Exponential time-decay factor: e^(-age / halfLife).
+    /// Returns a value in (0, 1] where 1.0 = just created, ~0.5 at 45 days, ~0.25 at 90 days.
+    static func timeDecay(for date: Date, halfLifeDays: Double = 45) -> Float {
+        let ageInDays = max(0, -date.timeIntervalSinceNow / 86400)
+        // decay = e^(-age * ln(2) / halfLife) so that decay = 0.5 at exactly halfLifeDays
+        return Float(exp(-ageInDays * log(2) / halfLifeDays))
+    }
+
+    /// BM25 scoring for memories — simplified version of KnowledgeBaseStore.computeBM25Scores.
+    /// Memory pools are small (≤100) so no inverted index needed.
+    private func computeMemoryBM25(queryWords: Set<String>, pool: [MemoryEntry]) -> [UUID: Float] {
+        guard !queryWords.isEmpty, !pool.isEmpty else { return [:] }
+
+        let n = Double(pool.count)
+        let k1 = 1.2
+        let b = 0.75
+
+        // Compute per-memory word sets and average document length
+        var memoryWordSets: [(UUID, Set<String>)] = []
+        var totalWordCount: Double = 0
+        for entry in pool {
+            let words = Set(entry.keywords).union(SharedDataManager.tokenize(entry.content))
+            memoryWordSets.append((entry.id, words))
+            totalWordCount += Double(words.count)
+        }
+        let avgDL = totalWordCount / n
+
+        // IDF for each query term
+        var termIDF: [String: Double] = [:]
+        for word in queryWords {
+            let docsContaining = memoryWordSets.count(where: { $0.1.contains(word) })
+            termIDF[word] = log((n - Double(docsContaining) + 0.5) / (Double(docsContaining) + 0.5) + 1.0)
+        }
+
+        // Theoretical upper bound for normalization
+        let shortDocDenom = 1.0 + k1 * (1.0 - b)
+        let theoreticalMax = termIDF.values.reduce(0.0) { $0 + $1 * (k1 + 1.0) / shortDocDenom }
+        guard theoreticalMax > 0 else { return [:] }
+
+        // Score each memory
+        var scores: [UUID: Float] = [:]
+        for (memID, words) in memoryWordSets {
+            let dl = Double(words.count)
+            var score: Double = 0
+            for queryWord in queryWords {
+                guard let idf = termIDF[queryWord], words.contains(queryWord) else { continue }
+                let numerator = k1 + 1.0
+                let denominator = 1.0 + k1 * (1.0 - b + b * dl / avgDL)
+                score += idf * (numerator / denominator)
+            }
+            if score > 0 {
+                scores[memID] = Float(score / theoreticalMax)
+            }
+        }
+        return scores
     }
 
     /// Keyword-based fallback retrieval for memories without embeddings.
-    private func retrieveByKeywords(query: String, from pool: [MemoryEntry], limit: Int) -> [MemoryEntry] {
+    private func retrieveByKeywords(query: String, from pool: [MemoryEntry], limit: Int, recencyWeight: Float = 0.15) -> [MemoryEntry] {
         let queryWords = tokenize(query)
         guard !queryWords.isEmpty else { return [] }
         let queryCount = Double(queryWords.count)
+        let relevanceWeight = 1.0 - Double(recencyWeight)
 
         let scored = pool.compactMap { entry -> (MemoryEntry, Double)? in
             let allEntryWords = Set(entry.keywords).union(tokenize(entry.content))
@@ -154,9 +227,8 @@ final class MemoryStore {
             let normalizedScore = matchedWords / queryCount
             guard normalizedScore >= 0.25 else { return nil }
 
-            let ageInDays = max(1, -entry.createdAt.timeIntervalSinceNow / 86400)
-            let recencyBonus = 1.0 / log2(ageInDays + 1)
-            return (entry, normalizedScore + recencyBonus * 0.05)
+            let decay = Double(Self.timeDecay(for: entry.createdAt))
+            return (entry, relevanceWeight * normalizedScore + Double(recencyWeight) * decay)
         }
 
         return scored
@@ -213,13 +285,24 @@ final class MemoryStore {
         saveToDisk()
     }
 
-    /// Extract memories from a conversation summary using the on-device model
+    /// Extract memories from a conversation summary using the on-device model.
+    /// Uses few-shot prompting with explicit format examples for reliable structured output.
     func extractMemories(from transcript: String, conversationTitle: String, domainID: UUID = KnowledgeDomain.generalID) async {
         let extractionSession = LanguageModelSession {
             """
-            Extract 1-3 key facts or decisions from this conversation.
-            Format: [keyword1, keyword2] Fact text.
-            If nothing notable, respond: NONE
+            You are a fact extractor. Your role is to identify 1-3 important facts, decisions, or preferences from a conversation transcript.
+
+            Instructions:
+            - Extract only concrete, reusable facts (e.g. preferences, decisions, names, dates, technical choices).
+            - Ignore greetings, filler, and questions that were not answered.
+            - Each fact must be a self-contained sentence that makes sense without the original conversation.
+            - Format each fact on its own line as: [keyword1, keyword2] Fact sentence here.
+            - If no notable facts exist, respond with exactly: NONE
+
+            Examples:
+            [python, preference] The user prefers Python for scripting tasks.
+            [meeting, tuesday] Weekly team meeting is scheduled for Tuesdays at 10am.
+            [api, openai] The project uses the OpenAI API with GPT-4 for summarization.
             """
         }
 
@@ -228,13 +311,24 @@ final class MemoryStore {
             maximumResponseTokens: 200
         )
 
+        // Guard against empty or trivially short transcripts
+        let trimmedTranscript = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmedTranscript.count >= 20 else { return }
+
         do {
-            let response = try await extractionSession.respond(to: transcript, options: extractionOptions)
+            let response = try await extractionSession.respond(to: trimmedTranscript, options: extractionOptions)
             let lines = response.content.components(separatedBy: "\n").filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
 
             for line in lines {
-                let trimmedLine = line.trimmingCharacters(in: .whitespaces)
-                if trimmedLine.uppercased() == "NONE" || trimmedLine.isEmpty { continue }
+                // Strip leading bullets, dashes, or numbering (e.g. "- [kw] fact" or "1. [kw] fact")
+                var trimmedLine = line.trimmingCharacters(in: .whitespaces)
+                if let firstBracket = trimmedLine.firstIndex(of: "["), firstBracket != trimmedLine.startIndex {
+                    // Remove any prefix before the opening bracket (bullets, numbering, etc.)
+                    trimmedLine = String(trimmedLine[firstBracket...])
+                }
+                trimmedLine = trimmedLine.trimmingCharacters(in: .whitespaces)
+
+                if trimmedLine.uppercased().contains("NONE") || trimmedLine.isEmpty { continue }
 
                 // Parse "[keyword1, keyword2] fact text"
                 if trimmedLine.hasPrefix("["),
@@ -260,7 +354,7 @@ final class MemoryStore {
                 }
             }
         } catch {
-            // Extraction failed silently — not critical
+            AppLogger.chat.warning("Memory extraction failed: \(error.localizedDescription)")
         }
     }
 
@@ -288,6 +382,17 @@ final class MemoryStore {
         }
         if changed { saveToDisk() }
     }
+
+    // MARK: - Test Support
+
+    #if DEBUG
+    /// Expose BM25 scores for testing. For unit tests only.
+    func testBM25Scores(query: String, domainID: UUID = KnowledgeDomain.generalID) -> [UUID: Float] {
+        let domainMemories = memories.filter { ($0.domainID ?? KnowledgeDomain.generalID) == domainID }
+        let queryWords = SharedDataManager.tokenize(query)
+        return computeMemoryBM25(queryWords: queryWords, pool: domainMemories)
+    }
+    #endif
 }
 
 // MARK: - Chat View Model
@@ -341,9 +446,17 @@ final class ChatViewModel: Identifiable {
     private static let estimatedMaxTokens = 4096.0
     private static let charsPerToken = 3.5
 
-    /// Concise system prompt optimised for the small on-device model.
-    /// Shorter instructions leave more context for the actual conversation.
-    static let defaultInstructions = "Be helpful, friendly, and concise. Answer directly."
+    /// System prompt optimised for the on-device model.
+    /// Follows prompt engineering best practices: Role, Instruction, Tone, and Formatting.
+    /// Kept compact to preserve context budget on the ~3B parameter model.
+    static let defaultInstructions = """
+        You are Engram, a knowledgeable and friendly on-device AI assistant. \
+        Your role is to help the user by answering questions clearly, solving problems step by step, and assisting with everyday tasks. \
+        When given reference material, use it only if directly relevant to the question. \
+        Respond concisely in a warm, conversational tone. \
+        Use short paragraphs and bullet points for clarity when listing multiple items. \
+        If you are unsure about something, say so honestly rather than guessing.
+        """
 
     var activeInstructions: String {
         customSystemPrompt?.isEmpty == false
@@ -369,7 +482,12 @@ final class ChatViewModel: Identifiable {
         } else if let summary = conversationSummary, !summary.isEmpty {
             let inst = instructions
             return LanguageModelSession {
-                "\(inst)\nContext: \(summary)"
+                """
+                \(inst)
+
+                Conversation context (summary of prior messages): \(summary)
+                Continue the conversation naturally from where it left off.
+                """
             }
         } else {
             let inst = instructions
@@ -653,37 +771,68 @@ final class ChatViewModel: Identifiable {
 
         // Retrieve memories (scoped to conversation's domain)
         if ragSettings.memoryRetrievalEnabled, let store = memoryStore {
-            let relevantMemories = store.retrieve(for: userText, domainID: domainID, limit: ragSettings.maxMemoryResults)
+            let relevantMemories = store.retrieve(for: userText, domainID: domainID, limit: ragSettings.maxMemoryResults, lexicalWeight: ragSettings.lexicalWeight, recencyWeight: ragSettings.recencyWeight)
             if !relevantMemories.isEmpty {
                 memoryCount = relevantMemories.count
                 let block = relevantMemories.map { "- \($0.content)" }.joined(separator: "\n")
-                contextBlocks.append("Remembered context from previous conversations:\n\(block)")
+                contextBlocks.append("**Memories** (facts recalled from previous conversations):\n\(block)")
                 usedChars += block.count
             }
         }
 
-        // Retrieve document chunks (scoped to conversation's domain)
+        // Retrieve document chunks (scoped to conversation's domain).
+        // Strategy: inject chunk summaries for breadth (5x denser), then append
+        // the top 1-2 full chunks for depth when the budget allows.
         if ragSettings.knowledgeBaseRetrievalEnabled, let kbStore = knowledgeBaseStore, usedChars < maxContextChars {
             let budget = maxContextChars - usedChars
-            let relevantChunks = kbStore.retrieve(for: userText, domainID: domainID, limit: ragSettings.maxDocumentChunks)
+            // Retrieve more chunks than usual — summaries are small, so we can fit more context
+            let retrievalLimit = ragSettings.maxDocumentChunks * 2
+            let relevantChunks = kbStore.retrieve(for: userText, domainID: domainID, limit: retrievalLimit, lexicalWeight: ragSettings.lexicalWeight)
             if !relevantChunks.isEmpty {
-                // Build a lookup dictionary once instead of O(N) linear search per chunk
                 let kbLookup = Dictionary(uniqueKeysWithValues: kbStore.knowledgeBases.map { ($0.id, $0.name) })
-                var chunkTexts: [String] = []
-                var chunkChars = 0
+                var summaryTexts: [String] = []
+                var fullTexts: [String] = []
+                var totalChars = 0
+
+                // Phase 1: Add chunk summaries for broad coverage
                 for chunk in relevantChunks {
-                    let text = "[\(chunk.locationLabel)] \(chunk.content)"
-                    if chunkChars + text.count > budget { break }
-                    chunkTexts.append(text)
-                    chunkChars += text.count
+                    let text: String
+                    if let summary = chunk.summary, !summary.isEmpty {
+                        text = "[\(chunk.locationLabel)] \(summary)"
+                    } else {
+                        // No summary — use truncated content as fallback
+                        text = "[\(chunk.locationLabel)] \(String(chunk.content.prefix(200)))"
+                    }
+                    if totalChars + text.count > budget { break }
+                    summaryTexts.append(text)
+                    totalChars += text.count
                     chunkCount += 1
-                    // Resolve KB name via O(1) dictionary lookup
                     if let name = kbLookup[chunk.knowledgeBaseID] {
                         docNames.insert(name)
                     }
                 }
-                if !chunkTexts.isEmpty {
-                    contextBlocks.append("Relevant knowledge base excerpts:\n\(chunkTexts.joined(separator: "\n---\n"))")
+
+                // Phase 2: Append 1-2 full verbatim chunks for depth (top-ranked only)
+                let fullChunkLimit = min(2, relevantChunks.count)
+                for chunk in relevantChunks.prefix(fullChunkLimit) {
+                    // Skip if the chunk is short enough that the summary IS the content
+                    guard chunk.content.count > 200 else { continue }
+                    let fullText = "[\(chunk.locationLabel)] \(chunk.content)"
+                    if totalChars + fullText.count > budget { break }
+                    fullTexts.append(fullText)
+                    totalChars += fullText.count
+                }
+
+                var block = ""
+                if !summaryTexts.isEmpty {
+                    block += "**Knowledge Base Summaries** (condensed from imported documents):\n\(summaryTexts.joined(separator: "\n"))"
+                }
+                if !fullTexts.isEmpty {
+                    if !block.isEmpty { block += "\n\n" }
+                    block += "**Key Excerpts** (verbatim for reference):\n\(fullTexts.joined(separator: "\n---\n"))"
+                }
+                if !block.isEmpty {
+                    contextBlocks.append(block)
                 }
             }
         }
@@ -698,16 +847,17 @@ final class ChatViewModel: Identifiable {
             return (userText, ragContext)
         }
 
-        // Format: user question FIRST, then supplementary context AFTER.
-        // This ensures the model prioritises the question and its own knowledge,
-        // treating the retrieved context as optional reference material only.
+        // Format: user question FIRST, then structured reference context AFTER.
+        // Clear RAG integration instructions help the model use retrieved content appropriately.
         let enriched = """
         \(userText)
 
         ---
-        Note: The following is supplementary reference material that MAY be relevant. \
-        Only use it if it directly relates to the question above. \
-        Otherwise rely on your own knowledge.
+        **Reference Material** (retrieved from your knowledge base and memory):
+        Use the following information to support your answer when it is directly relevant to the question above. \
+        If the reference material does not relate to the question, ignore it and rely on your own knowledge. \
+        When you do use reference material, incorporate it naturally — do not simply repeat it verbatim. \
+        Never mention that you are using "reference material" or "retrieved context" in your response.
 
         \(contextBlocks.joined(separator: "\n\n"))
         """
@@ -717,7 +867,8 @@ final class ChatViewModel: Identifiable {
     // MARK: - Private
 
     private func streamResponse(to prompt: String) async throws {
-        let stream = session.streamResponse(to: prompt)
+        let options = ragSettings.chatGenerationOptions
+        let stream = session.streamResponse(to: prompt, options: options)
         var fullText = ""
         for try await partial in stream {
             // Support cancellation — keep partial text
@@ -744,7 +895,7 @@ final class ChatViewModel: Identifiable {
                 try await streamResponse(to: originalPrompt)
                 turnCount = 1
             } catch {
-                messages.append(Message(role: .system, content: "Unable to continue — the message may be too long for on-device AI."))
+                messages.append(Message(role: .system, content: "Unable to process this message — it may exceed the on-device model's context limit. Try breaking your message into smaller parts."))
             }
         default:
             messages.append(Message(role: .system, content: "Error: \(error.localizedDescription)"))
@@ -764,9 +915,19 @@ final class ChatViewModel: Identifiable {
             await store.extractMemories(from: transcript, conversationTitle: title, domainID: domainID)
         }
 
-        // Summarise for the new session — use greedy sampling for a deterministic, focused summary
+        // Summarise for the new session — use greedy sampling for a deterministic, focused summary.
+        // Uses instructive prompting with clear formatting guidance for reliable continuation.
         let summarySession = LanguageModelSession {
-            "Summarize this conversation in 2 concise sentences. State only topics discussed and decisions made."
+            """
+            You are a conversation summarizer. Your role is to create a brief context summary that allows a conversation to continue seamlessly.
+
+            Instructions:
+            - Write exactly 2-3 sentences summarizing the conversation so far.
+            - Prioritize: (1) the main topic or question, (2) any decisions or conclusions reached, (3) the user's current need or next step.
+            - Use third-person perspective (e.g. "The user asked about..." or "They discussed...").
+            - Do not include greetings, filler, or meta-commentary.
+            - The summary must be self-contained — a reader should understand the conversation state without seeing the original messages.
+            """
         }
 
         let greedyOptions = GenerationOptions(
@@ -791,7 +952,7 @@ final class ChatViewModel: Identifiable {
         session.prewarm()
         turnCount = 0
 
-        messages.append(Message(role: .system, content: "Context refreshed — I still remember the key points."))
+        messages.append(Message(role: .system, content: "Context window refreshed. The conversation summary has been preserved so I can continue seamlessly."))
     }
 
     private func updateContextEstimate() {
@@ -847,6 +1008,31 @@ struct RAGContext {
     }
 }
 
+// MARK: - Sampling Mode Setting
+
+/// Persistent representation of the sampling strategy for the main chat.
+enum SamplingModeSetting: String, Codable, CaseIterable, Sendable {
+    case greedy   = "greedy"
+    case topK     = "topK"
+    case topP     = "topP"
+
+    var label: String {
+        switch self {
+        case .greedy: return "Greedy"
+        case .topK:   return "Top-K"
+        case .topP:   return "Top-P"
+        }
+    }
+
+    var description: String {
+        switch self {
+        case .greedy: return "Deterministic — always picks the most likely token"
+        case .topK:   return "Samples from the K most probable tokens"
+        case .topP:   return "Samples from tokens covering P% cumulative probability"
+        }
+    }
+}
+
 struct RAGSettings: Codable, Sendable {
     var memoryRetrievalEnabled: Bool = true
     var knowledgeBaseRetrievalEnabled: Bool = true
@@ -855,7 +1041,54 @@ struct RAGSettings: Codable, Sendable {
     var contextBudgetCharacters: Int = 1500
     var autoExtractMemories: Bool = true
 
+    // MARK: Generation Hyperparameters
+
+    /// Temperature controls randomness (0 = focused, 2 = creative). Default 1.0.
+    var temperature: Double = 1.0
+    /// Sampling strategy for the main chat session.
+    var samplingMode: SamplingModeSetting = .topK
+    /// Top-K value: number of top tokens to sample from (used when samplingMode == .topK).
+    var topKValue: Int = 40
+    /// Top-P value: cumulative probability threshold (used when samplingMode == .topP).
+    var topPValue: Double = 0.9
+    /// Weight given to BM25 lexical scores in hybrid retrieval (0 = pure dense, 1 = pure lexical).
+    var lexicalWeight: Float = 0.3
+    /// Weight given to recency in memory retrieval (0 = ignore age, higher = prefer recent).
+    /// Uses exponential decay with a 45-day half-life.
+    var recencyWeight: Float = 0.15
+
     static let `default` = RAGSettings()
+
+    /// Backward-compatible decoding: old persisted settings without generation fields use defaults.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        memoryRetrievalEnabled = try container.decodeIfPresent(Bool.self, forKey: .memoryRetrievalEnabled) ?? true
+        knowledgeBaseRetrievalEnabled = try container.decodeIfPresent(Bool.self, forKey: .knowledgeBaseRetrievalEnabled) ?? true
+        maxMemoryResults = try container.decodeIfPresent(Int.self, forKey: .maxMemoryResults) ?? 2
+        maxDocumentChunks = try container.decodeIfPresent(Int.self, forKey: .maxDocumentChunks) ?? 3
+        contextBudgetCharacters = try container.decodeIfPresent(Int.self, forKey: .contextBudgetCharacters) ?? 1500
+        autoExtractMemories = try container.decodeIfPresent(Bool.self, forKey: .autoExtractMemories) ?? true
+        temperature = try container.decodeIfPresent(Double.self, forKey: .temperature) ?? 1.0
+        samplingMode = try container.decodeIfPresent(SamplingModeSetting.self, forKey: .samplingMode) ?? .topK
+        topKValue = try container.decodeIfPresent(Int.self, forKey: .topKValue) ?? 40
+        topPValue = try container.decodeIfPresent(Double.self, forKey: .topPValue) ?? 0.9
+        lexicalWeight = try container.decodeIfPresent(Float.self, forKey: .lexicalWeight) ?? 0.3
+        recencyWeight = try container.decodeIfPresent(Float.self, forKey: .recencyWeight) ?? 0.15
+    }
+
+    /// Build FoundationModels GenerationOptions from the current settings.
+    var chatGenerationOptions: GenerationOptions {
+        let sampling: GenerationOptions.SamplingMode
+        switch samplingMode {
+        case .greedy:
+            sampling = .greedy
+        case .topK:
+            sampling = .random(top: topKValue)
+        case .topP:
+            sampling = .random(probabilityThreshold: topPValue)
+        }
+        return GenerationOptions(temperature: temperature, sampling: sampling)
+    }
 }
 
 @Observable

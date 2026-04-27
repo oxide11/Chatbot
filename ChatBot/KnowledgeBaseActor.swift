@@ -94,6 +94,44 @@ actor KnowledgeBaseActor {
         }
     }
 
+    /// Update the summary for a domain.
+    func updateDomainSummary(id: UUID, summary: String) throws {
+        let predicate = #Predicate<SDKnowledgeDomain> { $0.id == id }
+        let descriptor = FetchDescriptor<SDKnowledgeDomain>(predicate: predicate)
+        if let sd = try modelContext.fetch(descriptor).first {
+            sd.summary = summary
+            try modelContext.save()
+            AppLogger.kbActor.info("Updated summary for domain '\(sd.name)'")
+        }
+    }
+
+    /// Update the summary for a single chunk.
+    func updateChunkSummary(chunkID: UUID, summary: String) throws {
+        let predicate = #Predicate<SDDocumentChunk> { $0.id == chunkID }
+        let descriptor = FetchDescriptor<SDDocumentChunk>(predicate: predicate)
+        if let sd = try modelContext.fetch(descriptor).first {
+            sd.summary = summary
+            try modelContext.save()
+        }
+    }
+
+    /// Batch-update summaries for multiple chunks (more efficient than individual saves).
+    func updateChunkSummaries(_ summaries: [UUID: String]) throws {
+        let allDescriptor = FetchDescriptor<SDDocumentChunk>()
+        let allChunks = try modelContext.fetch(allDescriptor)
+        var updated = 0
+        for chunk in allChunks {
+            if let summary = summaries[chunk.id] {
+                chunk.summary = summary
+                updated += 1
+            }
+        }
+        if updated > 0 {
+            try modelContext.save()
+            AppLogger.kbActor.info("Batch-updated summaries for \(updated) chunks")
+        }
+    }
+
     // MARK: - Insert
 
     /// Insert a new knowledge base with all its chunks, optionally in a domain.

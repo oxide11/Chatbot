@@ -58,18 +58,27 @@ struct DynamicWorkerTool: Tool {
         // Record this invocation for UI notification
         tracker?.record(displayName)
 
-        // Create an ephemeral worker session — it lives only for this call
+        // Guard against empty tasks — return early with a clear message for the Manager
+        let task = arguments.task.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !task.isEmpty else {
+            return "No text was provided to process. Please include the text you want me to work on."
+        }
+
+        // Create an ephemeral worker session — it lives only for this call.
+        // Workers use greedy sampling for deterministic, consistent outputs.
         let instructions = workerSystemInstructions
         let workerSession = LanguageModelSession {
             instructions
         }
 
+        let options = GenerationOptions(sampling: .greedy)
+
         do {
-            let response = try await workerSession.respond(to: arguments.task)
+            let response = try await workerSession.respond(to: task, options: options)
             return response.content
         } catch {
             // Return errors as text so the Manager can report gracefully
-            return "Worker '\(displayName)' encountered an error: \(error.localizedDescription)"
+            return "The \(displayName) worker could not complete this task. Please try rephrasing or handling this directly."
         }
         // workerSession is deallocated here — ephemeral by design
     }

@@ -1,4 +1,5 @@
 import Foundation
+import FoundationModels
 import PDFKit
 import Compression
 import SwiftData
@@ -10,12 +11,14 @@ enum DocumentType: String, Codable, CaseIterable, Sendable {
     case pdf
     case epub
     case text
+    case markdown
 
     var icon: String {
         switch self {
         case .pdf: return "doc.richtext"
         case .epub: return "book"
         case .text: return "doc.text"
+        case .markdown: return "text.badge.star"
         }
     }
 
@@ -24,6 +27,7 @@ enum DocumentType: String, Codable, CaseIterable, Sendable {
         case .pdf: return "PDF"
         case .epub: return "ePUB"
         case .text: return "Text"
+        case .markdown: return "Markdown"
         }
     }
 }
@@ -90,7 +94,11 @@ struct DocumentChunk: Identifiable, Codable, Sendable {
     /// Optional for backward compatibility with chunks created before embeddings.
     var embedding: [Double]?
 
-    nonisolated init(id: UUID = UUID(), knowledgeBaseID: UUID, content: String, keywords: [String], locationLabel: String, index: Int, embedding: [Double]? = nil) {
+    /// LLM-generated 1-2 sentence summary of this chunk's content.
+    /// Used for dense context injection — summaries are ~5x smaller than raw chunks.
+    var summary: String?
+
+    nonisolated init(id: UUID = UUID(), knowledgeBaseID: UUID, content: String, keywords: [String], locationLabel: String, index: Int, embedding: [Double]? = nil, summary: String? = nil) {
         self.id = id
         self.knowledgeBaseID = knowledgeBaseID
         self.content = content
@@ -98,6 +106,7 @@ struct DocumentChunk: Identifiable, Codable, Sendable {
         self.locationLabel = locationLabel
         self.index = index
         self.embedding = embedding
+        self.summary = summary
     }
 }
 
@@ -113,7 +122,7 @@ struct IngestionJob: Identifiable {
     /// Whether this job has finished (completed or failed).
     var isFinished: Bool {
         switch status {
-        case .completed, .failed: return true
+        case .completed, .completedWithWarnings, .failed: return true
         case .queued, .processing: return false
         }
     }
@@ -122,6 +131,8 @@ struct IngestionJob: Identifiable {
         case queued
         case processing
         case completed
+        /// Completed but with non-fatal issues (e.g. skipped pages/chapters, persistence failure).
+        case completedWithWarnings(String)
         case failed(String)
 
         var label: String {
@@ -129,6 +140,7 @@ struct IngestionJob: Identifiable {
             case .queued: return "Queued"
             case .processing: return "Processing…"
             case .completed: return "Done"
+            case .completedWithWarnings(let msg): return msg
             case .failed(let msg): return msg
             }
         }
@@ -138,7 +150,8 @@ struct IngestionJob: Identifiable {
             case .queued: return "clock"
             case .processing: return "arrow.trianglehead.2.clockwise"
             case .completed: return "checkmark.circle.fill"
-            case .failed: return "exclamationmark.triangle.fill"
+            case .completedWithWarnings: return "exclamationmark.triangle.fill"
+            case .failed: return "xmark.circle.fill"
             }
         }
 
@@ -147,6 +160,7 @@ struct IngestionJob: Identifiable {
             case .queued: return "secondary"
             case .processing: return "blue"
             case .completed: return "green"
+            case .completedWithWarnings: return "orange"
             case .failed: return "red"
             }
         }
@@ -428,30 +442,51 @@ final class KnowledgeBaseStore {
             if accessing { job.url.stopAccessingSecurityScopedResource() }
 
             // Update UI state back on MainActor
-            if let idx = ingestionQueue.firstIndex(where: { $0.id == job.id }) {
-                switch outcome {
-                case .success(var result):
-                    ingestionQueue[idx].status = .completed
-                    result.kb.domainID = job.domainID
-                    knowledgeBases.insert(result.kb, at: 0)
-                    chunkCache[result.kb.id] = result.chunks
-                    invalidateEmbeddingMatrix(for: job.domainID)
-                    invertedKeywordIndex.removeAll()
+            guard let idx = ingestionQueue.firstIndex(where: { $0.id == job.id }) else {
+                // Job was removed from queue during processing (race condition) — log and skip
+                AppLogger.kbStore.warning("Ingestion job \(job.fileName) completed but was removed from queue")
+                continue
+            }
 
-                    // Persist to SwiftData (fire-and-forget — in-memory state is already updated)
-                    if let actor = dbActor {
-                        let domainID = job.domainID
-                        Task {
-                            do {
-                                try await actor.insertKnowledgeBase(result.kb, chunks: result.chunks, domainID: domainID)
-                            } catch {
-                                AppLogger.kbStore.error("Failed persisting ingestion result: \(error.localizedDescription)")
-                            }
-                        }
-                    }
-                case .failure(let reason):
-                    ingestionQueue[idx].status = .failed(reason)
+            switch outcome {
+            case .success(var result):
+                result.kb.domainID = job.domainID
+                knowledgeBases.insert(result.kb, at: 0)
+                chunkCache[result.kb.id] = result.chunks
+                invalidateEmbeddingMatrix(for: job.domainID)
+                invertedKeywordIndex.removeAll()
+
+                // Collect warnings for user display
+                var allWarnings = result.warnings
+
+                // Check if embeddings were expected but unavailable
+                if result.kb.embeddingModelID == nil {
+                    allWarnings.append("Semantic search unavailable — using keyword matching only")
                 }
+
+                // Persist to SwiftData — await result so we can surface failures
+                if let actor = dbActor {
+                    do {
+                        try await actor.insertKnowledgeBase(result.kb, chunks: result.chunks, domainID: job.domainID)
+                    } catch {
+                        allWarnings.append("Failed to save to database — data may not persist after restart")
+                        AppLogger.kbStore.error("Failed persisting ingestion result: \(error.localizedDescription)")
+                    }
+                }
+
+                if allWarnings.isEmpty {
+                    ingestionQueue[idx].status = .completed
+                } else {
+                    ingestionQueue[idx].status = .completedWithWarnings("Done (\(allWarnings.count) warning\(allWarnings.count == 1 ? "" : "s"))")
+                    AppLogger.kbStore.warning("Ingestion warnings for '\(job.fileName)': \(allWarnings.joined(separator: "; "))")
+                }
+
+                // Regenerate the domain summary now that new content has been added
+                Task { [weak self] in
+                    await self?.regenerateDomainSummary(for: job.domainID)
+                }
+            case .failure(let reason):
+                ingestionQueue[idx].status = .failed(reason)
             }
             updateOverallProgress()
         }
@@ -471,7 +506,7 @@ final class KnowledgeBaseStore {
         var completed = 0.0
         for job in ingestionQueue {
             switch job.status {
-            case .completed, .failed: completed += 1.0
+            case .completed, .completedWithWarnings, .failed: completed += 1.0
             case .processing: completed += 0.5
             case .queued: break
             }
@@ -485,6 +520,8 @@ final class KnowledgeBaseStore {
     private struct IngestionResult: Sendable {
         var kb: KnowledgeBase
         let chunks: [DocumentChunk]
+        /// Non-fatal warnings collected during extraction (e.g. skipped pages/chapters).
+        var warnings: [String] = []
     }
 
     /// Outcome of a background ingestion job.
@@ -499,24 +536,44 @@ final class KnowledgeBaseStore {
         url: URL
     ) async -> IngestionOutcome {
         let ext = url.pathExtension.lowercased()
-        guard ext == "pdf" || ext == "epub" || ext == "txt" else {
+        guard ext == "pdf" || ext == "epub" || ext == "txt" || ext == "md" || ext == "markdown" else {
             return .failure("Unsupported: .\(ext)")
         }
 
         let docType: DocumentType
         if ext == "pdf" { docType = .pdf }
         else if ext == "epub" { docType = .epub }
+        else if ext == "md" || ext == "markdown" { docType = .markdown }
         else { docType = .text }
 
         let fileSize = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int64) ?? 0
         let kbID = UUID()
+        var warnings: [String] = []
 
         // Extract text (CPU-heavy)
         let sections: [(label: String, text: String)]
         if docType == .pdf {
+            let pdfDoc = PDFDocument(url: url)
+            let totalPages = pdfDoc?.pageCount ?? 0
             sections = extractTextFromPDFBackground(at: url)
+            if totalPages > 0 && sections.count < totalPages {
+                let skipped = totalPages - sections.count
+                warnings.append("\(skipped) of \(totalPages) page\(skipped == 1 ? "" : "s") had no extractable text")
+            }
         } else if docType == .epub {
-            sections = (try? extractTextFromEPUBBackground(at: url)) ?? []
+            if let result = try? extractTextFromEPUBBackground(at: url) {
+                sections = result
+            } else {
+                warnings.append("EPUB extraction encountered errors — some chapters may be missing")
+                sections = []
+            }
+        } else if docType == .markdown {
+            if let textContent = try? String(contentsOf: url, encoding: .utf8),
+               !textContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                sections = extractSectionsFromMarkdown(textContent)
+            } else {
+                sections = []
+            }
         } else {
             // Plain text file
             if let textContent = try? String(contentsOf: url, encoding: .utf8),
@@ -531,18 +588,31 @@ final class KnowledgeBaseStore {
             return .failure("No text content found")
         }
 
-        // Chunk all sections (CPU-heavy)
+        // Chunk all sections (CPU-heavy).
+        // Markdown uses structure-aware chunking; other types use general paragraph-based chunking.
         var allChunks: [DocumentChunk] = []
         var chunkIndex = 0
 
-        for section in sections {
-            let sectionChunks = chunkTextBackground(
-                section.text,
-                locationLabel: section.label,
-                knowledgeBaseID: kbID,
-                startIndex: &chunkIndex
-            )
-            allChunks.append(contentsOf: sectionChunks)
+        if docType == .markdown {
+            for section in sections {
+                let sectionChunks = chunkMarkdownSectionBackground(
+                    section.text,
+                    locationLabel: section.label,
+                    knowledgeBaseID: kbID,
+                    startIndex: &chunkIndex
+                )
+                allChunks.append(contentsOf: sectionChunks)
+            }
+        } else {
+            for section in sections {
+                let sectionChunks = chunkTextBackground(
+                    section.text,
+                    locationLabel: section.label,
+                    knowledgeBaseID: kbID,
+                    startIndex: &chunkIndex
+                )
+                allChunks.append(contentsOf: sectionChunks)
+            }
         }
 
         guard !allChunks.isEmpty else {
@@ -557,6 +627,11 @@ final class KnowledgeBaseStore {
             }
         }
 
+        // Generate chunk summaries using the on-device LLM.
+        // Each summary is 1-2 sentences — ~5x smaller than the raw chunk.
+        // This runs serially to avoid overwhelming the on-device model.
+        await generateChunkSummaries(for: &allChunks)
+
         // Build the KB metadata (persistence happens on the MainActor after return)
         let kb = KnowledgeBase(
             id: kbID,
@@ -567,7 +642,37 @@ final class KnowledgeBaseStore {
             embeddingModelID: embeddingService.isAvailable ? embeddingService.modelIdentifier : nil
         )
 
-        return .success(IngestionResult(kb: kb, chunks: allChunks))
+        return .success(IngestionResult(kb: kb, chunks: allChunks, warnings: warnings))
+    }
+
+    /// Generate concise summaries for each chunk using the on-device LLM.
+    /// Runs during ingestion — one LLM call per chunk with greedy sampling for consistency.
+    nonisolated private static func generateChunkSummaries(for chunks: inout [DocumentChunk]) async {
+        // Only summarize chunks with enough content to warrant it
+        let minContentLength = 80
+        for i in chunks.indices {
+            let content = chunks[i].content
+            guard content.count >= minContentLength else { continue }
+
+            do {
+                let session = LanguageModelSession {
+                    """
+                    You are a concise summarizer. Given a text passage, write exactly 1-2 sentences \
+                    that capture the key facts and main point. Do not add commentary or opinions. \
+                    If the passage contains code, describe what the code does.
+                    """
+                }
+                let options = GenerationOptions(sampling: .greedy, maximumResponseTokens: 80)
+                let response = try await session.respond(to: content, options: options)
+                let summary = response.content.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !summary.isEmpty {
+                    chunks[i].summary = summary
+                }
+            } catch {
+                // Non-fatal — chunk still works without a summary
+                AppLogger.kbStore.warning("Chunk summary generation failed for chunk \(chunks[i].index): \(error.localizedDescription)")
+            }
+        }
     }
 
     // MARK: - Background-safe Extraction & Chunking (nonisolated static)
@@ -711,6 +816,244 @@ final class KnowledgeBaseStore {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    // MARK: - Markdown Extraction & Chunking
+
+    /// Parse a Markdown document into sections based on heading hierarchy.
+    /// Each section gets a descriptive label derived from the heading path
+    /// (e.g. "Installation > Prerequisites") for better retrieval context.
+    nonisolated private static func extractSectionsFromMarkdown(_ text: String) -> [(label: String, text: String)] {
+        let lines = text.components(separatedBy: "\n")
+        var sections: [(label: String, text: String)] = []
+        var currentLabel = "Introduction"
+        var currentLines: [String] = []
+
+        // Track the heading hierarchy for breadcrumb labels
+        var headingStack: [(level: Int, title: String)] = []
+
+        for line in lines {
+            // Detect ATX-style headings: # Title, ## Title, etc.
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if let headingMatch = parseMarkdownHeading(trimmed) {
+                // Flush the current section
+                let sectionText = currentLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+                if !sectionText.isEmpty {
+                    sections.append((currentLabel, sectionText))
+                }
+
+                // Update heading stack: pop any headings at the same or deeper level
+                while let last = headingStack.last, last.level >= headingMatch.level {
+                    headingStack.removeLast()
+                }
+                headingStack.append((headingMatch.level, headingMatch.title))
+
+                // Build breadcrumb label from heading stack
+                currentLabel = headingStack.map(\.title).joined(separator: " > ")
+                currentLines = []
+            } else {
+                currentLines.append(line)
+            }
+        }
+
+        // Flush final section
+        let finalText = currentLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        if !finalText.isEmpty {
+            sections.append((currentLabel, finalText))
+        }
+
+        // If no headings were found, return the whole document as a single section
+        if sections.isEmpty {
+            let whole = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !whole.isEmpty {
+                sections.append(("Full Text", whole))
+            }
+        }
+
+        return sections
+    }
+
+    /// Parse a Markdown ATX heading line (e.g. "## My Title") into its level and title.
+    /// Returns nil if the line is not a heading.
+    nonisolated private static func parseMarkdownHeading(_ line: String) -> (level: Int, title: String)? {
+        guard line.hasPrefix("#") else { return nil }
+        var level = 0
+        for char in line {
+            if char == "#" { level += 1 }
+            else { break }
+        }
+        guard level >= 1, level <= 6 else { return nil }
+        let title = String(line.dropFirst(level)).trimmingCharacters(in: .whitespaces)
+        guard !title.isEmpty else { return nil }
+        return (level, title)
+    }
+
+    /// Strip Markdown formatting syntax for cleaner text used in keyword extraction.
+    /// Preserves the readable text content but removes: headings markers, bold/italic,
+    /// links, images, code fences, and HTML tags.
+    nonisolated private static func stripMarkdownFormatting(_ text: String) -> String {
+        text
+            // Remove code fences (```...```) — keep the code content
+            .replacingOccurrences(of: "```[a-zA-Z]*\\n?", with: "", options: .regularExpression)
+            // Remove inline code backticks
+            .replacingOccurrences(of: "`([^`]+)`", with: "$1", options: .regularExpression)
+            // Remove images: ![alt](url)
+            .replacingOccurrences(of: "!\\[[^\\]]*\\]\\([^)]*\\)", with: "", options: .regularExpression)
+            // Convert links [text](url) to just text
+            .replacingOccurrences(of: "\\[([^\\]]+)\\]\\([^)]*\\)", with: "$1", options: .regularExpression)
+            // Remove bold **text** or __text__
+            .replacingOccurrences(of: "\\*\\*([^*]+)\\*\\*", with: "$1", options: .regularExpression)
+            .replacingOccurrences(of: "__([^_]+)__", with: "$1", options: .regularExpression)
+            // Remove italic *text* or _text_ (single markers)
+            .replacingOccurrences(of: "(?<![*])\\*([^*]+)\\*(?![*])", with: "$1", options: .regularExpression)
+            // Remove heading markers
+            .replacingOccurrences(of: "^#{1,6}\\s+", with: "", options: .regularExpression)
+            // Remove blockquote markers
+            .replacingOccurrences(of: "^>\\s?", with: "", options: [.regularExpression, .anchorsMatchLines])
+            // Remove horizontal rules
+            .replacingOccurrences(of: "^[-*_]{3,}$", with: "", options: [.regularExpression, .anchorsMatchLines])
+            // Remove HTML tags
+            .replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Structure-aware Markdown chunking: respects block boundaries (paragraphs,
+    /// code blocks, lists) rather than splitting purely by character count.
+    ///
+    /// Key differences from general chunking:
+    /// - Code blocks (``` fenced) are never split mid-block
+    /// - Paragraph boundaries are preserved as chunk boundaries
+    /// - Keywords are extracted from stripped Markdown (no syntax noise)
+    /// - Overlap uses the last complete paragraph instead of raw character slicing
+    nonisolated private static func chunkMarkdownSectionBackground(
+        _ text: String,
+        locationLabel: String,
+        knowledgeBaseID: UUID,
+        startIndex: inout Int
+    ) -> [DocumentChunk] {
+        let config = chunkingConfig
+        var chunks: [DocumentChunk] = []
+
+        // Split into logical blocks: paragraphs and fenced code blocks
+        let blocks = splitMarkdownIntoBlocks(text)
+
+        var currentChunk = ""
+        var lastBlock = ""  // Track last block for paragraph-aligned overlap
+
+        for block in blocks {
+            let trimmed = block.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+
+            if currentChunk.count + trimmed.count + 2 > config.targetCharacters
+                && currentChunk.count >= config.minChunkCharacters {
+                // Emit current chunk
+                let strippedForKeywords = stripMarkdownFormatting(currentChunk)
+                let keywords = Array(SharedDataManager.extractKeywords(from: strippedForKeywords, limit: 8))
+                chunks.append(DocumentChunk(
+                    knowledgeBaseID: knowledgeBaseID,
+                    content: currentChunk.trimmingCharacters(in: .whitespacesAndNewlines),
+                    keywords: keywords,
+                    locationLabel: locationLabel,
+                    index: startIndex
+                ))
+                startIndex += 1
+
+                // Paragraph-aligned overlap: start new chunk with the last complete block
+                if lastBlock.count <= config.overlapCharacters {
+                    currentChunk = lastBlock + "\n\n" + trimmed
+                } else {
+                    currentChunk = trimmed
+                }
+            } else {
+                if !currentChunk.isEmpty { currentChunk += "\n\n" }
+                currentChunk += trimmed
+            }
+            lastBlock = trimmed
+        }
+
+        // Emit remaining text
+        let remaining = currentChunk.trimmingCharacters(in: .whitespacesAndNewlines)
+        if remaining.count >= config.minChunkCharacters {
+            let strippedForKeywords = stripMarkdownFormatting(remaining)
+            let keywords = Array(SharedDataManager.extractKeywords(from: strippedForKeywords, limit: 8))
+            chunks.append(DocumentChunk(
+                knowledgeBaseID: knowledgeBaseID,
+                content: remaining,
+                keywords: keywords,
+                locationLabel: locationLabel,
+                index: startIndex
+            ))
+            startIndex += 1
+        } else if !remaining.isEmpty, let last = chunks.indices.last {
+            // Merge short tail into last chunk
+            let merged = chunks[last].content + "\n\n" + remaining
+            let strippedForKeywords = stripMarkdownFormatting(merged)
+            chunks[last] = DocumentChunk(
+                knowledgeBaseID: knowledgeBaseID,
+                content: merged,
+                keywords: Array(SharedDataManager.extractKeywords(from: strippedForKeywords, limit: 8)),
+                locationLabel: chunks[last].locationLabel,
+                index: chunks[last].index
+            )
+        }
+
+        return chunks
+    }
+
+    /// Split Markdown text into logical blocks, keeping fenced code blocks intact.
+    /// Regular paragraphs are split on double newlines; code fences are preserved whole.
+    nonisolated private static func splitMarkdownIntoBlocks(_ text: String) -> [String] {
+        var blocks: [String] = []
+        let lines = text.components(separatedBy: "\n")
+        var currentBlock = ""
+        var inCodeFence = false
+
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+
+            if trimmed.hasPrefix("```") {
+                if inCodeFence {
+                    // End of code fence — emit the whole code block as one block
+                    currentBlock += "\n" + line
+                    blocks.append(currentBlock)
+                    currentBlock = ""
+                    inCodeFence = false
+                } else {
+                    // Start of code fence — flush any preceding text first
+                    let pending = currentBlock.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !pending.isEmpty {
+                        // Split pending text on double newlines (paragraph boundaries)
+                        let paragraphs = pending.components(separatedBy: "\n\n")
+                            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+                        blocks.append(contentsOf: paragraphs)
+                    }
+                    currentBlock = line
+                    inCodeFence = true
+                }
+            } else if inCodeFence {
+                currentBlock += "\n" + line
+            } else if trimmed.isEmpty {
+                // Paragraph boundary
+                let pending = currentBlock.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !pending.isEmpty {
+                    blocks.append(pending)
+                    currentBlock = ""
+                }
+            } else {
+                if !currentBlock.isEmpty { currentBlock += "\n" }
+                currentBlock += line
+            }
+        }
+
+        // Flush final block
+        let pending = currentBlock.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !pending.isEmpty {
+            blocks.append(pending)
+        }
+
+        return blocks
+    }
+
+    // MARK: - ZIP Extraction
+
     nonisolated private static func extractZIPBackground(at url: URL, to destination: URL) throws -> [String] {
         let fileData = try Data(contentsOf: url)
         var extractedPaths: [String] = []
@@ -793,6 +1136,8 @@ final class KnowledgeBaseStore {
     }
 
     /// Background-safe chunking (nonisolated static).
+    /// Uses paragraph-aligned overlap instead of raw character slicing to avoid
+    /// cutting mid-word/mid-sentence, which degrades embedding quality.
     nonisolated private static func chunkTextBackground(
         _ text: String,
         locationLabel: String,
@@ -805,6 +1150,7 @@ final class KnowledgeBaseStore {
             .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
 
         var currentChunk = ""
+        var lastParagraph = ""  // Track last paragraph for clean overlap
 
         for paragraph in paragraphs {
             let trimmed = paragraph.trimmingCharacters(in: .whitespaces)
@@ -820,13 +1166,20 @@ final class KnowledgeBaseStore {
                 ))
                 startIndex += 1
 
-                let overlapStart = max(0, currentChunk.count - config.overlapCharacters)
-                let overlapIdx = currentChunk.index(currentChunk.startIndex, offsetBy: overlapStart)
-                currentChunk = String(currentChunk[overlapIdx...]) + "\n\n" + trimmed
+                // Paragraph-aligned overlap: use the last complete paragraph instead of
+                // slicing at a raw character offset (which can cut mid-word/sentence).
+                if lastParagraph.count <= config.overlapCharacters {
+                    currentChunk = lastParagraph + "\n\n" + trimmed
+                } else {
+                    // Last paragraph itself exceeds overlap budget — use sentence-boundary fallback
+                    let overlapText = sentenceBoundaryOverlap(lastParagraph, maxChars: config.overlapCharacters)
+                    currentChunk = overlapText + "\n\n" + trimmed
+                }
             } else {
                 if !currentChunk.isEmpty { currentChunk += "\n\n" }
                 currentChunk += trimmed
             }
+            lastParagraph = trimmed
         }
 
         let remaining = currentChunk.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -855,6 +1208,47 @@ final class KnowledgeBaseStore {
         return chunks
     }
 
+    /// Extract the last complete sentence(s) from a paragraph, up to maxChars.
+    /// Falls back to word-boundary slicing if no sentence boundary is found.
+    nonisolated private static func sentenceBoundaryOverlap(_ text: String, maxChars: Int) -> String {
+        guard text.count > maxChars else { return text }
+
+        // Look for the last sentence boundary (. ! ? followed by space or end) within the tail
+        let tail = String(text.suffix(maxChars + 50))  // slight overshoot to find boundary
+        let sentenceEndings = CharacterSet(charactersIn: ".!?")
+
+        // Scan from the start of tail to find a sentence boundary
+        var bestCut = tail.startIndex
+        var foundBoundary = false
+        for i in tail.indices {
+            let char = tail[i]
+            if char.unicodeScalars.allSatisfy({ sentenceEndings.contains($0) }) {
+                let next = tail.index(after: i)
+                if next < tail.endIndex && tail[next] == " " {
+                    bestCut = next
+                    foundBoundary = true
+                } else if next == tail.endIndex {
+                    bestCut = next
+                    foundBoundary = true
+                }
+            }
+        }
+
+        if foundBoundary {
+            let result = String(tail[bestCut...]).trimmingCharacters(in: .whitespaces)
+            if !result.isEmpty && result.count <= maxChars { return result }
+        }
+
+        // Fallback: word-boundary slicing (find the first space from the overlap start)
+        let overlapStart = max(0, text.count - maxChars)
+        let startIdx = text.index(text.startIndex, offsetBy: overlapStart)
+        let tailSlice = text[startIdx...]
+        if let firstSpace = tailSlice.firstIndex(of: " ") {
+            return String(tailSlice[tailSlice.index(after: firstSpace)...])
+        }
+        return String(tailSlice)
+    }
+
     // MARK: - Chunking
 
     nonisolated private static let chunkingConfig = ChunkingConfig()
@@ -880,6 +1274,7 @@ final class KnowledgeBaseStore {
             .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
 
         var currentChunk = ""
+        var lastParagraph = ""
 
         for paragraph in paragraphs {
             let trimmed = paragraph.trimmingCharacters(in: .whitespaces)
@@ -896,14 +1291,18 @@ final class KnowledgeBaseStore {
                 ))
                 startIndex += 1
 
-                // Start new chunk with overlap from the tail of the previous
-                let overlapStart = max(0, currentChunk.count - config.overlapCharacters)
-                let overlapIdx = currentChunk.index(currentChunk.startIndex, offsetBy: overlapStart)
-                currentChunk = String(currentChunk[overlapIdx...]) + "\n\n" + trimmed
+                // Paragraph-aligned overlap instead of raw character slicing
+                if lastParagraph.count <= config.overlapCharacters {
+                    currentChunk = lastParagraph + "\n\n" + trimmed
+                } else {
+                    let overlapText = Self.sentenceBoundaryOverlap(lastParagraph, maxChars: config.overlapCharacters)
+                    currentChunk = overlapText + "\n\n" + trimmed
+                }
             } else {
                 if !currentChunk.isEmpty { currentChunk += "\n\n" }
                 currentChunk += trimmed
             }
+            lastParagraph = trimmed
         }
 
         // Emit remaining text
@@ -986,6 +1385,107 @@ final class KnowledgeBaseStore {
         }
     }
 
+    // MARK: - BM25 Lexical Scoring
+
+    /// Compute BM25 scores for all chunks in a domain against the given query.
+    /// Returns a dictionary of chunk UUID → BM25 score.
+    ///
+    /// BM25 parameters:
+    /// - k1 = 1.2 (term frequency saturation)
+    /// - b = 0.75 (length normalization)
+    ///
+    /// This is a simplified BM25 that uses our existing keyword cache as the
+    /// term-frequency source. Scores are normalized to [0, 1] using the theoretical
+    /// upper bound for stable fusion with dense scores across different queries.
+    private func computeBM25Scores(queryWords: Set<String>, domainID: UUID) -> [UUID: Float] {
+        // Ensure caches are built
+        if invertedKeywordIndex.isEmpty {
+            rebuildInvertedIndex()
+        }
+
+        guard !queryWords.isEmpty else { return [:] }
+
+        // Collect domain chunk IDs and compute average document length
+        let domainKBIDs = Set(knowledgeBases.filter { $0.effectiveDomainID == domainID }.map(\.id))
+        var domainChunkIDs: [UUID] = []
+        var totalWordCount: Double = 0
+
+        for (kbID, chunks) in chunkCache where domainKBIDs.contains(kbID) {
+            for chunk in chunks {
+                domainChunkIDs.append(chunk.id)
+                let words = chunkKeywordCache[chunk.id] ?? Set(chunk.keywords).union(SharedDataManager.tokenize(chunk.content))
+                if chunkKeywordCache[chunk.id] == nil {
+                    chunkKeywordCache[chunk.id] = words
+                }
+                totalWordCount += Double(words.count)
+            }
+        }
+
+        let n = Double(domainChunkIDs.count)
+        guard n > 0 else { return [:] }
+        let avgDL = totalWordCount / n
+
+        // BM25 parameters
+        let k1 = 1.2
+        let b = 0.75
+
+        // Compute IDF for each query term (using domain scope)
+        // Iterate the smaller of the two sets to avoid allocating a temporary intersection.
+        let domainChunkSet = Set(domainChunkIDs)
+        var termIDF: [String: Double] = [:]
+        for word in queryWords {
+            var docsContaining = 0
+            if let postingList = invertedKeywordIndex[word] {
+                // Count domain-scoped hits without allocating an intersection set
+                if postingList.count <= domainChunkSet.count {
+                    for chunkID in postingList where domainChunkSet.contains(chunkID) {
+                        docsContaining += 1
+                    }
+                } else {
+                    for chunkID in domainChunkSet where postingList.contains(chunkID) {
+                        docsContaining += 1
+                    }
+                }
+            }
+            // IDF with smoothing: log((N - n(t) + 0.5) / (n(t) + 0.5) + 1)
+            let idf = log((n - Double(docsContaining) + 0.5) / (Double(docsContaining) + 0.5) + 1.0)
+            termIDF[word] = idf
+        }
+
+        // Theoretical upper bound: all terms present in a short document (dl ≈ 0)
+        // BM25_max = sum(IDF_i * (k1 + 1) / (1 + k1 * (1 - b)))
+        // This gives stable normalization across queries with different term counts.
+        let shortDocDenom = 1.0 + k1 * (1.0 - b)
+        let theoreticalMax = termIDF.values.reduce(0.0) { $0 + $1 * (k1 + 1.0) / shortDocDenom }
+        guard theoreticalMax > 0 else { return [:] }
+
+        // Score each chunk
+        var scores: [UUID: Float] = [:]
+
+        for chunkID in domainChunkIDs {
+            guard let words = chunkKeywordCache[chunkID] else { continue }
+            let dl = Double(words.count)
+            var score: Double = 0
+
+            for queryWord in queryWords {
+                guard let idf = termIDF[queryWord], words.contains(queryWord) else { continue }
+
+                // tf = 1 (keyword sets are deduplicated; exact match only — dense
+                // embeddings already handle morphological/semantic similarity)
+                let numerator = k1 + 1.0
+                let denominator = 1.0 + k1 * (1.0 - b + b * dl / avgDL)
+                score += idf * (numerator / denominator)
+            }
+
+            if score > 0 {
+                // Normalize by theoretical max so scores are in [0, 1]
+                scores[chunkID] = Float(score / theoreticalMax)
+            }
+        }
+
+        return scores
+    }
+
     /// Retrieve the most relevant document chunks for a query, scoped to a domain.
     ///
     /// **Primary path:** Batch cosine similarity via Accelerate/vDSP against the
@@ -994,18 +1494,63 @@ final class KnowledgeBaseStore {
     ///
     /// **Fallback:** Keyword overlap (used when embedding assets aren't downloaded yet
     /// or chunks were imported before embeddings were available).
-    func retrieve(for query: String, domainID: UUID = KnowledgeDomain.generalID, limit: Int = 3) -> [DocumentChunk] {
+    func retrieve(for query: String, domainID: UUID = KnowledgeDomain.generalID, limit: Int = 3, lexicalWeight: Float = 0.3) -> [DocumentChunk] {
         ensureAllChunksLoaded()
 
         let embeddingService = EmbeddingService.shared
 
-        // Try semantic retrieval first
+        // Tokenize once, reuse everywhere
+        let queryWords = SharedDataManager.tokenize(query)
+
+        // Try hybrid retrieval (dense + lexical) first
         if let queryVector = embeddingService.embed(query) {
-            return retrieveBySimilarity(queryVector: queryVector, query: query, domainID: domainID, limit: limit)
+            // Compute BM25 lexical scores for score fusion
+            let bm25Scores = lexicalWeight > 0 ? computeBM25Scores(queryWords: queryWords, domainID: domainID) : [:]
+
+            let results = retrieveBySimilarity(
+                queryVector: queryVector, queryWords: queryWords, domainID: domainID,
+                limit: limit, bm25Scores: bm25Scores, lexicalWeight: lexicalWeight
+            )
+
+            // Cross-domain fallback: if the current domain yields no results and other domains
+            // have summaries, find the best-matching domain via embedding similarity and search there.
+            if results.isEmpty && domains.count > 1 {
+                if let bestDomain = bestDomainForQuery(queryVector: queryVector, excludingDomain: domainID) {
+                    let crossBM25 = lexicalWeight > 0 ? computeBM25Scores(queryWords: queryWords, domainID: bestDomain) : [:]
+                    return retrieveBySimilarity(
+                        queryVector: queryVector, queryWords: queryWords, domainID: bestDomain,
+                        limit: limit, bm25Scores: crossBM25, lexicalWeight: lexicalWeight
+                    )
+                }
+            }
+
+            return results
         }
 
-        // Fallback: keyword matching
+        // Fallback: keyword matching (when embeddings unavailable)
         return retrieveByKeywords(query: query, domainID: domainID, limit: limit)
+    }
+
+    /// Find the domain whose summary best matches the query, excluding the given domain.
+    /// Returns nil if no domain has a summary or if no match exceeds the threshold.
+    private func bestDomainForQuery(queryVector: [Double], excludingDomain: UUID) -> UUID? {
+        let embeddingService = EmbeddingService.shared
+        guard embeddingService.isAvailable else { return nil }
+
+        var bestScore: Double = 0.3 // Minimum threshold
+        var bestDomainID: UUID?
+
+        for domain in domains where domain.id != excludingDomain {
+            guard let summary = domain.summary, !summary.isEmpty else { continue }
+            guard let summaryVector = embeddingService.embed(summary) else { continue }
+            let score = EmbeddingService.cosineSimilarity(queryVector, summaryVector)
+            if score > bestScore {
+                bestScore = score
+                bestDomainID = domain.id
+            }
+        }
+
+        return bestDomainID
     }
 
     /// Semantic retrieval using Accelerate-powered batch cosine similarity.
@@ -1019,7 +1564,7 @@ final class KnowledgeBaseStore {
     /// 2. **Semantic re-rank:** Score only the candidate subset using cosine similarity.
     ///
     /// This avoids scoring thousands of irrelevant chunks while maintaining recall.
-    private func retrieveBySimilarity(queryVector: [Double], query: String, domainID: UUID, limit: Int) -> [DocumentChunk] {
+    private func retrieveBySimilarity(queryVector: [Double], queryWords: Set<String>, domainID: UUID, limit: Int, bm25Scores: [UUID: Float] = [:], lexicalWeight: Float = 0.3) -> [DocumentChunk] {
         // Ensure the per-domain embedding matrix is built
         if embeddingMatrices[domainID] == nil {
             rebuildEmbeddingMatrix(for: domainID)
@@ -1033,48 +1578,76 @@ final class KnowledgeBaseStore {
 
         // Two-phase for large corpora
         if totalChunks >= 200 {
-            return twoPhaseRetrieval(queryVector: queryVector, query: query, domainID: domainID, limit: limit, matrix: matrix)
+            return twoPhaseRetrieval(queryVector: queryVector, queryWords: queryWords, domainID: domainID, limit: limit, matrix: matrix, bm25Scores: bm25Scores, lexicalWeight: lexicalWeight)
         }
 
         // Full matrix scan for small corpora — fast enough with Accelerate
-        return fullMatrixRetrieval(queryVector: queryVector, limit: limit, matrix: matrix)
+        return fullMatrixRetrieval(queryVector: queryVector, limit: limit, matrix: matrix, bm25Scores: bm25Scores, lexicalWeight: lexicalWeight)
     }
 
     /// Full matrix batch dot product — scores all chunks at once via Float32 BLAS.
     /// Since embeddings are pre-normalized, dot product = cosine similarity.
-    private func fullMatrixRetrieval(queryVector: [Double], limit: Int, matrix: EmbeddingMatrix) -> [DocumentChunk] {
+    /// When BM25 scores are provided, fuses dense and lexical scores for hybrid retrieval.
+    private func fullMatrixRetrieval(queryVector: [Double], limit: Int, matrix: EmbeddingMatrix, bm25Scores: [UUID: Float] = [:], lexicalWeight: Float = 0.3) -> [DocumentChunk] {
         let floatQuery = EmbeddingMatrix.prepareQuery(queryVector, dimension: matrix.dimension)
 
-        let similarities = EmbeddingService.batchDotProduct(
+        var similarities = EmbeddingService.batchDotProduct(
             query: floatQuery,
             matrix: matrix.data,
             count: matrix.rowCount,
             dimension: matrix.dimension
         )
 
+        // Fuse dense + lexical scores when BM25 data is available
+        if !bm25Scores.isEmpty {
+            let denseWeight: Float = 1.0 - lexicalWeight
+            for i in 0 ..< similarities.count {
+                let mapping = matrix.rowMap[i]
+                // Bounds-check to guard against stale rowMap indices after chunkCache mutations
+                guard let chunks = chunkCache[mapping.knowledgeBaseID],
+                      mapping.chunkIndex < chunks.count else { continue }
+                let bm25 = bm25Scores[chunks[mapping.chunkIndex].id] ?? 0
+                similarities[i] = denseWeight * similarities[i] + lexicalWeight * bm25
+            }
+        }
+
         // Top-K selection using partial sort (faster than full sort for small K)
-        return topK(similarities: similarities, matrix: matrix, limit: limit, threshold: 0.3)
+        return topK(similarities: similarities, matrix: matrix, limit: limit, threshold: 0.2)
     }
 
-    /// Two-phase retrieval: keyword pre-filter → semantic re-rank.
-    private func twoPhaseRetrieval(queryVector: [Double], query: String, domainID: UUID, limit: Int, matrix: EmbeddingMatrix) -> [DocumentChunk] {
+    /// Two-phase retrieval: keyword pre-filter → hybrid (dense + lexical) re-rank.
+    private func twoPhaseRetrieval(queryVector: [Double], queryWords: Set<String>, domainID: UUID, limit: Int, matrix: EmbeddingMatrix, bm25Scores: [UUID: Float] = [:], lexicalWeight: Float = 0.3) -> [DocumentChunk] {
         // Build inverted index if needed
         if invertedKeywordIndex.isEmpty {
             rebuildInvertedIndex()
         }
 
         // Phase 1: Keyword pre-filter — find candidate chunk IDs
-        let queryWords = SharedDataManager.tokenize(query)
+        // Build domain chunk ID set from the matrix to scope candidates correctly
+        // (the inverted index is global across all domains)
+        var domainChunkIDs = Set<UUID>()
+        for mapping in matrix.rowMap {
+            if let chunks = chunkCache[mapping.knowledgeBaseID],
+               mapping.chunkIndex < chunks.count {
+                domainChunkIDs.insert(chunks[mapping.chunkIndex].id)
+            }
+        }
+
         var candidateChunkIDs = Set<UUID>()
         for word in queryWords {
             if let chunkIDs = invertedKeywordIndex[word] {
-                candidateChunkIDs.formUnion(chunkIDs)
+                // Only include chunks from this domain
+                for id in chunkIDs where domainChunkIDs.contains(id) {
+                    candidateChunkIDs.insert(id)
+                }
             }
             // Also check prefix matches for longer words
             if word.count >= 5 {
                 for (indexWord, chunkIDs) in invertedKeywordIndex where indexWord.count >= 5 {
                     if indexWord.hasPrefix(word) || word.hasPrefix(indexWord) {
-                        candidateChunkIDs.formUnion(chunkIDs)
+                        for id in chunkIDs where domainChunkIDs.contains(id) {
+                            candidateChunkIDs.insert(id)
+                        }
                     }
                 }
             }
@@ -1084,7 +1657,7 @@ final class KnowledgeBaseStore {
         // (the query might use different vocabulary than the documents)
         let minCandidates = max(limit * 3, 20)
         if candidateChunkIDs.count < minCandidates {
-            return fullMatrixRetrieval(queryVector: queryVector, limit: limit, matrix: matrix)
+            return fullMatrixRetrieval(queryVector: queryVector, limit: limit, matrix: matrix, bm25Scores: bm25Scores, lexicalWeight: lexicalWeight)
         }
 
         // Phase 2: Build a smaller Float32 matrix from candidates and score
@@ -1106,17 +1679,29 @@ final class KnowledgeBaseStore {
         }
 
         guard !subRowMap.isEmpty else {
-            return fullMatrixRetrieval(queryVector: queryVector, limit: limit, matrix: matrix)
+            return fullMatrixRetrieval(queryVector: queryVector, limit: limit, matrix: matrix, bm25Scores: bm25Scores, lexicalWeight: lexicalWeight)
         }
 
         let floatQuery = EmbeddingMatrix.prepareQuery(queryVector, dimension: dim)
 
-        let similarities = EmbeddingService.batchDotProduct(
+        var similarities = EmbeddingService.batchDotProduct(
             query: floatQuery,
             matrix: subMatrix,
             count: subRowMap.count,
             dimension: dim
         )
+
+        // Fuse dense + lexical scores for the candidate subset
+        if !bm25Scores.isEmpty {
+            let denseWeight: Float = 1.0 - lexicalWeight
+            for i in 0 ..< similarities.count {
+                let mapping = subRowMap[i]
+                guard let chunks = chunkCache[mapping.knowledgeBaseID],
+                      mapping.chunkIndex < chunks.count else { continue }
+                let bm25 = bm25Scores[chunks[mapping.chunkIndex].id] ?? 0
+                similarities[i] = denseWeight * similarities[i] + lexicalWeight * bm25
+            }
+        }
 
         // Use the sub-matrix row map for resolution
         let subEmbeddingMatrix = EmbeddingMatrix(
@@ -1126,7 +1711,7 @@ final class KnowledgeBaseStore {
             rowMap: subRowMap
         )
 
-        return topK(similarities: similarities, matrix: subEmbeddingMatrix, limit: limit, threshold: 0.3)
+        return topK(similarities: similarities, matrix: subEmbeddingMatrix, limit: limit, threshold: 0.2)
     }
 
     /// Extract the top-K results from a Float32 similarity array using partial sort.
@@ -1372,59 +1957,69 @@ final class KnowledgeBaseStore {
 
             if accessing { job.url.stopAccessingSecurityScopedResource() }
 
-            if let idx = ingestionQueue.firstIndex(where: { $0.id == job.id }) {
-                switch outcome {
-                case .success(let result):
-                    ingestionQueue[idx].status = .completed
+            guard let idx = ingestionQueue.firstIndex(where: { $0.id == job.id }) else {
+                AppLogger.kbStore.warning("Re-import job for '\(job.fileName)' completed but was removed from queue")
+                isProcessing = false
+                return
+            }
 
-                    // Replace chunks for existing KB
-                    if let kbIndex = knowledgeBases.firstIndex(where: { $0.id == kb.id }) {
-                        // Clean old keyword caches
-                        if let oldChunks = chunkCache[kb.id] {
-                            for chunk in oldChunks {
-                                chunkKeywordCache.removeValue(forKey: chunk.id)
-                            }
-                        }
+            switch outcome {
+            case .success(let result):
+                var allWarnings = result.warnings
 
-                        // Re-key chunks to use the existing KB ID
-                        let rekeyedChunks = result.chunks.map { original in
-                            DocumentChunk(
-                                knowledgeBaseID: kb.id,
-                                content: original.content,
-                                keywords: original.keywords,
-                                locationLabel: original.locationLabel,
-                                index: original.index,
-                                embedding: original.embedding
-                            )
-                        }
-
-                        chunkCache[kb.id] = rekeyedChunks
-                        knowledgeBases[kbIndex].chunkCount = rekeyedChunks.count
-                        knowledgeBases[kbIndex].updatedAt = Date()
-                        knowledgeBases[kbIndex].embeddingModelID = result.kb.embeddingModelID
-
-                        invalidateEmbeddingMatrix(for: kb.effectiveDomainID)
-                        invertedKeywordIndex.removeAll()
-
-                        // Persist to SwiftData
-                        if let actor = dbActor {
-                            Task {
-                                do {
-                                    try await actor.replaceChunks(
-                                        for: kb.id,
-                                        newChunks: rekeyedChunks,
-                                        embeddingModelID: result.kb.embeddingModelID
-                                    )
-                                } catch {
-                                    AppLogger.kbStore.error("Failed persisting re-import: \(error.localizedDescription)")
-                                }
-                            }
+                // Replace chunks for existing KB
+                if let kbIndex = knowledgeBases.firstIndex(where: { $0.id == kb.id }) {
+                    // Clean old keyword caches
+                    if let oldChunks = chunkCache[kb.id] {
+                        for chunk in oldChunks {
+                            chunkKeywordCache.removeValue(forKey: chunk.id)
                         }
                     }
 
-                case .failure(let reason):
-                    ingestionQueue[idx].status = .failed(reason)
+                    // Re-key chunks to use the existing KB ID
+                    let rekeyedChunks = result.chunks.map { original in
+                        DocumentChunk(
+                            knowledgeBaseID: kb.id,
+                            content: original.content,
+                            keywords: original.keywords,
+                            locationLabel: original.locationLabel,
+                            index: original.index,
+                            embedding: original.embedding
+                        )
+                    }
+
+                    chunkCache[kb.id] = rekeyedChunks
+                    knowledgeBases[kbIndex].chunkCount = rekeyedChunks.count
+                    knowledgeBases[kbIndex].updatedAt = Date()
+                    knowledgeBases[kbIndex].embeddingModelID = result.kb.embeddingModelID
+
+                    invalidateEmbeddingMatrix(for: kb.effectiveDomainID)
+                    invertedKeywordIndex.removeAll()
+
+                    // Persist to SwiftData — await to surface failures
+                    if let actor = dbActor {
+                        do {
+                            try await actor.replaceChunks(
+                                for: kb.id,
+                                newChunks: rekeyedChunks,
+                                embeddingModelID: result.kb.embeddingModelID
+                            )
+                        } catch {
+                            allWarnings.append("Failed to save to database — data may not persist after restart")
+                            AppLogger.kbStore.error("Failed persisting re-import: \(error.localizedDescription)")
+                        }
+                    }
                 }
+
+                if allWarnings.isEmpty {
+                    ingestionQueue[idx].status = .completed
+                } else {
+                    ingestionQueue[idx].status = .completedWithWarnings("Done (\(allWarnings.count) warning\(allWarnings.count == 1 ? "" : "s"))")
+                    AppLogger.kbStore.warning("Re-import warnings for '\(job.fileName)': \(allWarnings.joined(separator: "; "))")
+                }
+
+            case .failure(let reason):
+                ingestionQueue[idx].status = .failed(reason)
             }
             isProcessing = false
         }
@@ -1695,4 +2290,102 @@ final class KnowledgeBaseStore {
             }
         }
     }
+
+    // MARK: - Domain Summary Generation
+
+    /// Regenerate the LLM-generated summary for a domain based on its knowledge bases.
+    /// Called after ingestion or KB deletion to keep the domain summary current.
+    func regenerateDomainSummary(for domainID: UUID) async {
+        let domainKBs = knowledgeBases(for: domainID)
+        guard !domainKBs.isEmpty else {
+            // No KBs — clear any existing summary
+            if let idx = domains.firstIndex(where: { $0.id == domainID }) {
+                domains[idx].summary = nil
+                if let actor = dbActor {
+                    Task { try? await actor.updateDomainSummary(id: domainID, summary: "") }
+                }
+            }
+            return
+        }
+
+        // Collect chunk summaries (or first sentence of content) for each KB to build an overview
+        var kbDescriptions: [String] = []
+        for kb in domainKBs {
+            var chunkPreviews: [String] = []
+            if let cached = chunkCache[kb.id] {
+                for chunk in cached.prefix(5) {
+                    // Prefer the summary if available, otherwise use a truncated content preview
+                    if let summary = chunk.summary, !summary.isEmpty {
+                        chunkPreviews.append(summary)
+                    } else {
+                        let preview = String(chunk.content.prefix(150))
+                        chunkPreviews.append(preview)
+                    }
+                }
+            }
+            let previews = chunkPreviews.joined(separator: " ")
+            kbDescriptions.append("\(kb.name): \(previews)")
+        }
+
+        let input = kbDescriptions.joined(separator: "\n---\n")
+
+        do {
+            let session = LanguageModelSession {
+                """
+                You are a knowledge base cataloger. Given descriptions of documents in a knowledge domain, \
+                write a concise 2-3 sentence summary of what this domain covers. \
+                Focus on the main topics, subject areas, and types of information available. \
+                Do not list individual documents — describe the domain as a whole.
+                """
+            }
+            let options = GenerationOptions(sampling: .greedy, maximumResponseTokens: 120)
+            let response = try await session.respond(to: input, options: options)
+            let summary = response.content.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            if !summary.isEmpty, let idx = domains.firstIndex(where: { $0.id == domainID }) {
+                domains[idx].summary = summary
+                if let actor = dbActor {
+                    try? await actor.updateDomainSummary(id: domainID, summary: summary)
+                }
+                AppLogger.kbStore.info("Generated domain summary for '\(domains[idx].name)': \(summary.prefix(80))...")
+            }
+        } catch {
+            AppLogger.kbStore.warning("Domain summary generation failed: \(error.localizedDescription)")
+        }
+    }
+
+    // MARK: - Test Support
+
+    #if DEBUG
+    /// Inject test data directly without SwiftData. For unit tests only.
+    func injectTestData(knowledgeBases: [KnowledgeBase], chunks: [UUID: [DocumentChunk]], domains: [KnowledgeDomain]) {
+        self.knowledgeBases = knowledgeBases
+        self.chunkCache = chunks
+        self.domains = domains
+        invalidateAllEmbeddingMatrices()
+        invertedKeywordIndex.removeAll()
+        chunkKeywordCache.removeAll()
+    }
+
+    /// Retrieve using a pre-computed query vector (bypasses EmbeddingService). For unit tests only.
+    func retrieveWithVector(_ queryVector: [Double], query: String, domainID: UUID = KnowledgeDomain.generalID, limit: Int = 3, lexicalWeight: Float = 0.3) -> [DocumentChunk] {
+        let queryWords = SharedDataManager.tokenize(query)
+        let bm25Scores = lexicalWeight > 0 ? computeBM25Scores(queryWords: queryWords, domainID: domainID) : [:]
+        return retrieveBySimilarity(
+            queryVector: queryVector, queryWords: queryWords, domainID: domainID,
+            limit: limit, bm25Scores: bm25Scores, lexicalWeight: lexicalWeight
+        )
+    }
+
+    /// Expose BM25 scores for testing. For unit tests only.
+    func testBM25Scores(query: String, domainID: UUID = KnowledgeDomain.generalID) -> [UUID: Float] {
+        let queryWords = SharedDataManager.tokenize(query)
+        return computeBM25Scores(queryWords: queryWords, domainID: domainID)
+    }
+
+    /// Expose keyword-only retrieval for testing. For unit tests only.
+    func testKeywordRetrieve(query: String, domainID: UUID = KnowledgeDomain.generalID, limit: Int = 3) -> [DocumentChunk] {
+        return retrieveByKeywords(query: query, domainID: domainID, limit: limit)
+    }
+    #endif
 }

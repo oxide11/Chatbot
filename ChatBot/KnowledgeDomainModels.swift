@@ -18,6 +18,10 @@ struct KnowledgeDomain: Identifiable, Codable, Sendable {
     let createdAt: Date
     var isDefault: Bool
 
+    /// LLM-generated summary of all knowledge bases in this domain.
+    /// Used for domain-level pre-filtering during retrieval.
+    var summary: String?
+
     /// Well-known UUID for the auto-created "General" domain.
     nonisolated static let generalID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
 
@@ -31,11 +35,12 @@ struct KnowledgeDomain: Identifiable, Codable, Sendable {
         )
     }
 
-    init(id: UUID = UUID(), name: String, createdAt: Date = Date(), isDefault: Bool = false) {
+    init(id: UUID = UUID(), name: String, createdAt: Date = Date(), isDefault: Bool = false, summary: String? = nil) {
         self.id = id
         self.name = name
         self.createdAt = createdAt
         self.isDefault = isDefault
+        self.summary = summary
     }
 }
 
@@ -48,14 +53,18 @@ final class SDKnowledgeDomain {
     var createdAt: Date
     var isDefault: Bool
 
+    /// LLM-generated summary of all knowledge bases in this domain.
+    var summary: String?
+
     @Relationship(deleteRule: .cascade, inverse: \SDKnowledgeBase.domain)
     var knowledgeBases: [SDKnowledgeBase] = []
 
-    init(id: UUID = UUID(), name: String, createdAt: Date = Date(), isDefault: Bool = false) {
+    init(id: UUID = UUID(), name: String, createdAt: Date = Date(), isDefault: Bool = false, summary: String? = nil) {
         self.id = id
         self.name = name
         self.createdAt = createdAt
         self.isDefault = isDefault
+        self.summary = summary
     }
 
     /// Create from the lightweight struct.
@@ -64,7 +73,8 @@ final class SDKnowledgeDomain {
             id: domain.id,
             name: domain.name,
             createdAt: domain.createdAt,
-            isDefault: domain.isDefault
+            isDefault: domain.isDefault,
+            summary: domain.summary
         )
     }
 
@@ -74,7 +84,8 @@ final class SDKnowledgeDomain {
             id: id,
             name: name,
             createdAt: createdAt,
-            isDefault: isDefault
+            isDefault: isDefault,
+            summary: summary
         )
     }
 }
