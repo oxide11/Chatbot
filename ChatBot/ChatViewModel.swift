@@ -32,6 +32,42 @@ struct ConversationData: Identifiable, Codable, Sendable {
     var customSystemPrompt: String?
     /// The knowledge domain assigned to this conversation (nil treated as General).
     var domainID: UUID?
+    /// Stored raw so unknown values from older / future builds decode cleanly.
+    var providerIDRaw: String?
+
+    var providerID: ChatProviderID {
+        get { providerIDRaw.flatMap(ChatProviderID.init(rawValue:)) ?? .foundationModels }
+        set { providerIDRaw = newValue.rawValue }
+    }
+
+    init(
+        id: UUID,
+        title: String,
+        createdAt: Date,
+        messages: [Message],
+        customSystemPrompt: String? = nil,
+        domainID: UUID? = nil,
+        providerIDRaw: String? = nil
+    ) {
+        self.id = id
+        self.title = title
+        self.createdAt = createdAt
+        self.messages = messages
+        self.customSystemPrompt = customSystemPrompt
+        self.domainID = domainID
+        self.providerIDRaw = providerIDRaw
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        title = try c.decode(String.self, forKey: .title)
+        createdAt = try c.decode(Date.self, forKey: .createdAt)
+        messages = try c.decodeIfPresent([Message].self, forKey: .messages) ?? []
+        customSystemPrompt = try c.decodeIfPresent(String.self, forKey: .customSystemPrompt)
+        domainID = try c.decodeIfPresent(UUID.self, forKey: .domainID)
+        providerIDRaw = try c.decodeIfPresent(String.self, forKey: .providerIDRaw)
+    }
 }
 
 // MARK: - Chat View Model
@@ -80,6 +116,14 @@ final class ChatViewModel: Identifiable {
 
     /// Reference to the shared agent orchestrator for Manager-Worker pattern
     var orchestrator: AgentOrchestrator?
+
+    /// Provider this conversation routes through. `.foundationModels` uses
+    /// the on-device path; others stream via the matching ChatProvider.
+    var providerID: ChatProviderID = .foundationModels
+
+    /// Reference to the shared provider registry — used to resolve remote
+    /// providers from Keychain credentials. Set by ConversationStore.
+    var providerRegistry: ProviderRegistry?
 
     private static let maxTurnsBeforeRotation = 6
     private static let estimatedMaxTokens = 4096.0
@@ -160,6 +204,7 @@ final class ChatViewModel: Identifiable {
         self.messages = data.messages
         self.customSystemPrompt = data.customSystemPrompt
         self.domainID = data.domainID ?? KnowledgeDomain.generalID
+        self.providerID = data.providerID
         self.hasAutoTitle = !data.messages.isEmpty
 
         // Initial session without tools — will be rebuilt after orchestrator is assigned
@@ -189,13 +234,26 @@ final class ChatViewModel: Identifiable {
             createdAt: createdAt,
             messages: messages,
             customSystemPrompt: customSystemPrompt,
-            domainID: domainID
+            domainID: domainID,
+            providerIDRaw: providerID.rawValue
         )
     }
 
     // MARK: - Availability
 
     func checkAvailability() {
+        // Remote providers are available iff a key is stored.
+        if providerID != .foundationModels {
+            if providerRegistry?.isConfigured(providerID) == true {
+                isAvailable = true
+                unavailableReason = nil
+            } else {
+                isAvailable = false
+                unavailableReason = "No API key configured for \(providerID.displayName). Add one in Settings → Providers."
+            }
+            return
+        }
+
         let model = SystemLanguageModel.default
         switch model.availability {
         case .available:
@@ -455,6 +513,13 @@ final class ChatViewModel: Identifiable {
     // MARK: - Private
 
     private func streamResponse(to prompt: String) async throws {
+        if providerID != .foundationModels,
+           let registry = providerRegistry,
+           let remote = registry.resolve(providerID) {
+            try await streamRemoteResponse(prompt: prompt, provider: remote)
+            return
+        }
+
         let stream = session.streamResponse(to: prompt)
         var fullText = ""
         for try await partial in stream {
@@ -464,6 +529,60 @@ final class ChatViewModel: Identifiable {
                 isWaitingForFirstToken = false
             }
             fullText = partial.content
+            streamingText = fullText
+        }
+        if !fullText.isEmpty {
+            messages.append(Message(role: .assistant, content: fullText))
+        }
+    }
+
+    /// Stream a reply from a remote provider (Anthropic / OpenAI / Gemini).
+    /// We rebuild the conversation history each call because remote APIs
+    /// are stateless. The just-appended user turn is replaced with the
+    /// RAG-enriched `prompt` so retrieved context reaches the model.
+    private func streamRemoteResponse(
+        prompt enrichedPrompt: String,
+        provider: ChatProvider
+    ) async throws {
+        var history: [ProviderMessage] = []
+        for message in messages.dropLast() {
+            switch message.role {
+            case .user:
+                history.append(ProviderMessage(role: .user, content: message.content))
+            case .assistant:
+                history.append(ProviderMessage(role: .assistant, content: message.content))
+            case .system:
+                // System messages from context-rotation events stay local;
+                // remote providers receive the actual system prompt below.
+                continue
+            }
+        }
+        history.append(ProviderMessage(role: .user, content: enrichedPrompt))
+
+        let systemPrompt: String? = {
+            let custom = customSystemPrompt?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let custom, !custom.isEmpty { return custom }
+            return Self.defaultInstructions
+        }()
+
+        let options = ProviderGenerationOptions(
+            maxOutputTokens: 4096,
+            temperature: 1.0
+        )
+
+        let stream = provider.streamReply(
+            history: history,
+            systemPrompt: systemPrompt,
+            options: options
+        )
+
+        var fullText = ""
+        for try await delta in stream {
+            try Task.checkCancellation()
+            if isWaitingForFirstToken {
+                isWaitingForFirstToken = false
+            }
+            fullText += delta
             streamingText = fullText
         }
         if !fullText.isEmpty {
@@ -658,6 +777,7 @@ final class ConversationStore {
                 conversation.knowledgeBaseStore = knowledgeBaseStore
                 conversation.ragSettings = ragSettings
                 conversation.orchestrator = orchestrator
+                conversation.providerRegistry = providers
                 conversation.onChange { [weak self] in self?.saveToDisk() }
             }
             selectedConversation()?.prewarmSession()
@@ -727,6 +847,8 @@ final class ConversationStore {
 
     func createConversation() -> ChatViewModel {
         let conversation = ChatViewModel()
+        conversation.providerID = providers.defaultProviderID
+        conversation.providerRegistry = providers
         conversation.checkAvailability()
         conversation.wikiEngine = wikiEngine
         conversation.knowledgeBaseStore = knowledgeBaseStore
