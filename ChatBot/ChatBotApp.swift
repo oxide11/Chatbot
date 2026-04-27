@@ -13,6 +13,11 @@ struct ChatBotApp: App {
     @State private var store = ConversationStore()
     @Environment(\.scenePhase) private var scenePhase
 
+    init() {
+        WikiLintScheduler.shared.register(with: store)
+        WikiLintScheduler.shared.reschedule(enabled: store.ragSettings.dailyBackgroundLintEnabled)
+    }
+
     var body: some Scene {
         WindowGroup {
             ContentView(store: store)

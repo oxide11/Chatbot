@@ -599,6 +599,13 @@ struct RAGSettings: Codable, Sendable {
     /// When true, every newly imported document is automatically run through
     /// wiki extraction in addition to being chunked for RAG retrieval.
     var autoExtractWikiFromDocuments: Bool = false
+    /// Run the structural lint pass after every successful extraction.
+    var lintAfterExtractions: Bool = false
+    /// Allow iOS to schedule a daily background structural lint pass.
+    var dailyBackgroundLintEnabled: Bool = false
+    /// Cosine-similarity cutoff (0...1) for flagging duplicate-candidate
+    /// page pairs. Lower = more flags (noisier), higher = fewer.
+    var lintSimilarityThreshold: Double = 0.85
 
     static let `default` = RAGSettings()
 
@@ -613,6 +620,9 @@ struct RAGSettings: Codable, Sendable {
         contextBudgetCharacters = try c.decodeIfPresent(Int.self, forKey: .contextBudgetCharacters) ?? 1500
         autoExtractKnowledge = try c.decodeIfPresent(Bool.self, forKey: .autoExtractKnowledge) ?? true
         autoExtractWikiFromDocuments = try c.decodeIfPresent(Bool.self, forKey: .autoExtractWikiFromDocuments) ?? false
+        lintAfterExtractions = try c.decodeIfPresent(Bool.self, forKey: .lintAfterExtractions) ?? false
+        dailyBackgroundLintEnabled = try c.decodeIfPresent(Bool.self, forKey: .dailyBackgroundLintEnabled) ?? false
+        lintSimilarityThreshold = try c.decodeIfPresent(Double.self, forKey: .lintSimilarityThreshold) ?? 0.85
     }
 }
 
@@ -622,6 +632,7 @@ final class ConversationStore {
     var selectedConversationID: UUID?
     let wikiStore = WikiStore()
     let wikiEngine: WikiEngine
+    let wikiLinter: WikiLinter
     let knowledgeBaseStore = KnowledgeBaseStore()
     let providers = ProviderRegistry()
     var ragSettings: RAGSettings = .default
@@ -634,6 +645,7 @@ final class ConversationStore {
 
     init() {
         self.wikiEngine = WikiEngine(wikiStore: wikiStore)
+        self.wikiLinter = WikiLinter(wikiStore: wikiStore)
         SharedDataManager.migrateIfNeeded()
         loadRAGSettings()
         loadDefaultSystemPrompt()
@@ -670,9 +682,17 @@ final class ConversationStore {
     }
 
     /// Auto-extract wiki pages from a freshly ingested document if the
-    /// "Auto-Extract from Documents" toggle is on. Runs detached.
+    /// "Auto-Extract from Documents" toggle is on. Runs detached and
+    /// optionally chains into a lint pass when "Lint after extractions" is on.
     private func autoExtractWikiIfEnabled(for kb: KnowledgeBase) {
-        guard ragSettings.autoExtractWikiFromDocuments else { return }
+        guard ragSettings.autoExtractWikiFromDocuments else {
+            // Even without extraction, give the user the option to lint after
+            // any fresh content lands.
+            if ragSettings.lintAfterExtractions {
+                runStructuralLint()
+            }
+            return
+        }
         Task { @MainActor [weak self] in
             guard let self else { return }
             await BackgroundTask.run("Auto Wiki Extraction") {
@@ -686,8 +706,18 @@ final class ConversationStore {
                     sourceDocumentID: kb.id,
                     domainID: kb.domainID
                 )
+                if self.ragSettings.lintAfterExtractions {
+                    self.runStructuralLint()
+                }
             }
         }
+    }
+
+    /// Apply the current similarity threshold to the linter and run a
+    /// structural pass. Does not invoke the LLM.
+    func runStructuralLint() {
+        wikiLinter.similarityThreshold = ragSettings.lintSimilarityThreshold
+        wikiLinter.runStructuralLint()
     }
 
     /// Provide the SwiftData ModelContainer to the wiki store. Call from the view layer.
