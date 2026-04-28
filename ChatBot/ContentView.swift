@@ -38,7 +38,7 @@ enum AppInfo {
     /// MAJOR: breaking schema or API changes.
     /// MINOR: new user-visible features.
     /// PATCH: bug fixes and tuning.
-    static let version = "1.0.0"
+    static let version = "2.0.0"
     static let build = "1"
 }
 
@@ -105,8 +105,8 @@ struct ContentView: View {
         .onAppear {
             store.conversations.first?.checkAvailability()
             store.configureOrchestrator(with: modelContext)
-            store.configureKnowledgeBaseStore(with: modelContext)
             store.configureWikiStore(with: modelContext)
+            store.configureDocumentImporter(with: modelContext)
             EmbeddingService.shared.requestAssetsIfNeeded()
         }
     }

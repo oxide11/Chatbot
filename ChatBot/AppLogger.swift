@@ -9,11 +9,8 @@
 import os
 
 nonisolated enum AppLogger {
-    /// Knowledge Base store operations (ingestion, retrieval, persistence).
-    nonisolated static let kbStore = Logger(subsystem: "com.polygoncyber.Engram", category: "KBStore")
-
-    /// Knowledge Base SwiftData actor operations.
-    nonisolated static let kbActor = Logger(subsystem: "com.polygoncyber.Engram", category: "KBActor")
+    /// Document importer operations (file copy, text extraction, queueing).
+    nonisolated static let importer = Logger(subsystem: "com.polygoncyber.Engram", category: "Importer")
 
     /// SharedDataManager (file-based storage, App Group).
     nonisolated static let sharedData = Logger(subsystem: "com.polygoncyber.Engram", category: "SharedData")

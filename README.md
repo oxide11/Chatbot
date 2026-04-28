@@ -116,15 +116,19 @@ Document import into the wiki then runs on Claude (much higher quality) while ch
 
 ## Status
 
-Engram is under active development. Recent milestones:
+Engram is `2.0.0` and follows [Semantic Versioning](https://semver.org/) (MAJOR.MINOR.PATCH).
+
+Recent milestones:
 
 - LLM Wiki replaces the legacy MemoryStore as the primary long-term knowledge surface.
 - Document → Wiki extraction with paragraph-aware chunking, progress UI, and background continuation.
 - Karpathy-style wiki lint with structural and semantic passes; human-in-the-loop merge UI.
 - Multi-provider scaffolding + Anthropic streaming + per-task routing.
 - Liquid Glass UI sweep with iOS 26 scroll edge effects.
+- Knowledge Domains removed in favour of a single global wiki.
+- **`2.0.0` (breaking)**: Knowledge Bases retired entirely. The chunk-based RAG store is gone; the wiki is the only long-term knowledge surface. Imported documents (PDF / ePub / text / Markdown) flow through a one-way `DocumentImporter` that hands the full text to the wiki extraction pipeline. Source files are kept in `Documents/Imports/` so they can be re-extracted later.
 
-In flight: removing Knowledge Domains, replacing Knowledge Bases with a simpler Document Importer, and wiring OpenAI + Gemini providers.
+In flight: wiring OpenAI + Gemini providers; further wiki / lint polish.
 
 ## License
 

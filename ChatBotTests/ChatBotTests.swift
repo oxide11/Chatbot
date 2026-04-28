@@ -12,107 +12,37 @@ import SwiftData
 @testable import ChatBot
 
 
-// MARK: - KnowledgeBase Model Tests
+// MARK: - DocumentType Tests
 
-@Suite("KnowledgeBase Model")
-struct KnowledgeBaseModelTests {
+@Suite("DocumentType")
+struct DocumentTypeTests {
 
-    @Test("KnowledgeBase round-trips through Codable")
-    func codableRoundTrip() throws {
-        let original = KnowledgeBase(
-            name: "My Doc",
-            documentType: .epub,
-            chunkCount: 42,
-            fileSize: 2048,
-            embeddingModelID: "model-v1"
-        )
-        let data = try JSONEncoder().encode(original)
-        let decoded = try JSONDecoder().decode(KnowledgeBase.self, from: data)
-        #expect(decoded.id == original.id)
-        #expect(decoded.name == "My Doc")
-        #expect(decoded.documentType == .epub)
-        #expect(decoded.chunkCount == 42)
-        #expect(decoded.fileSize == 2048)
-        #expect(decoded.embeddingModelID == "model-v1")
-    }
-
-    @Test("Backward-compatible decoding without updatedAt")
-    func backwardCompatibleDecoding() throws {
-        // Simulate old JSON without updatedAt
-        let json = """
-        {
-            "id": "11111111-1111-1111-1111-111111111111",
-            "name": "Old Doc",
-            "documentType": "pdf",
-            "createdAt": 0,
-            "chunkCount": 3,
-            "fileSize": 256
-        }
-        """
-        let data = json.data(using: .utf8)!
-        let decoded = try JSONDecoder().decode(KnowledgeBase.self, from: data)
-        #expect(decoded.name == "Old Doc")
-        #expect(decoded.embeddingModelID == nil)
-        // updatedAt falls back to createdAt
-        #expect(abs(decoded.updatedAt.timeIntervalSince(decoded.createdAt)) < 0.001)
-    }
-
-    @Test("DocumentType labels and icons are correct")
+    @Test("Labels and icons are correct")
     func documentTypeProperties() {
         #expect(DocumentType.pdf.label == "PDF")
         #expect(DocumentType.epub.label == "ePUB")
         #expect(DocumentType.text.label == "Text")
+        #expect(DocumentType.markdown.label == "Markdown")
         #expect(DocumentType.pdf.icon == "doc.richtext")
         #expect(DocumentType.epub.icon == "book")
-        #expect(DocumentType.text.icon == "doc.text")
     }
 
-    @Test("DocumentType round-trips through raw value")
+    @Test("Round-trips through raw value")
     func documentTypeRawValue() {
         for type in DocumentType.allCases {
             #expect(DocumentType(rawValue: type.rawValue) == type)
         }
     }
-}
 
-// MARK: - DocumentChunk Model Tests
-
-@Suite("DocumentChunk Model")
-struct DocumentChunkModelTests {
-
-    @Test("Keywords are lowercased on init")
-    func keywordsLowercased() {
-        let chunk = DocumentChunk(
-            knowledgeBaseID: UUID(),
-            content: "Test content",
-            keywords: ["Swift", "CODING", "MacOS"],
-            locationLabel: "Page 1",
-            index: 0
-        )
-        #expect(chunk.keywords == ["swift", "coding", "macos"])
-    }
-
-    @Test("Chunk round-trips through Codable")
-    func codableRoundTrip() throws {
-        let embedding = [1.0, 2.0, 3.0]
-        let kbID = UUID()
-        let original = DocumentChunk(
-            knowledgeBaseID: kbID,
-            content: "Some text",
-            keywords: ["test"],
-            locationLabel: "Chapter 2",
-            index: 5,
-            embedding: embedding
-        )
-        let data = try JSONEncoder().encode(original)
-        let decoded = try JSONDecoder().decode(DocumentChunk.self, from: data)
-        #expect(decoded.id == original.id)
-        #expect(decoded.knowledgeBaseID == kbID)
-        #expect(decoded.content == "Some text")
-        #expect(decoded.keywords == ["test"])
-        #expect(decoded.locationLabel == "Chapter 2")
-        #expect(decoded.index == 5)
-        #expect(decoded.embedding == embedding)
+    @Test("Resolves from file extension")
+    func fromExtension() {
+        #expect(DocumentType.from(fileExtension: "pdf") == .pdf)
+        #expect(DocumentType.from(fileExtension: "PDF") == .pdf)
+        #expect(DocumentType.from(fileExtension: "epub") == .epub)
+        #expect(DocumentType.from(fileExtension: "txt") == .text)
+        #expect(DocumentType.from(fileExtension: "md") == .markdown)
+        #expect(DocumentType.from(fileExtension: "markdown") == .markdown)
+        #expect(DocumentType.from(fileExtension: "xyz") == nil)
     }
 }
 
