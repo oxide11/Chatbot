@@ -188,24 +188,25 @@ struct ContentView: View {
                 .help("New Chat (\u{2318}N)")
             }
             #else
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    _ = store.createConversation()
+                } label: {
+                    Label("New Chat", systemImage: "square.and.pencil")
+                }
+                .keyboardShortcut("n", modifiers: .command)
+                .help("New Chat (\u{2318}N)")
+            }
             ToolbarItem(placement: .bottomBar) {
                 HStack {
                     Button {
                         showingSettings = true
                     } label: {
-                        Image(systemName: "gearshape")
+                        Label("Settings", systemImage: "gearshape")
                     }
                     .help("Settings")
 
                     Spacer()
-
-                    Button {
-                        _ = store.createConversation()
-                    } label: {
-                        Label("New Chat", systemImage: "plus")
-                    }
-                    .keyboardShortcut("n", modifiers: .command)
-                    .help("New Chat (\u{2318}N)")
                 }
             }
             #endif
@@ -253,7 +254,9 @@ struct ContentView: View {
     @ViewBuilder
     private var detail: some View {
         if let conversation = store.selectedConversation() {
-            ChatDetailView(viewModel: conversation)
+            ChatDetailView(viewModel: conversation) {
+                _ = store.createConversation()
+            }
         } else {
             ContentUnavailableView {
                 Label("No Chat Selected", systemImage: "bubble.left.and.bubble.right")

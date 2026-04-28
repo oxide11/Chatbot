@@ -313,7 +313,7 @@ struct SettingsView: View {
                 WikiPageListView(wikiStore: store.wikiStore)
             }
             .sheet(isPresented: $showingImports) {
-                DocumentImportListView(importer: store.documentImporter)
+                DocumentImportListView(importer: store.documentImporter, wikiStore: store.wikiStore)
             }
             .sheet(isPresented: $showingWorkers) {
                 WorkerLibraryView(orchestrator: store.orchestrator)
