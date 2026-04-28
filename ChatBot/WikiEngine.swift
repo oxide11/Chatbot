@@ -66,55 +66,78 @@ final class WikiEngine {
         )
 
         do {
-            let responseText = try await respondOnce(
+            let draft = try await respondGenerable(
                 systemPrompt: WikiExtractionPrompts.systemPrompt,
                 userPrompt: prompt,
                 maxTokens: 500,
-                task: .extraction
+                task: .extraction,
+                generating: WikiExtractionDraft.self,
+                decodeText: WikiExtractionPrompts.parseExtraction
             )
-            let extracted = WikiExtractionPrompts.parse(responseText)
 
-            guard !extracted.isEmpty else {
+            guard !draft.nothingExtracted, !draft.pages.isEmpty else {
                 AppLogger.wiki.debug("No knowledge extracted from '\(conversationTitle)'")
                 return
             }
 
-            for item in extracted {
-                // Resolve [[wikilinks]] in the body to actual page IDs
-                let referencedTitles = WikiExtractionPrompts.extractWikilinks(from: item.body)
-                let linkedIDs = referencedTitles.compactMap { title in
-                    wikiStore.findPageByTitle(title)?.id
-                }
-
-                if let existing = wikiStore.findPageByTitle(item.title) {
-                    // Merge into existing page
-                    let mergedBody = mergeContent(existing: existing.body, new: item.body)
-                    let mergedTags = Array(Set(existing.tags + item.tags))
-                    let mergedLinks = Array(Set(existing.linkedPageIDs + linkedIDs))
-
-                    await wikiStore.updatePage(
-                        id: existing.id,
-                        body: mergedBody,
-                        tags: mergedTags,
-                        linkedPageIDs: mergedLinks,
-                        sourceConversationID: conversationID
-                    )
-                    AppLogger.wiki.info("Merged into existing wiki page '\(item.title)'")
-                } else {
-                    // Create new page
-                    await wikiStore.createPage(
-                        title: item.title,
-                        body: item.body,
-                        tags: item.tags,
-                        sourceConversationID: conversationID
-                    )
-                    AppLogger.wiki.info("Created new wiki page '\(item.title)'")
-                }
+            for page in draft.pages {
+                await applyExtractedPage(
+                    page,
+                    sourceConversationID: conversationID,
+                    sourceDocumentID: nil
+                )
             }
 
-            AppLogger.wiki.info("Extracted \(extracted.count) wiki page(s) from '\(conversationTitle)'")
+            AppLogger.wiki.info("Extracted \(draft.pages.count) wiki page(s) from '\(conversationTitle)'")
         } catch {
             AppLogger.wiki.error("Wiki extraction failed: \(error.localizedDescription)")
+        }
+    }
+
+    enum AppliedPageResult {
+        case created
+        case merged
+    }
+
+    /// Apply a single extracted page draft to the store: either merge into
+    /// an existing same-title page or create a new one. Resolves [[wikilinks]]
+    /// in the body to page ids. Used by both extraction paths.
+    @discardableResult
+    private func applyExtractedPage(
+        _ page: WikiPageDraft,
+        sourceConversationID: UUID?,
+        sourceDocumentID: UUID?
+    ) async -> AppliedPageResult {
+        let referencedTitles = WikiExtractionPrompts.extractWikilinks(from: page.body)
+        let linkedIDs = referencedTitles.compactMap { title in
+            wikiStore.findPageByTitle(title)?.id
+        }
+
+        if let existing = wikiStore.findPageByTitle(page.title) {
+            let mergedBody = mergeContent(existing: existing.body, new: page.body)
+            let mergedTags = Array(Set(existing.tags + page.tags))
+            let mergedLinks = Array(Set(existing.linkedPageIDs + linkedIDs))
+
+            await wikiStore.updatePage(
+                id: existing.id,
+                body: mergedBody,
+                tags: mergedTags,
+                linkedPageIDs: mergedLinks,
+                sourceConversationID: sourceConversationID,
+                sourceDocumentID: sourceDocumentID
+            )
+            AppLogger.wiki.info("Merged into existing wiki page '\(page.title)'")
+            return .merged
+        } else {
+            await wikiStore.createPage(
+                title: page.title,
+                body: page.body,
+                tags: page.tags,
+                sourceConversationID: sourceConversationID,
+                sourceDocumentID: sourceDocumentID
+            )
+            AppLogger.wiki.info("Created new wiki page '\(page.title)'")
+            return .created
         }
     }
 
@@ -156,18 +179,23 @@ final class WikiEngine {
 
     // MARK: - Provider Routing
 
-    /// Run a single prompt through whichever provider the user has bound
-    /// to `task`. Falls back to the on-device LanguageModelSession when no
-    /// remote provider is configured for the task. Used by both
-    /// extraction paths and the lint semantic pass.
-    func respondOnce(
+    /// Run a single prompt through whichever provider the user has bound to
+    /// `task` and decode the response into a `Generable` type. The on-device
+    /// FoundationModels path returns the typed value directly — no parser,
+    /// no malformed-output failure mode. Remote providers (Anthropic /
+    /// OpenAI / Gemini) still emit text, so the caller-supplied `decodeText`
+    /// adapter wraps the response via the existing `WikiExtractionPrompts.parse*`
+    /// helpers.
+    func respondGenerable<T: Generable & Sendable>(
         systemPrompt: String,
         userPrompt: String,
         maxTokens: Int,
-        task: ProviderTask
-    ) async throws -> String {
+        task: ProviderTask,
+        generating type: T.Type,
+        decodeText: (String) -> T
+    ) async throws -> T {
         if let provider = providerRegistry?.resolve(for: task) {
-            return try await provider.respond(
+            let text = try await provider.respond(
                 history: [ProviderMessage(role: .user, content: userPrompt)],
                 systemPrompt: systemPrompt,
                 options: ProviderGenerationOptions(
@@ -175,13 +203,18 @@ final class WikiEngine {
                     temperature: 1.0
                 )
             )
+            return decodeText(text)
         }
         let session = LanguageModelSession { systemPrompt }
         let options = GenerationOptions(
             sampling: .greedy,
             maximumResponseTokens: maxTokens
         )
-        let response = try await session.respond(to: userPrompt, options: options)
+        let response = try await session.respond(
+            to: userPrompt,
+            generating: type,
+            options: options
+        )
         return response.content
     }
 
@@ -286,40 +319,26 @@ extension WikiEngine {
             )
 
             do {
-                let responseText = try await respondOnce(
+                let draft = try await respondGenerable(
                     systemPrompt: WikiExtractionPrompts.systemPrompt,
                     userPrompt: prompt,
                     maxTokens: 600,
-                    task: .extraction
+                    task: .extraction,
+                    generating: WikiExtractionDraft.self,
+                    decodeText: WikiExtractionPrompts.parseExtraction
                 )
-                let extracted = WikiExtractionPrompts.parse(responseText)
 
-                for item in extracted {
-                    let referencedTitles = WikiExtractionPrompts.extractWikilinks(from: item.body)
-                    let linkedIDs = referencedTitles.compactMap { title in
-                        wikiStore.findPageByTitle(title)?.id
-                    }
-
-                    if let existing = wikiStore.findPageByTitle(item.title) {
-                        let mergedBody = mergeContent(existing: existing.body, new: item.body)
-                        let mergedTags = Array(Set(existing.tags + item.tags))
-                        let mergedLinks = Array(Set(existing.linkedPageIDs + linkedIDs))
-                        await wikiStore.updatePage(
-                            id: existing.id,
-                            body: mergedBody,
-                            tags: mergedTags,
-                            linkedPageIDs: mergedLinks,
+                if !draft.nothingExtracted {
+                    for page in draft.pages {
+                        let result = await applyExtractedPage(
+                            page,
+                            sourceConversationID: nil,
                             sourceDocumentID: sourceDocumentID
                         )
-                        pagesMerged += 1
-                    } else {
-                        await wikiStore.createPage(
-                            title: item.title,
-                            body: item.body,
-                            tags: item.tags,
-                            sourceDocumentID: sourceDocumentID
-                        )
-                        pagesCreated += 1
+                        switch result {
+                        case .created: pagesCreated += 1
+                        case .merged:  pagesMerged += 1
+                        }
                     }
                 }
             } catch {
