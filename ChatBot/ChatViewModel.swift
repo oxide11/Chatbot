@@ -449,10 +449,13 @@ final class ChatViewModel: Identifiable {
 
         // Retrieve wiki pages (scoped to conversation's domain)
         if ragSettings.wikiRetrievalEnabled, let engine = wikiEngine {
-            let (wikiContext, pageCount) = engine.buildWikiContext(for: userText)
+            let (wikiContext, pageCount) = engine.buildWikiContext(
+                for: userText,
+                forRemoteProvider: providerID != .foundationModels
+            )
             if !wikiContext.isEmpty {
                 wikiPageCount = pageCount
-                contextBlocks.append("Knowledge from your wiki:\n\(wikiContext)")
+                contextBlocks.append("Pages from your wiki, ranked by relevance to the question:\n\(wikiContext)")
                 usedChars += wikiContext.count
             }
         }
@@ -471,9 +474,10 @@ final class ChatViewModel: Identifiable {
         \(userText)
 
         ---
-        Note: The following is supplementary reference material that MAY be relevant. \
-        Only use it if it directly relates to the question above. \
-        Otherwise rely on your own knowledge.
+        Reference material from the user's personal wiki — already filtered for \
+        relevance to the question above. When the wiki covers the answer, ground \
+        your reply in it (preserve names, numbers, and decisions exactly) and \
+        mention which page you used. If a page is off-topic, you can ignore it.
 
         \(contextBlocks.joined(separator: "\n\n"))
         """

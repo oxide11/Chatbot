@@ -44,6 +44,16 @@ final class WikiEngine {
     /// Max characters of wiki context for on-device model.
     var onDeviceCharBudget: Int = 1750
 
+    /// Max wiki pages to inject when the chat is routed to a remote provider
+    /// (Anthropic / OpenAI / Gemini). Their windows are 100k+ tokens, so the
+    /// on-device cap of 2 pages would starve the model of useful context.
+    var remotePageLimit: Int = 8
+
+    /// Max characters of wiki context when the chat is routed to a remote
+    /// provider. Roughly ~3k tokens — generous but bounded so a fat wiki
+    /// doesn't blow past the model's effective attention.
+    var remoteCharBudget: Int = 12_000
+
     init(wikiStore: WikiStore) {
         self.wikiStore = wikiStore
     }
@@ -145,13 +155,17 @@ final class WikiEngine {
 
     /// Query the wiki for relevant pages and format them for injection into the prompt.
     /// Returns a formatted context string and the number of pages included.
+    /// Pass `forRemoteProvider: true` when the consuming model has a large
+    /// context window (Anthropic / OpenAI / Gemini) so the on-device caps
+    /// don't starve it of wiki signal.
     func buildWikiContext(
-        for query: String
+        for query: String,
+        forRemoteProvider: Bool = false
     ) -> (context: String, pageCount: Int) {
         guard injectionEnabled else { return ("", 0) }
 
-        let budgetChars = onDeviceCharBudget
-        let maxPages = onDevicePageLimit
+        let budgetChars = forRemoteProvider ? remoteCharBudget : onDeviceCharBudget
+        let maxPages = forRemoteProvider ? remotePageLimit : onDevicePageLimit
 
         let relevantPages = wikiStore.findRelevantPages(
             for: query,
