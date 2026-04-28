@@ -19,95 +19,102 @@ import Foundation
 
 enum WikiExtractionPrompts {
 
-    static let systemPrompt = """
-        You are a knowledge extraction assistant. Your job is to identify \
-        reusable factual knowledge from conversations and organize it into \
-        wiki pages. Each page covers ONE concept, entity, or topic.
+    /// Shared format spec used by both extraction modes. Kept in one place
+    /// so updates to the page format only have to be made once.
+    private static let pageBlockFormat = """
+        ---PAGE---
+        TITLE: <concise, capitalised, noun-phrase title>
+        TAGS: <comma-separated, lowercase>
+        BODY:
+        <2–6 bullet points or short paragraphs; ≤100 words>
+        ---END---
         """
 
-    /// Build the extraction prompt, including existing page titles so the LLM
-    /// can update existing pages rather than creating duplicates.
-    static func extractionPrompt(
-        transcript: String,
-        existingPageTitles: [String]
-    ) -> String {
-        var prompt = """
-        Extract key knowledge from this conversation into wiki pages.
-        Each page covers ONE concept, entity, or topic.
-
-        Format your response using exactly this structure:
-        ---PAGE---
-        TITLE: <concise page title>
-        TAGS: <comma-separated tags>
-        BODY:
-        <page content as concise bullet points or short paragraphs>
-        ---END---
-
-        Rules:
-        - Only extract factual, reusable knowledge (skip greetings and small talk)
-        - If nothing notable was discussed, respond with exactly: NONE
-        - Keep each page focused on a single topic
-        - Use [[Page Title]] to reference other pages
-        - Be specific — preserve exact names, numbers, dates, and details
-        - Keep each page body under 100 words
-        """
-
-        if !existingPageTitles.isEmpty {
-            let titles = existingPageTitles.prefix(30).joined(separator: ", ")
-            prompt += "\n\nExisting wiki pages (update these titles if relevant instead of creating duplicates): \(titles)"
-        }
-
-        prompt += "\n\nConversation transcript:\n\(transcript)"
-        return prompt
-    }
-
-    /// Build a document-mode extraction prompt. Tuned for monologue text
-    /// (papers, chapters, manuals, ePub sections) rather than dialogue.
-    /// Includes inline few-shot examples since the on-device 3B model
-    /// produces meaningfully better results when shown the desired shape.
-    static func documentExtractionPrompt(
-        text: String,
-        sourceName: String,
-        existingPageTitles: [String]
-    ) -> String {
-        var prompt = """
-        Read the document excerpt below and extract reusable knowledge into wiki pages.
-        Each page covers ONE concept, entity, definition, claim, procedure, or parameter.
-
-        Format your response using exactly this structure for each page:
-        ---PAGE---
-        TITLE: <concise page title>
-        TAGS: <comma-separated tags, lowercase>
-        BODY:
-        <2-6 bullet points or short paragraphs; under 100 words>
-        ---END---
-
-        Rules:
-        - Extract concrete, reusable facts: definitions, formulae, parameters, named entities, procedures, design rationale.
-        - Preserve exact terminology, numbers, and identifiers from the source.
-        - One topic per page. If the same concept appears later, return the same TITLE so it merges.
-        - Use [[Page Title]] to cross-reference other pages you create.
-        - Skip filler, transitions, and decorative prose.
-        - If nothing in this excerpt is worth keeping, respond with exactly: NONE
-
-        Example:
+    /// One-page worked example showing the exact shape we want.
+    /// Reused across modes so the small model has a stable reference.
+    private static let pageBlockExample = """
         ---PAGE---
         TITLE: Adam Optimizer
         TAGS: optimizer, deep-learning, adaptive
         BODY:
         - Combines momentum and RMSProp; tracks first and second moment estimates of the gradient.
         - Default hyperparameters: learning rate 1e-3, β₁=0.9, β₂=0.999, ε=1e-8.
-        - Uses bias-corrected estimates so early steps aren't biased toward zero.
-        - See [[RMSProp]], [[Momentum]] for component algorithms.
+        - Bias-corrected estimates prevent early-step bias toward zero.
+        - See [[RMSProp]], [[Momentum]] for the component algorithms.
         ---END---
+        """
+
+    static let systemPrompt = """
+        You extract reusable factual knowledge into wiki pages. \
+        One page per concept, entity, definition, procedure, or claim. \
+        Preserve exact names, numbers, and identifiers from the source. \
+        Output only `---PAGE---/---END---` blocks (or the literal word NONE) — no preamble, no commentary.
+        """
+
+    /// Build the extraction prompt for a conversation transcript. Includes
+    /// the shared format spec and example so the on-device model follows
+    /// the structure consistently.
+    static func extractionPrompt(
+        transcript: String,
+        existingPageTitles: [String]
+    ) -> String {
+        var prompt = """
+        Extract reusable knowledge from the conversation below into wiki pages.
+
+        Format each page exactly like this:
+        \(pageBlockFormat)
+
+        Rules:
+        - Extract concrete, reusable facts (preferences, decisions, names, numbers, technical choices). Skip greetings, filler, and questions that weren't answered.
+        - One page per topic. If the same concept appears more than once, write a single merged page.
+        - Use `[[Page Title]]` for cross-references.
+        - If nothing notable was discussed, respond with exactly: NONE
+
+        Example:
+        \(pageBlockExample)
+        """
+
+        if !existingPageTitles.isEmpty {
+            let titles = existingPageTitles.prefix(30).joined(separator: ", ")
+            prompt += "\n\nExisting page titles (reuse the same TITLE to merge instead of creating duplicates): \(titles)"
+        }
+
+        prompt += "\n\nConversation transcript:\n\(transcript)"
+        return prompt
+    }
+
+    /// Document-mode extraction. Tuned for monologue text (papers, chapters,
+    /// manuals, ePub sections). Same format + example as conversation mode
+    /// so the model's output shape is consistent across pipelines.
+    static func documentExtractionPrompt(
+        text: String,
+        sourceName: String,
+        existingPageTitles: [String]
+    ) -> String {
+        var prompt = """
+        Extract reusable knowledge from the document excerpt below into wiki pages.
+
+        Format each page exactly like this:
+        \(pageBlockFormat)
+
+        Rules:
+        - Extract definitions, formulae, parameters, named entities, procedures, and design rationale.
+        - Preserve exact terminology, numbers, and identifiers from the source.
+        - One topic per page. If the same concept appears later, reuse the same TITLE so the entries merge.
+        - Use `[[Page Title]]` for cross-references between concepts you've extracted.
+        - Skip filler, transitions, and decorative prose.
+        - If nothing in this excerpt is worth keeping, respond with exactly: NONE
+
+        Example:
+        \(pageBlockExample)
         """
 
         if !existingPageTitles.isEmpty {
             let titles = existingPageTitles.prefix(40).joined(separator: ", ")
-            prompt += "\n\nExisting wiki pages (reuse these titles when relevant): \(titles)"
+            prompt += "\n\nExisting page titles (reuse the same TITLE to merge instead of creating duplicates): \(titles)"
         }
 
-        prompt += "\n\nSource: \(sourceName)\n\nDocument excerpt:\n\(text)"
+        prompt += "\n\nSource: \(sourceName)\n\nExcerpt:\n\(text)"
         return prompt
     }
 

@@ -95,21 +95,27 @@ final class AgentOrchestrator {
         var fullInstructions = baseInstructions
 
         if !tools.isEmpty {
-            // Provide clear delegation instructions so the Manager knows when and how
-            // to use workers vs. answering directly. Tool schemas are already injected
-            // by the framework, so we focus on behavioral guidance here.
+            // Tool schemas are already injected by the framework; this section
+            // is purely behavioural guidance for *when* to delegate and *how*
+            // to integrate the worker's output.
             fullInstructions += """
 
-            You have access to specialized worker tools. Follow these delegation rules:
-            - For simple questions, greetings, or general conversation: answer directly without using any tool.
-            - For tasks that match a worker's specialty (e.g. proofreading, summarizing, translating, code review): delegate to the appropriate worker tool by passing the relevant text as the task.
-            - Use only one worker per response unless the user explicitly asks for multiple operations.
-            - After receiving a worker's result, present it to the user naturally. Do not mention the worker by name or say "I used a tool."
+
+            ## Worker Tools
+            Specialist tools are available. Use this decision rule:
+            - Greetings, follow-ups, and general questions: answer directly. Do not invoke a tool.
+            - Tasks that match a tool's specialty (proofreading, summarising, translating, code review, simple explanations): invoke the matching tool, passing the user's text as `task`.
+            - Invoke at most one tool per turn unless the user explicitly asks for multiple steps.
+
+            When a tool returns:
+            - Present its output as your own answer in plain prose.
+            - Never name the tool, mention "delegating", or write phrases like "I used a tool" / "the proofreader said".
+            - Do not echo the tool's output verbatim if a one-line introduction would help — but do not pad it.
             """
         }
 
         if let summary = conversationSummary, !summary.isEmpty {
-            fullInstructions += "\nConversation context (summary of prior messages): \(summary)\nContinue the conversation naturally from where it left off."
+            fullInstructions += "\n\n## Prior Context\n\(summary)\n\nContinue the conversation naturally from where it left off."
         }
 
         let instructions = fullInstructions
