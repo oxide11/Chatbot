@@ -1859,8 +1859,7 @@ final class KnowledgeBaseStore {
             id: UUID(),
             url: url,
             fileName: "\(kb.name) (Update)",
-            status: .queued,
-            domainID: KnowledgeBasePool.id
+            status: .queued
         )
         ingestionQueue.append(job)
 
