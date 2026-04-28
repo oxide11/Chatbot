@@ -20,6 +20,7 @@ import Foundation
 
 #if canImport(BackgroundTasks) && !os(macOS)
 import BackgroundTasks
+import os
 #endif
 
 @MainActor
