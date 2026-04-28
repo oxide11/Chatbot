@@ -435,12 +435,11 @@ final class ChatViewModel: Identifiable {
     /// Build an enriched prompt by prepending relevant wiki pages and document chunks.
     /// Returns the prompt string and a RAGContext describing what was injected.
     private func buildEnrichedPrompt(for userText: String) -> (prompt: String, context: RAGContext) {
-        let maxContextChars = ragSettings.contextBudgetCharacters
         var contextBlocks: [String] = []
         var usedChars = 0
         var wikiPageCount = 0
-        var chunkCount = 0
-        var docNames: Set<String> = []
+        let chunkCount = 0
+        let docNames: Set<String> = []
 
         // Retrieve wiki pages (scoped to conversation's domain)
         if ragSettings.wikiRetrievalEnabled, let engine = wikiEngine {

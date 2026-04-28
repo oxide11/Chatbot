@@ -160,3 +160,17 @@ private func decodeJSONArray<T: Decodable>(_ raw: String) -> [T] {
     guard let data = raw.data(using: .utf8) else { return [] }
     return (try? JSONDecoder().decode([T].self, from: data)) ?? []
 }
+
+// MARK: - Embedding Data Conversion
+
+extension [Double] {
+    nonisolated var asData: Data {
+        withUnsafeBufferPointer { Data(buffer: $0) }
+    }
+}
+
+extension Data {
+    nonisolated func asDoubleArray() -> [Double] {
+        withUnsafeBytes { Array($0.bindMemory(to: Double.self)) }
+    }
+}
