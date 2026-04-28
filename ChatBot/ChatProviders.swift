@@ -322,8 +322,12 @@ final class ProviderRegistry {
             guard let key = KeychainManager.getAPIKey(for: id.keychainAccount),
                   !key.isEmpty else { return nil }
             return AnthropicProvider(apiKey: key, model: modelID(for: id))
-        case .openAI, .gemini:
-            // Implementations to follow.
+        case .openAI:
+            guard let key = KeychainManager.getAPIKey(for: id.keychainAccount),
+                  !key.isEmpty else { return nil }
+            return OpenAIProvider(apiKey: key, model: modelID(for: id))
+        case .gemini:
+            // Implementation to follow.
             return nil
         }
     }
