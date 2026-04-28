@@ -568,7 +568,23 @@ final class ChatViewModel: Identifiable {
                 messages.append(Message(role: .system, content: "Unable to continue — the message may be too long for on-device AI."))
             }
         default:
-            messages.append(Message(role: .system, content: "Error: \(error.localizedDescription)"))
+            // Foundation Models on iOS Simulator (and unsupported devices) often
+            // surfaces an opaque error -1 because Apple Intelligence can't run
+            // there. Spell that out so the user knows the workaround instead of
+            // chasing a non-existent bug.
+            #if targetEnvironment(simulator)
+            let isLikelySimulatorIssue = (error as NSError).code == -1
+            #else
+            let isLikelySimulatorIssue = false
+            #endif
+
+            if providerID == .foundationModels && isLikelySimulatorIssue {
+                messages.append(Message(role: .system, content:
+                    "On-device AI isn't available on this simulator. Open Settings → Providers, connect Anthropic (or OpenAI / Gemini) with an API key, and switch this chat's provider via the chat menu."
+                ))
+            } else {
+                messages.append(Message(role: .system, content: "Error: \(error.localizedDescription)"))
+            }
         }
     }
 

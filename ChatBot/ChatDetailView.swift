@@ -130,6 +130,7 @@ struct ChatDetailView: View {
             } label: {
                 Label(isSearching ? "Close Search" : "Search Messages", systemImage: "magnifyingglass")
             }
+            .keyboardShortcut("f", modifiers: .command)
 
             if !viewModel.messages.isEmpty {
                 ShareLink(
@@ -181,6 +182,7 @@ struct ChatDetailView: View {
                         .foregroundStyle(.secondary)
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("Clear search")
             }
             Button("Done") {
                 withAnimation {
@@ -581,6 +583,7 @@ struct ChatDetailView: View {
                     }
                     .glassEffect(.regular.tint(.red).interactive(), in: .circle)
                     .help("Stop Generating")
+                    .accessibilityLabel("Stop Generating")
                 } else {
                     Button {
                         sendMessage()
@@ -594,6 +597,7 @@ struct ChatDetailView: View {
                     .keyboardShortcut(.return, modifiers: .command)
                     #endif
                     .help("Send (⌘Return)")
+                    .accessibilityLabel("Send Message")
                 }
             }
             .padding(.horizontal)

@@ -53,6 +53,54 @@ struct ContentView: View {
     @State private var renameDraft = ""
     @State private var deletingConversationID: UUID?
 
+    /// Flattened, in-display order. Used by the keyboard shortcuts so
+    /// `⌘1`-`⌘9` jump to the visible position, and `⌘[` / `⌘]` walk in the
+    /// same direction the user sees on screen.
+    private var flatConversations: [ChatViewModel] {
+        groupedConversations.flatMap { $0.1 }
+    }
+
+    private func selectPreviousChat() {
+        let flat = flatConversations
+        guard let id = store.selectedConversationID,
+              let i = flat.firstIndex(where: { $0.id == id }),
+              i > 0 else { return }
+        store.selectedConversationID = flat[i - 1].id
+    }
+
+    private func selectNextChat() {
+        let flat = flatConversations
+        guard let id = store.selectedConversationID,
+              let i = flat.firstIndex(where: { $0.id == id }),
+              i + 1 < flat.count else { return }
+        store.selectedConversationID = flat[i + 1].id
+    }
+
+    private func selectChat(atFlatIndex index: Int) {
+        let flat = flatConversations
+        guard index < flat.count else { return }
+        store.selectedConversationID = flat[index].id
+    }
+
+    /// Invisible button group that registers app-wide keyboard shortcuts.
+    /// Sits in `.background { ... }` of the sidebar so the responder chain
+    /// picks them up regardless of which column has focus.
+    private var keyboardShortcutSink: some View {
+        Group {
+            Button("Previous Chat", action: selectPreviousChat)
+                .keyboardShortcut("[", modifiers: .command)
+            Button("Next Chat", action: selectNextChat)
+                .keyboardShortcut("]", modifiers: .command)
+            ForEach(0..<9, id: \.self) { i in
+                Button("Chat \(i + 1)") { selectChat(atFlatIndex: i) }
+                    .keyboardShortcut(KeyEquivalent(Character("\(i + 1)")), modifiers: .command)
+            }
+        }
+        .frame(width: 0, height: 0)
+        .opacity(0)
+        .accessibilityHidden(true)
+    }
+
     private var groupedConversations: [(String, [ChatViewModel])] {
         let filtered = searchText.isEmpty
             ? store.conversations
@@ -108,7 +156,31 @@ struct ContentView: View {
             store.configureWikiStore(with: modelContext)
             store.configureDocumentImporter(with: modelContext)
             EmbeddingService.shared.requestAssetsIfNeeded()
+            handlePendingQuickAction()
         }
+        #if canImport(UIKit) && !os(macOS) && !os(visionOS)
+        .onChange(of: QuickActionRouter.shared.pending) { _, _ in
+            handlePendingQuickAction()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { handlePendingQuickAction() }
+        }
+        #endif
+    }
+
+    @Environment(\.scenePhase) private var scenePhase
+
+    private func handlePendingQuickAction() {
+        #if canImport(UIKit) && !os(macOS) && !os(visionOS)
+        guard let action = QuickActionRouter.shared.pending else { return }
+        switch action {
+        case .newChat:
+            _ = store.createConversation()
+        case .openSettings:
+            showingSettings = true
+        }
+        QuickActionRouter.shared.pending = nil
+        #endif
     }
 
     // MARK: - Sidebar
@@ -162,6 +234,7 @@ struct ContentView: View {
                 }
             }
         }
+        .background { keyboardShortcutSink }
         .searchable(text: $searchText, prompt: "Search chats")
         #if os(iOS) || os(tvOS) || os(visionOS)
         .searchToolbarBehavior(.minimize)
@@ -177,6 +250,8 @@ struct ContentView: View {
                     Image(systemName: "gearshape")
                 }
                 .help("Settings")
+                .accessibilityLabel("Settings")
+                .keyboardShortcut(",", modifiers: .command)
             }
             ToolbarItem(placement: .automatic) {
                 Button {
@@ -194,7 +269,8 @@ struct ContentView: View {
                 } label: {
                     Label("Settings", systemImage: "gearshape")
                 }
-                .help("Settings")
+                .keyboardShortcut(",", modifiers: .command)
+                .help("Settings (\u{2318},)")
             }
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
