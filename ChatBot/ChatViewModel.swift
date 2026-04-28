@@ -108,6 +108,12 @@ final class ChatViewModel: Identifiable {
     /// Reference to the shared agent orchestrator for Manager-Worker pattern
     var orchestrator: AgentOrchestrator?
 
+    /// Per-conversation tracker for the wiki tool fetch cap. Reset at the
+    /// start of each user turn so the cap applies per-question, not per-
+    /// session. Lives here (not on the orchestrator) because it's tied to
+    /// the conversation lifecycle, not the worker registry.
+    private let wikiToolTracker = WikiToolBudgetTracker()
+
     /// Provider this conversation routes through. `.foundationModels` uses
     /// the on-device path; others stream via the matching ChatProvider.
     var providerID: ChatProviderID = .foundationModels
@@ -144,25 +150,85 @@ final class ChatViewModel: Identifiable {
         return Self.maxTurnsBeforeRotation
     }
 
-    /// Create a LanguageModelSession, using the orchestrator's Manager-Worker tools when available.
+    /// Create a LanguageModelSession, mounting worker tools (Manager-Worker
+    /// pattern) and wiki tools (search + fetch) when the active provider
+    /// is on-device. Remote providers go through the pre-injection path
+    /// in `buildEnrichedPrompt` instead — the `ChatProvider` abstraction
+    /// doesn't expose tool calls today.
     private func createSession(instructions: String, conversationSummary: String? = nil) -> LanguageModelSession {
-        if let orchestrator, orchestrator.hasActiveWorkers {
+        let wikiTools = makeWikiTools()
+        let wikiInstructions = wikiTools.isEmpty ? "" : Self.wikiToolInstructions
+        let workersActive = orchestrator?.hasActiveWorkers == true
+
+        // Whenever any tools (worker or wiki) need to mount, route through
+        // the orchestrator's session factory so the Manager scaffolding is
+        // applied consistently. Falls back to a plain session when nothing
+        // is mounted.
+        if let orchestrator, workersActive || !wikiTools.isEmpty {
             return orchestrator.createManagerSession(
                 baseInstructions: instructions,
-                conversationSummary: conversationSummary
+                conversationSummary: conversationSummary,
+                extraTools: wikiTools,
+                extraInstructions: wikiInstructions
             )
-        } else if let summary = conversationSummary, !summary.isEmpty {
-            let inst = instructions
-            return LanguageModelSession {
-                "\(inst)\nContext: \(summary)"
-            }
+        }
+
+        var fullInstructions = instructions
+        if !wikiInstructions.isEmpty {
+            fullInstructions += "\n\n\(wikiInstructions)"
+        }
+        if let summary = conversationSummary, !summary.isEmpty {
+            fullInstructions += "\nContext: \(summary)"
+        }
+        let finalInstructions = fullInstructions
+
+        if wikiTools.isEmpty {
+            return LanguageModelSession { finalInstructions }
         } else {
-            let inst = instructions
-            return LanguageModelSession {
-                inst
-            }
+            return LanguageModelSession(tools: wikiTools) { finalInstructions }
         }
     }
+
+    /// Build the wiki tool array for the active conversation. Returns
+    /// empty when the budget profile says "prefer pre-injection" (remote
+    /// providers), wiki injection is disabled, or there are no pages.
+    private func makeWikiTools() -> [any Tool] {
+        let budget = WikiContextBudget.forProvider(providerID)
+        guard budget.prefersToolPath,
+              ragSettings.wikiRetrievalEnabled,
+              let engine = wikiEngine,
+              engine.injectionEnabled,
+              !engine.wikiStore.pages.isEmpty
+        else { return [] }
+
+        return [
+            WikiSearchTool(store: engine.wikiStore, budget: budget, tracker: wikiToolTracker),
+            WikiGetPageTool(store: engine.wikiStore, budget: budget, tracker: wikiToolTracker),
+        ]
+    }
+
+    /// Behavioural guidance for the wiki tools, appended to the system
+    /// prompt when the tools are mounted. Tells the model when to use
+    /// the TOC vs. when to fetch pages, and to cite which pages it used.
+    private static let wikiToolInstructions = """
+        ## Wiki
+        The user has a personal wiki. At the start of each question you'll \
+        see a table of contents listing relevant pages with one-line \
+        summaries. Use it like this:
+
+        - If the question is small-talk, opinion, or general knowledge, \
+          answer directly. Don't touch the tools.
+        - If the wiki TOC mentions a page that looks relevant, call \
+          `getWikiPage` with its exact title to read the body, then ground \
+          your answer in it (preserve names, numbers, decisions exactly). \
+          Mention which page you used (e.g. "from your Adam Optimizer \
+          page").
+        - If the TOC doesn't have an obvious match but the question \
+          sounds like something the user might have written about, call \
+          `searchWiki` to look from a different angle.
+        - The wiki is the user's source of truth for their own decisions \
+          and notes. Prefer it over generic knowledge when both apply.
+        """
 
     // MARK: - Init
 
@@ -177,15 +243,31 @@ final class ChatViewModel: Identifiable {
         session.prewarm()
     }
 
-    /// Rebuild the session with current orchestrator tools.
-    /// Call after the orchestrator is assigned to pick up worker tools.
+    /// Rebuild the session when the set of mounted tools has changed —
+    /// e.g. workers got enabled, or the wiki finished loading and now has
+    /// pages to expose. Cheap when nothing changed (fingerprint compare).
     func rebuildSessionIfNeeded() {
-        guard let orchestrator, orchestrator.hasActiveWorkers else { return }
+        let fingerprint = currentToolFingerprint
+        guard fingerprint != sessionToolFingerprint else { return }
+        sessionToolFingerprint = fingerprint
         session = createSession(
             instructions: activeInstructions,
             conversationSummary: conversationSummary
         )
         session.prewarm()
+    }
+
+    private var sessionToolFingerprint: String = ""
+
+    /// Identity of the tool set the current session was built with —
+    /// changes when worker tools or wiki tools come or go.
+    private var currentToolFingerprint: String {
+        let workers = (orchestrator?.activeTools ?? [])
+            .map(\.name)
+            .sorted()
+            .joined(separator: ",")
+        let wikiOn = !makeWikiTools().isEmpty
+        return "workers=[\(workers)]|wiki=\(wikiOn)"
     }
 
     /// Eagerly load model weights + cache the prompt prefix to reduce first-token latency.
@@ -283,6 +365,11 @@ final class ChatViewModel: Identifiable {
             let trimmed = text.prefix(30)
             title = trimmed.count < text.count ? "\(trimmed)..." : String(trimmed)
         }
+
+        // Pick up wiki tools if the wiki finished loading after the session
+        // was first created. The fingerprint check makes this a no-op when
+        // nothing has changed, so it doesn't churn the session per turn.
+        rebuildSessionIfNeeded()
 
         isResponding = true
         isWaitingForFirstToken = true
@@ -438,36 +525,63 @@ final class ChatViewModel: Identifiable {
 
     // MARK: - RAG Integration
 
-    /// Build an enriched prompt by prepending relevant wiki pages and document chunks.
-    /// Returns the prompt string and a RAGContext describing what was injected.
+    /// Build an enriched prompt by prepending wiki context. Two strategies
+    /// keyed off the active provider's `WikiContextBudget`:
+    ///
+    /// - **Tool path** (on-device): inject a TOC of `[[Title]] — summary`
+    ///   entries; the session has `searchWiki` / `getWikiPage` mounted so
+    ///   the model fetches what it actually needs.
+    /// - **Pre-inject path** (remote): inject several full pages already
+    ///   ranked by embedding similarity — remote providers don't get
+    ///   tool calls through our `ChatProvider` abstraction yet.
     private func buildEnrichedPrompt(for userText: String) -> (prompt: String, context: RAGContext) {
-        var contextBlocks: [String] = []
-        var usedChars = 0
-        var wikiPageCount = 0
-        let chunkCount = 0
-        let docNames: Set<String> = []
+        let budget = WikiContextBudget.forProvider(providerID)
 
-        // Retrieve wiki pages (scoped to conversation's domain)
-        if ragSettings.wikiRetrievalEnabled, let engine = wikiEngine {
-            let (wikiContext, pageCount) = engine.buildWikiContext(
-                for: userText,
-                forRemoteProvider: providerID != .foundationModels
-            )
-            if !wikiContext.isEmpty {
-                wikiPageCount = pageCount
-                contextBlocks.append("Pages from your wiki, ranked by relevance to the question:\n\(wikiContext)")
-                usedChars += wikiContext.count
-            }
+        guard ragSettings.wikiRetrievalEnabled,
+              let engine = wikiEngine,
+              engine.injectionEnabled,
+              !engine.wikiStore.pages.isEmpty
+        else {
+            return (userText, RAGContext(wikiPageCount: 0, documentChunkCount: 0, documentNames: []))
         }
 
-        let ragContext = RAGContext(
-            wikiPageCount: wikiPageCount,
-            documentChunkCount: chunkCount,
-            documentNames: docNames.sorted()
-        )
+        if budget.prefersToolPath {
+            // Reset the per-turn fetch counter before the model sees the
+            // TOC, so the budget hint we pass it ("up to N pages") is
+            // accurate.
+            wikiToolTracker.reset()
 
-        guard !contextBlocks.isEmpty else {
-            return (userText, ragContext)
+            let toc = engine.wikiStore.tableOfContents(for: userText, budget: budget)
+            guard !toc.text.isEmpty else {
+                return (userText, RAGContext(wikiPageCount: 0, documentChunkCount: 0, documentNames: []))
+            }
+
+            // Kick off lazy summary backfill for any TOC entries that
+            // still don't have one — the next turn will see the new
+            // summary. Detached because we don't want to block this turn.
+            engine.backfillMissingSummaries()
+
+            let enriched = """
+            \(userText)
+
+            ---
+            Wiki table of contents (already filtered to entries that look \
+            relevant). Call `getWikiPage` for the ones you actually need to \
+            read; up to \(budget.pageFetchCap) per turn.
+
+            \(toc.text)
+            """
+            return (enriched, RAGContext(
+                wikiPageCount: toc.entryCount,
+                documentChunkCount: 0,
+                documentNames: []
+            ))
+        }
+
+        // Remote pre-injection path: full pages, larger budget.
+        let (wikiContext, pageCount) = engine.buildWikiContext(for: userText, budget: budget)
+        guard !wikiContext.isEmpty else {
+            return (userText, RAGContext(wikiPageCount: 0, documentChunkCount: 0, documentNames: []))
         }
 
         let enriched = """
@@ -479,9 +593,14 @@ final class ChatViewModel: Identifiable {
         your reply in it (preserve names, numbers, and decisions exactly) and \
         mention which page you used. If a page is off-topic, you can ignore it.
 
-        \(contextBlocks.joined(separator: "\n\n"))
+        Pages from your wiki, ranked by relevance to the question:
+        \(wikiContext)
         """
-        return (enriched, ragContext)
+        return (enriched, RAGContext(
+            wikiPageCount: pageCount,
+            documentChunkCount: 0,
+            documentNames: []
+        ))
     }
 
     // MARK: - Private

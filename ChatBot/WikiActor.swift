@@ -46,11 +46,14 @@ actor WikiActor {
 
     // MARK: - Update
 
-    /// Update a wiki page's body, tags, and linked pages.
+    /// Update a wiki page's body, tags, summary, and linked pages.
+    /// Pass `summary: nil` to leave the existing summary alone (e.g. for
+    /// updates from the lint pipeline that don't regenerate one).
     func updatePage(
         id: UUID,
         body: String,
         tags: [String],
+        summary: String? = nil,
         linkedPageIDs: [UUID],
         sourceConversationID: UUID? = nil,
         sourceDocumentID: UUID? = nil
@@ -63,6 +66,9 @@ actor WikiActor {
         sd.tags = tags
         sd.linkedPageIDs = linkedPageIDs
         sd.updatedAt = Date()
+        if let summary, !summary.isEmpty {
+            sd.summary = summary
+        }
 
         if let convID = sourceConversationID {
             var ids = sd.sourceConversationIDs
@@ -85,6 +91,16 @@ actor WikiActor {
 
         try modelContext.save()
         AppLogger.wiki.info("Updated wiki page '\(sd.title)' (\(id))")
+    }
+
+    /// Persist a freshly generated summary for a page (used by lazy
+    /// backfill of legacy pages that don't have one yet).
+    func setSummary(pageID: UUID, summary: String) throws {
+        let predicate = #Predicate<SDWikiPage> { $0.id == pageID }
+        let descriptor = FetchDescriptor<SDWikiPage>(predicate: predicate)
+        guard let sd = try modelContext.fetch(descriptor).first else { return }
+        sd.summary = summary
+        try modelContext.save()
     }
 
     /// Record an access (for retrieval prioritization).

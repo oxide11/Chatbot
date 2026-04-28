@@ -29,6 +29,9 @@ struct WikiPageDraft: Sendable, Hashable {
     @Guide(description: "Concise, capitalised, noun-phrase title (e.g. \"Adam Optimizer\"). One concept per page.")
     var title: String
 
+    @Guide(description: "One sentence (≤120 chars) describing what the page covers. Used as a TOC entry when the model browses the wiki — should make it obvious whether this page answers a given question.")
+    var summary: String
+
     @Guide(description: "2–6 bullet points or short paragraphs covering the concept. Under 100 words. Use [[Page Title]] markdown for cross-references to other wiki pages.")
     var body: String
 
@@ -76,6 +79,7 @@ enum WikiExtractionPrompts {
     private static let pageBlockFormat = """
         ---PAGE---
         TITLE: <concise, capitalised, noun-phrase title>
+        SUMMARY: <one sentence; ≤120 chars; what this page covers>
         TAGS: <comma-separated, lowercase>
         BODY:
         <2–6 bullet points or short paragraphs; ≤100 words>
@@ -87,6 +91,7 @@ enum WikiExtractionPrompts {
     private static let pageBlockExample = """
         ---PAGE---
         TITLE: Adam Optimizer
+        SUMMARY: Adaptive optimizer combining momentum and RMSProp; the default choice for most deep nets.
         TAGS: optimizer, deep-learning, adaptive
         BODY:
         - Combines momentum and RMSProp; tracks first and second moment estimates of the gradient.
@@ -174,6 +179,7 @@ enum WikiExtractionPrompts {
 
     struct ExtractionResult {
         let title: String
+        let summary: String
         let body: String
         let tags: [String]
     }
@@ -196,6 +202,7 @@ enum WikiExtractionPrompts {
             guard !trimmedContent.isEmpty else { continue }
 
             var title: String?
+            var summary: String = ""
             var tags: [String] = []
             var bodyLines: [String] = []
             var inBody = false
@@ -205,6 +212,9 @@ enum WikiExtractionPrompts {
 
                 if trimmedLine.uppercased().hasPrefix("TITLE:") {
                     title = String(trimmedLine.dropFirst(6)).trimmingCharacters(in: .whitespaces)
+                    inBody = false
+                } else if trimmedLine.uppercased().hasPrefix("SUMMARY:") {
+                    summary = String(trimmedLine.dropFirst(8)).trimmingCharacters(in: .whitespaces)
                     inBody = false
                 } else if trimmedLine.uppercased().hasPrefix("TAGS:") {
                     let tagStr = String(trimmedLine.dropFirst(5)).trimmingCharacters(in: .whitespaces)
@@ -224,7 +234,7 @@ enum WikiExtractionPrompts {
             if let title, !title.isEmpty {
                 let body = bodyLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
                 if !body.isEmpty {
-                    results.append(ExtractionResult(title: title, body: body, tags: tags))
+                    results.append(ExtractionResult(title: title, summary: summary, body: body, tags: tags))
                 }
             }
         }
@@ -236,7 +246,33 @@ enum WikiExtractionPrompts {
     /// shape — used when a remote provider returned text (or to bridge
     /// between the legacy and Generable code paths).
     static func draft(from result: ExtractionResult) -> WikiPageDraft {
-        WikiPageDraft(title: result.title, body: result.body, tags: result.tags)
+        WikiPageDraft(title: result.title, summary: result.summary, body: result.body, tags: result.tags)
+    }
+
+    /// Deterministic summary fallback for legacy pages that pre-date the
+    /// `SUMMARY:` field. Takes the first non-empty body line, strips bullet
+    /// markers and wikilink brackets, caps at 120 chars. Cheap (no LLM
+    /// call) and safe to use when an async backfill isn't available.
+    static func deriveSummary(fromBody body: String, title: String) -> String {
+        let firstLine = body
+            .components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .first(where: { !$0.isEmpty })
+            ?? title
+
+        var cleaned = firstLine
+        for prefix in ["- ", "* ", "• "] where cleaned.hasPrefix(prefix) {
+            cleaned = String(cleaned.dropFirst(prefix.count))
+        }
+        cleaned = cleaned
+            .replacingOccurrences(of: "[[", with: "")
+            .replacingOccurrences(of: "]]", with: "")
+
+        if cleaned.count > 120 {
+            let cutoff = cleaned.index(cleaned.startIndex, offsetBy: 117)
+            cleaned = cleaned[..<cutoff].trimmingCharacters(in: .whitespaces) + "…"
+        }
+        return cleaned
     }
 
     // MARK: - Text → Generable Adapters

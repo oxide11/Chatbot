@@ -55,18 +55,26 @@ final class WikiStore {
     // MARK: - CRUD
 
     /// Create a new wiki page. Returns the created page.
+    /// If `summary` is empty, falls back to `deriveSummary` so every page
+    /// has a usable TOC entry — even ones created outside of extraction
+    /// (lint stubs, manual creation in the wiki UI).
     @discardableResult
     func createPage(
         title: String,
         body: String,
         tags: [String],
+        summary: String = "",
         sourceConversationID: UUID? = nil,
         sourceDocumentID: UUID? = nil
     ) async -> WikiPage? {
+        let resolvedSummary = summary.isEmpty
+            ? WikiExtractionPrompts.deriveSummary(fromBody: body, title: title)
+            : summary
         let page = WikiPage(
             id: UUID(),
             title: title,
             body: body,
+            summary: resolvedSummary,
             tags: tags,
             createdAt: Date(),
             updatedAt: Date(),
@@ -94,6 +102,7 @@ final class WikiStore {
         id: UUID,
         body: String,
         tags: [String],
+        summary: String? = nil,
         linkedPageIDs: [UUID] = [],
         sourceConversationID: UUID? = nil,
         sourceDocumentID: UUID? = nil
@@ -104,6 +113,7 @@ final class WikiStore {
                 id: id,
                 body: body,
                 tags: tags,
+                summary: summary,
                 linkedPageIDs: linkedPageIDs,
                 sourceConversationID: sourceConversationID,
                 sourceDocumentID: sourceDocumentID
@@ -111,6 +121,22 @@ final class WikiStore {
             await loadAll()
         } catch {
             AppLogger.wiki.error("Failed to update wiki page \(id): \(error.localizedDescription)")
+        }
+    }
+
+    /// Persist a summary for a page (used by lazy backfill). Patches the
+    /// in-memory copy on the main actor so the next TOC pass sees it
+    /// without a full reload.
+    @MainActor
+    func setSummary(pageID: UUID, summary: String) async {
+        guard let actor else { return }
+        do {
+            try await actor.setSummary(pageID: pageID, summary: summary)
+            if let i = pages.firstIndex(where: { $0.id == pageID }) {
+                pages[i].summary = summary
+            }
+        } catch {
+            AppLogger.wiki.error("Failed to set summary on \(pageID): \(error.localizedDescription)")
         }
     }
 
@@ -174,6 +200,58 @@ final class WikiStore {
     func findPageByTitle(_ title: String) -> WikiPage? {
         let lowered = title.lowercased()
         return pages.first { $0.title.lowercased() == lowered }
+    }
+
+    /// Build a table-of-contents string for the model to scan before
+    /// deciding which pages to fetch. When the wiki fits inside
+    /// `budget.tocEntryLimit`, every page is included; otherwise we
+    /// embedding-rank against the query and keep the top entries.
+    /// Each line has the shape `[[Title]] — summary` (or `[[Title]]`
+    /// alone for pages that haven't been summarised yet).
+    func tableOfContents(
+        for query: String,
+        budget: WikiContextBudget
+    ) -> (text: String, entryCount: Int) {
+        let pool = pages
+        guard !pool.isEmpty else { return ("", 0) }
+
+        let selected: [WikiPage]
+        if pool.count <= budget.tocEntryLimit {
+            selected = pool
+        } else if let queryVector = EmbeddingService.shared.embed(query) {
+            let scored = pool.compactMap { page -> (WikiPage, Double)? in
+                guard let pageVector = page.embedding else { return (page, 0) }
+                let similarity = EmbeddingService.cosineSimilarity(queryVector, pageVector)
+                return (page, similarity)
+            }
+            selected = scored
+                .sorted { $0.1 > $1.1 }
+                .prefix(budget.tocEntryLimit)
+                .map { $0.0 }
+        } else {
+            selected = Array(pool.prefix(budget.tocEntryLimit))
+        }
+
+        let lines = selected.map { page -> String in
+            let summary = page.summary.trimmingCharacters(in: .whitespacesAndNewlines)
+            if summary.isEmpty {
+                return "- [[\(page.title)]]"
+            }
+            return "- [[\(page.title)]] — \(summary)"
+        }
+        return (lines.joined(separator: "\n"), selected.count)
+    }
+
+    /// Title-keyed lookup for the `getWikiPage` tool. Returns the page
+    /// with body head-truncated to `budget.pageCharBudget` so a fat page
+    /// doesn't blow the on-device window.
+    func toolPageBody(forTitle title: String, budget: WikiContextBudget) -> WikiPage? {
+        guard var page = findPageByTitle(title) else { return nil }
+        if page.body.count > budget.pageCharBudget {
+            let cutoff = page.body.index(page.body.startIndex, offsetBy: budget.pageCharBudget)
+            page.body = String(page.body[..<cutoff]) + "\n…(page truncated)"
+        }
+        return page
     }
 
     /// Find pages with a specific tag.

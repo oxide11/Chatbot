@@ -21,6 +21,12 @@ final class SDWikiPage {
     var title: String
     var body: String
 
+    /// One-line summary used as a TOC entry when the model browses the wiki.
+    /// Generated at extraction time (or backfilled lazily for legacy pages).
+    /// Empty string for pages that haven't been summarised yet — the
+    /// retrieval layer treats empty as "needs backfill".
+    var summary: String = ""
+
     /// Tags stored as JSON-encoded string (SwiftData doesn't natively support [String] in predicates).
     var tagsRaw: String
 
@@ -77,6 +83,7 @@ final class SDWikiPage {
         id: UUID = UUID(),
         title: String,
         body: String,
+        summary: String = "",
         tags: [String] = [],
         sourceConversationIDs: [UUID] = [],
         sourceDocumentIDs: [UUID] = [],
@@ -85,6 +92,7 @@ final class SDWikiPage {
         self.id = id
         self.title = title
         self.body = body
+        self.summary = summary
         self.tagsRaw = encodeJSONArray(tags)
         self.createdAt = Date()
         self.updatedAt = Date()
@@ -102,6 +110,7 @@ final class SDWikiPage {
             id: page.id,
             title: page.title,
             body: page.body,
+            summary: page.summary,
             tags: page.tags,
             sourceConversationIDs: page.sourceConversationIDs,
             sourceDocumentIDs: page.sourceDocumentIDs,
@@ -120,6 +129,7 @@ final class SDWikiPage {
             id: id,
             title: title,
             body: body,
+            summary: summary,
             tags: tags,
             createdAt: createdAt,
             updatedAt: updatedAt,
@@ -139,6 +149,7 @@ struct WikiPage: Identifiable, Codable, Hashable, Sendable {
     let id: UUID
     var title: String
     var body: String
+    var summary: String = ""
     var tags: [String]
     let createdAt: Date
     var updatedAt: Date
