@@ -16,6 +16,58 @@
 //
 
 import Foundation
+import FoundationModels
+
+// MARK: - Generable Output Types
+
+/// One wiki page as produced by the LLM during extraction or lint review.
+/// Used directly by the FoundationModels Generable path; remote providers
+/// emit the same shape via the `---PAGE---/---END---` text format and the
+/// caller maps text → `WikiPageDraft` via `WikiExtractionPrompts.parse`.
+@Generable
+struct WikiPageDraft: Sendable, Hashable {
+    @Guide(description: "Concise, capitalised, noun-phrase title (e.g. \"Adam Optimizer\"). One concept per page.")
+    var title: String
+
+    @Guide(description: "2–6 bullet points or short paragraphs covering the concept. Under 100 words. Use [[Page Title]] markdown for cross-references to other wiki pages.")
+    var body: String
+
+    @Guide(description: "Lowercase keyword tags. Two to five entries.")
+    var tags: [String]
+}
+
+/// Result of a single extraction pass. `nothingExtracted` signals the
+/// "NONE" case from the text format — when true, `pages` is empty.
+@Generable
+struct WikiExtractionDraft: Sendable {
+    @Guide(description: "True if the source has no reusable factual knowledge worth extracting (greetings, filler, off-topic). When true, leave pages empty.")
+    var nothingExtracted: Bool
+
+    @Guide(description: "Wiki pages extracted from the source. Empty when nothingExtracted is true.")
+    var pages: [WikiPageDraft]
+}
+
+/// Lint output: should the two pages be merged?
+@Generable
+struct WikiMergeDecision: Sendable {
+    @Guide(description: "True iff the two pages describe the same concept and should be merged into one. False if they are related but distinct (KEEP_BOTH).")
+    var shouldMerge: Bool
+
+    @Guide(description: "When shouldMerge is true, the merged page that preserves every distinct fact from both sources (deduplicated). When false, leave nil.")
+    var mergedPage: WikiPageDraft?
+}
+
+/// Lint output: should we draft a stub for a missing wikilink target?
+@Generable
+struct WikiStubDecision: Sendable {
+    @Guide(description: "True iff the surrounding context is rich enough to write a truthful stub page. False if the context is too thin (SKIP).")
+    var canDraft: Bool
+
+    @Guide(description: "When canDraft is true, the stub page grounded in the surrounding context. When false, leave nil.")
+    var stub: WikiPageDraft?
+}
+
+// MARK: - Prompts
 
 enum WikiExtractionPrompts {
 
@@ -178,6 +230,63 @@ enum WikiExtractionPrompts {
         }
 
         return results
+    }
+
+    /// Convert a parsed text-format page block into the typed Generable
+    /// shape — used when a remote provider returned text (or to bridge
+    /// between the legacy and Generable code paths).
+    static func draft(from result: ExtractionResult) -> WikiPageDraft {
+        WikiPageDraft(title: result.title, body: result.body, tags: result.tags)
+    }
+
+    // MARK: - Text → Generable Adapters
+    //
+    // The remote providers (Anthropic / OpenAI / Gemini) still emit the
+    // text format described above. These adapters wrap the existing
+    // `parse(_:)` so call-sites can stay generic over the response shape:
+    // they ask for a `Generable` type and either get one directly from
+    // FoundationModels, or get one decoded from text via these helpers.
+
+    /// Parse a text-format response into a `WikiExtractionDraft`. Honors
+    /// the literal "NONE" sentinel.
+    static func parseExtraction(_ response: String) -> WikiExtractionDraft {
+        let trimmed = response.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.uppercased() == "NONE" || trimmed.isEmpty {
+            return WikiExtractionDraft(nothingExtracted: true, pages: [])
+        }
+        let pages = parse(trimmed).map(draft(from:))
+        return WikiExtractionDraft(
+            nothingExtracted: pages.isEmpty,
+            pages: pages
+        )
+    }
+
+    /// Parse a text-format lint merge response. The literal "KEEP_BOTH"
+    /// (case-insensitive substring) means "do not merge"; otherwise the
+    /// first parsed page block is the proposed merge.
+    static func parseMergeDecision(_ response: String) -> WikiMergeDecision {
+        let trimmed = response.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.uppercased().contains("KEEP_BOTH") {
+            return WikiMergeDecision(shouldMerge: false, mergedPage: nil)
+        }
+        if let first = parse(trimmed).first {
+            return WikiMergeDecision(shouldMerge: true, mergedPage: draft(from: first))
+        }
+        return WikiMergeDecision(shouldMerge: false, mergedPage: nil)
+    }
+
+    /// Parse a text-format lint stub response. The literal "SKIP" means
+    /// "context too thin"; otherwise the first parsed page block is the
+    /// proposed stub.
+    static func parseStubDecision(_ response: String) -> WikiStubDecision {
+        let trimmed = response.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.uppercased().contains("SKIP") {
+            return WikiStubDecision(canDraft: false, stub: nil)
+        }
+        if let first = parse(trimmed).first {
+            return WikiStubDecision(canDraft: true, stub: draft(from: first))
+        }
+        return WikiStubDecision(canDraft: false, stub: nil)
     }
 
     /// Extract [[wikilink]] references from a page body and return the referenced titles.

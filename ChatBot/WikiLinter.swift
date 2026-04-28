@@ -222,20 +222,29 @@ final class WikiLinter {
         over a low-confidence merge or stub. Output only the requested format — no preamble, no commentary.
         """
 
-    /// Run a single LLM round-trip routed through whichever provider is
-    /// bound to the `.lint` task. Falls back to LanguageModelSession when
-    /// no remote provider is configured.
-    private func respondOnce(prompt: String, maxTokens: Int) async throws -> String {
+    /// Run a single LLM round-trip and decode the response into a
+    /// `Generable` type. The FoundationModels path returns the typed value
+    /// directly (no parser); the remote-provider path returns text and the
+    /// caller-supplied `decodeText` adapter wraps it back into the typed
+    /// shape via `WikiExtractionPrompts.parse*`.
+    private func respondGenerable<T: Generable & Sendable>(
+        prompt: String,
+        maxTokens: Int,
+        generating type: T.Type,
+        decodeText: (String) -> T
+    ) async throws -> T {
         if let provider = providerRegistry?.resolve(for: .lint) {
-            return try await provider.respond(
+            let text = try await provider.respond(
                 history: [ProviderMessage(role: .user, content: prompt)],
                 systemPrompt: Self.semanticSystemPrompt,
                 options: ProviderGenerationOptions(maxOutputTokens: maxTokens, temperature: 1.0)
             )
+            return decodeText(text)
         }
         let session = LanguageModelSession { Self.semanticSystemPrompt }
         let options = GenerationOptions(sampling: .greedy, maximumResponseTokens: maxTokens)
-        return try await session.respond(to: prompt, options: options).content
+        let response = try await session.respond(to: prompt, generating: type, options: options)
+        return response.content
     }
 
     private func suggestion(for finding: WikiLintFinding) async throws -> WikiLintSuggestion {
@@ -284,13 +293,17 @@ final class WikiLinter {
         \(b.body)
         """
 
-        let response = try await respondOnce(prompt: prompt, maxTokens: 400)
-        if response.trimmingCharacters(in: .whitespacesAndNewlines)
-            .uppercased().contains("KEEP_BOTH") {
+        let decision = try await respondGenerable(
+            prompt: prompt,
+            maxTokens: 400,
+            generating: WikiMergeDecision.self,
+            decodeText: WikiExtractionPrompts.parseMergeDecision
+        )
+        if !decision.shouldMerge {
             return .noAction(rationale: "Pages are related but distinct.")
         }
-        if let result = WikiExtractionPrompts.parse(response).first {
-            return .mergePages(title: result.title, body: result.body, tags: result.tags)
+        if let merged = decision.mergedPage {
+            return .mergePages(title: merged.title, body: merged.body, tags: merged.tags)
         }
         return .noAction(rationale: "Could not parse a merge proposal.")
     }
@@ -322,13 +335,17 @@ final class WikiLinter {
         \(referencer.body)
         """
 
-        let response = try await respondOnce(prompt: prompt, maxTokens: 400)
-        if response.trimmingCharacters(in: .whitespacesAndNewlines)
-            .uppercased().contains("SKIP") {
+        let decision = try await respondGenerable(
+            prompt: prompt,
+            maxTokens: 400,
+            generating: WikiStubDecision.self,
+            decodeText: WikiExtractionPrompts.parseStubDecision
+        )
+        if !decision.canDraft {
             return .noAction(rationale: "Insufficient context to draft a stub.")
         }
-        if let result = WikiExtractionPrompts.parse(response).first {
-            return .createStub(title: result.title, body: result.body, tags: result.tags)
+        if let stub = decision.stub {
+            return .createStub(title: stub.title, body: stub.body, tags: stub.tags)
         }
         return .noAction(rationale: "Could not parse a stub draft.")
     }
