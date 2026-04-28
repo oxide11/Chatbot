@@ -188,6 +188,14 @@ struct ContentView: View {
                 .help("New Chat (\u{2318}N)")
             }
             #else
+            ToolbarItem(placement: .topBarLeading) {
+                Button {
+                    showingSettings = true
+                } label: {
+                    Label("Settings", systemImage: "gearshape")
+                }
+                .help("Settings")
+            }
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
                     _ = store.createConversation()
@@ -196,18 +204,6 @@ struct ContentView: View {
                 }
                 .keyboardShortcut("n", modifiers: .command)
                 .help("New Chat (\u{2318}N)")
-            }
-            ToolbarItem(placement: .bottomBar) {
-                HStack {
-                    Button {
-                        showingSettings = true
-                    } label: {
-                        Label("Settings", systemImage: "gearshape")
-                    }
-                    .help("Settings")
-
-                    Spacer()
-                }
             }
             #endif
         }
