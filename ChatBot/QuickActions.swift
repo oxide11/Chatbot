@@ -7,8 +7,9 @@
 //    - Settings
 //
 //  Quick Actions are registered dynamically at launch (no Info.plist
-//  array required), and the user's pick is delivered through
-//  `ChatBotAppDelegate.application(_:performActionFor:completionHandler:)`.
+//  array required), and the user's pick is delivered through the
+//  UIWindowSceneDelegate scene lifecycle (ConnectionOptions on cold
+//  launch, windowScene(_:performActionFor:) when foregrounded).
 //  We funnel it into a small @Observable router that ContentView watches.
 //
 
@@ -39,32 +40,17 @@ final class ChatBotAppDelegate: NSObject, UIApplicationDelegate {
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
         application.shortcutItems = Self.makeShortcutItems()
-
-        // Cold-launch via a Quick Action — capture it so the router fires
-        // once SwiftUI's scene comes up.
-        if let cold = launchOptions?[.shortcutItem] as? UIApplicationShortcutItem,
-           let action = QuickActionType(rawValue: cold.type) {
-            Task { @MainActor in
-                QuickActionRouter.shared.pending = action
-            }
-        }
         return true
     }
 
-    /// Foreground tap on a Quick Action — the OS calls this directly.
     func application(
         _ application: UIApplication,
-        performActionFor shortcutItem: UIApplicationShortcutItem,
-        completionHandler: @escaping (Bool) -> Void
-    ) {
-        guard let action = QuickActionType(rawValue: shortcutItem.type) else {
-            completionHandler(false)
-            return
-        }
-        Task { @MainActor in
-            QuickActionRouter.shared.pending = action
-            completionHandler(true)
-        }
+        configurationForConnecting connectingSceneSession: UISceneSession,
+        options: UIScene.ConnectionOptions
+    ) -> UISceneConfiguration {
+        let config = UISceneConfiguration(name: nil, sessionRole: connectingSceneSession.role)
+        config.delegateClass = ChatBotSceneDelegate.self
+        return config
     }
 
     private static func makeShortcutItems() -> [UIApplicationShortcutItem] {
@@ -84,6 +70,37 @@ final class ChatBotAppDelegate: NSObject, UIApplicationDelegate {
                 userInfo: nil
             )
         ]
+    }
+}
+
+final class ChatBotSceneDelegate: NSObject, UIWindowSceneDelegate {
+
+    func scene(
+        _ scene: UIScene,
+        willConnectTo session: UISceneSession,
+        options connectionOptions: UIScene.ConnectionOptions
+    ) {
+        if let shortcutItem = connectionOptions.shortcutItem,
+           let action = QuickActionType(rawValue: shortcutItem.type) {
+            Task { @MainActor in
+                QuickActionRouter.shared.pending = action
+            }
+        }
+    }
+
+    func windowScene(
+        _ windowScene: UIWindowScene,
+        performActionFor shortcutItem: UIApplicationShortcutItem,
+        completionHandler: @escaping (Bool) -> Void
+    ) {
+        guard let action = QuickActionType(rawValue: shortcutItem.type) else {
+            completionHandler(false)
+            return
+        }
+        Task { @MainActor in
+            QuickActionRouter.shared.pending = action
+            completionHandler(true)
+        }
     }
 }
 
