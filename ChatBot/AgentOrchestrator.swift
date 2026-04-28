@@ -80,21 +80,30 @@ final class AgentOrchestrator {
 
     // MARK: - Session Factory
 
-    /// Create a `LanguageModelSession` configured as the Manager with all active worker tools.
+    /// Create a `LanguageModelSession` configured as the Manager with all
+    /// active worker tools, plus any extra tools (e.g. wiki search/fetch)
+    /// the caller wants mounted alongside.
     ///
     /// - Parameters:
     ///   - baseInstructions: The conversation's system prompt (custom or default).
     ///   - conversationSummary: Optional summary from a previous context rotation.
+    ///   - extraTools: Additional tools to expose to the Manager — typically
+    ///     `WikiSearchTool` / `WikiGetPageTool` when wiki retrieval is on.
+    ///   - extraInstructions: Behavioural guidance for the extra tools,
+    ///     appended after the worker-tool guidance.
     /// - Returns: A configured `LanguageModelSession`.
     func createManagerSession(
         baseInstructions: String,
-        conversationSummary: String? = nil
+        conversationSummary: String? = nil,
+        extraTools: [any Tool] = [],
+        extraInstructions: String = ""
     ) -> LanguageModelSession {
-        let tools = activeTools
+        let workerTools: [any Tool] = activeTools
+        let allTools: [any Tool] = workerTools + extraTools
 
         var fullInstructions = baseInstructions
 
-        if !tools.isEmpty {
+        if !workerTools.isEmpty {
             // Tool schemas are already injected by the framework; this section
             // is purely behavioural guidance for *when* to delegate and *how*
             // to integrate the worker's output.
@@ -114,18 +123,22 @@ final class AgentOrchestrator {
             """
         }
 
+        if !extraInstructions.isEmpty {
+            fullInstructions += "\n\n\(extraInstructions)"
+        }
+
         if let summary = conversationSummary, !summary.isEmpty {
             fullInstructions += "\n\n## Prior Context\n\(summary)\n\nContinue the conversation naturally from where it left off."
         }
 
         let instructions = fullInstructions
 
-        if tools.isEmpty {
+        if allTools.isEmpty {
             return LanguageModelSession {
                 instructions
             }
         } else {
-            return LanguageModelSession(tools: tools) {
+            return LanguageModelSession(tools: allTools) {
                 instructions
             }
         }

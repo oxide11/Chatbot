@@ -38,22 +38,6 @@ final class WikiEngine {
     /// Whether wiki injection into prompts is enabled.
     var injectionEnabled: Bool = true
 
-    /// Max wiki pages to inject for on-device model (4096 token budget).
-    var onDevicePageLimit: Int = 2
-
-    /// Max characters of wiki context for on-device model.
-    var onDeviceCharBudget: Int = 1750
-
-    /// Max wiki pages to inject when the chat is routed to a remote provider
-    /// (Anthropic / OpenAI / Gemini). Their windows are 100k+ tokens, so the
-    /// on-device cap of 2 pages would starve the model of useful context.
-    var remotePageLimit: Int = 8
-
-    /// Max characters of wiki context when the chat is routed to a remote
-    /// provider. Roughly ~3k tokens — generous but bounded so a fat wiki
-    /// doesn't blow past the model's effective attention.
-    var remoteCharBudget: Int = 12_000
-
     init(wikiStore: WikiStore) {
         self.wikiStore = wikiStore
     }
@@ -127,11 +111,16 @@ final class WikiEngine {
             let mergedBody = mergeContent(existing: existing.body, new: page.body)
             let mergedTags = Array(Set(existing.tags + page.tags))
             let mergedLinks = Array(Set(existing.linkedPageIDs + linkedIDs))
+            // Prefer the freshly extracted summary; fall back to the
+            // existing one so a model that forgets the field doesn't
+            // wipe a good summary on merge.
+            let mergedSummary = page.summary.isEmpty ? existing.summary : page.summary
 
             await wikiStore.updatePage(
                 id: existing.id,
                 body: mergedBody,
                 tags: mergedTags,
+                summary: mergedSummary,
                 linkedPageIDs: mergedLinks,
                 sourceConversationID: sourceConversationID,
                 sourceDocumentID: sourceDocumentID
@@ -139,10 +128,14 @@ final class WikiEngine {
             AppLogger.wiki.info("Merged into existing wiki page '\(page.title)'")
             return .merged
         } else {
+            let summary = page.summary.isEmpty
+                ? WikiExtractionPrompts.deriveSummary(fromBody: page.body, title: page.title)
+                : page.summary
             await wikiStore.createPage(
                 title: page.title,
                 body: page.body,
                 tags: page.tags,
+                summary: summary,
                 sourceConversationID: sourceConversationID,
                 sourceDocumentID: sourceDocumentID
             )
@@ -153,23 +146,19 @@ final class WikiEngine {
 
     // MARK: - Context Injection
 
-    /// Query the wiki for relevant pages and format them for injection into the prompt.
-    /// Returns a formatted context string and the number of pages included.
-    /// Pass `forRemoteProvider: true` when the consuming model has a large
-    /// context window (Anthropic / OpenAI / Gemini) so the on-device caps
-    /// don't starve it of wiki signal.
+    /// Query the wiki for relevant pages and format them for injection into
+    /// the prompt as full-page blocks. Used by the pre-injection path
+    /// (remote providers); the on-device tool path uses
+    /// `WikiStore.tableOfContents` instead.
     func buildWikiContext(
         for query: String,
-        forRemoteProvider: Bool = false
+        budget: WikiContextBudget
     ) -> (context: String, pageCount: Int) {
         guard injectionEnabled else { return ("", 0) }
 
-        let budgetChars = forRemoteProvider ? remoteCharBudget : onDeviceCharBudget
-        let maxPages = forRemoteProvider ? remotePageLimit : onDevicePageLimit
-
         let relevantPages = wikiStore.findRelevantPages(
             for: query,
-            limit: maxPages
+            limit: budget.preInjectPageLimit
         )
 
         guard !relevantPages.isEmpty else { return ("", 0) }
@@ -180,7 +169,7 @@ final class WikiEngine {
 
         for page in relevantPages {
             let formatted = "## \(page.title)\n\(page.body)"
-            if usedChars + formatted.count > budgetChars { break }
+            if usedChars + formatted.count > budget.preInjectCharBudget { break }
             context += formatted + "\n\n"
             usedChars += formatted.count
             includedCount += 1
@@ -189,6 +178,28 @@ final class WikiEngine {
         }
 
         return (context.trimmingCharacters(in: .whitespacesAndNewlines), includedCount)
+    }
+
+    /// Lazy backfill: walk pages with empty `summary` and persist a
+    /// deterministic fallback derived from the body's first line.
+    /// Detached so it doesn't block the turn that triggered it. Cheap —
+    /// no LLM calls, just string ops + a SwiftData write per page.
+    func backfillMissingSummaries() {
+        let needsBackfill = wikiStore.pages.filter { $0.summary.isEmpty }
+        guard !needsBackfill.isEmpty else { return }
+
+        let store = wikiStore
+        Task {
+            for page in needsBackfill {
+                let summary = WikiExtractionPrompts.deriveSummary(
+                    fromBody: page.body,
+                    title: page.title
+                )
+                if !summary.isEmpty {
+                    await store.setSummary(pageID: page.id, summary: summary)
+                }
+            }
+        }
     }
 
     // MARK: - Provider Routing
