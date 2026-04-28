@@ -120,9 +120,15 @@ final class ChatViewModel: Identifiable {
     private static let estimatedMaxTokens = 4096.0
     private static let charsPerToken = 3.5
 
-    /// Concise system prompt optimised for the small on-device model.
-    /// Shorter instructions leave more context for the actual conversation.
-    static let defaultInstructions = "Be helpful, friendly, and concise. Answer directly."
+    /// Default system prompt for the chat. Kept short to leave context room
+    /// on the on-device 3B model. Notes that markdown / LaTeX render in the
+    /// UI so the model can use them when they make an answer clearer (math
+    /// in particular benefits — Engram renders `$inline$` and `$$display$$`
+    /// equations via SwiftMath).
+    static let defaultInstructions = """
+        You are Engram, a helpful, concise assistant. Answer directly. \
+        Use markdown — including `code`, lists, and LaTeX math `$x^2$` / `$$\\int x\\,dx$$` — when it makes the answer clearer. Skip filler.
+        """
 
     var activeInstructions: String {
         customSystemPrompt?.isEmpty == false
@@ -605,9 +611,17 @@ final class ChatViewModel: Identifiable {
             )
         }
 
-        // Summarise for the new session — use greedy sampling for a deterministic, focused summary
+        // Summarise for the new session — use greedy sampling for a deterministic, focused summary.
+        // Wiki extraction (a separate pipeline) handles persisted facts; this
+        // summary is *only* short-term continuity bridging context rotation,
+        // so we ask for topics + decisions + open questions and nothing else.
         let summarySession = LanguageModelSession {
-            "Summarize this conversation in 2 concise sentences. State only topics discussed and decisions made."
+            """
+            Summarise the conversation in two short sentences. \
+            Include only: topics discussed, decisions made, open questions. \
+            Skip greetings, filler, and any persistent facts (those are handled separately). \
+            Output two sentences. Nothing else.
+            """
         }
 
         let greedyOptions = GenerationOptions(

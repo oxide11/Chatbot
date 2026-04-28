@@ -216,8 +216,11 @@ final class WikiLinter {
         }
     }
 
-    private static let semanticSystemPrompt =
-        "You review a personal wiki for duplicates, missing pages, and contradictions."
+    private static let semanticSystemPrompt = """
+        You review a personal wiki for duplicates, missing pages, and contradictions. \
+        Be conservative: when in doubt, prefer the literal sentinel words KEEP_BOTH or SKIP \
+        over a low-confidence merge or stub. Output only the requested format — no preamble, no commentary.
+        """
 
     /// Run a single LLM round-trip routed through whichever provider is
     /// bound to the `.lint` task. Falls back to LanguageModelSession when
@@ -258,17 +261,20 @@ final class WikiLinter {
         }
 
         let prompt = """
-        These two wiki pages may describe the same concept. If they are the
-        same, propose a merged page that preserves every distinct fact from
-        both (deduplicate exact repeats). If they are related but distinct,
-        respond with exactly: KEEP_BOTH
+        Decide whether these two wiki pages describe the same concept.
 
-        Format your merge as:
+        - If they are the same concept, output a merged page that keeps every distinct fact from both (deduplicate exact repeats; preserve numbers, names, and `[[wikilinks]]` from either source).
+        - If they are related but distinct, respond with exactly: KEEP_BOTH
+
+        Output one of:
+          (a) KEEP_BOTH on a single line by itself, or
+          (b) a single page block in this exact shape (no preamble, no commentary):
+
         ---PAGE---
-        TITLE: <best title>
+        TITLE: <best surviving title>
         TAGS: <comma-separated, lowercase>
         BODY:
-        <merged content; bullet points; under 120 words>
+        <merged content; bullet points; ≤120 words>
         ---END---
 
         --- Page A: \(a.title) ---
@@ -296,17 +302,20 @@ final class WikiLinter {
         }
 
         let prompt = """
-        The wiki references [[\(target)]] but no page exists for it. Draft a
-        concise stub page based only on the surrounding context below. Use
-        bullet points; under 80 words. If the context is too thin to write
-        anything truthful, respond with exactly: SKIP
+        The wiki references `[[\(target)]]` but no page exists for it. \
+        Draft a stub page using ONLY facts you can ground in the surrounding context below. \
+        Do not invent or guess. \
+        If the context is too thin to write anything truthful, respond with exactly: SKIP
 
-        Format:
+        Output one of:
+          (a) SKIP on a single line by itself, or
+          (b) a single page block in this exact shape (no preamble, no commentary):
+
         ---PAGE---
         TITLE: \(target.capitalized)
         TAGS: <comma-separated, lowercase>
         BODY:
-        <stub content>
+        <2–4 bullet points; ≤80 words>
         ---END---
 
         --- Surrounding context (from \u{201C}\(referencer.title)\u{201D}) ---

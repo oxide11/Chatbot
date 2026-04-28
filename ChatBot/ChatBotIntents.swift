@@ -15,8 +15,15 @@ struct AskChatBotIntent: AppIntent {
     }
 
     func perform() async throws -> some IntentResult & ProvidesDialog {
+        // Siri answers are spoken — keep them short and avoid markdown / code
+        // blocks / LaTeX (Siri reads them literally). The chat-default
+        // persona used inside the app is more permissive about formatting.
         let session = LanguageModelSession {
-            "You are a helpful, friendly assistant. Be concise."
+            """
+            You are Engram, answering via Siri. Be concise — under 40 words. \
+            Plain spoken English: no markdown, no code blocks, no LaTeX, no lists. \
+            If you don't know, say so in one sentence.
+            """
         }
 
         let response = try await session.respond(to: question)
