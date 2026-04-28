@@ -216,32 +216,30 @@ struct KnowledgeBaseListView: View {
                     }
                 }
 
-                // Existing knowledge bases, grouped by domain
-                ForEach(knowledgeBaseStore.domains) { domain in
-                    let domainKBs = knowledgeBaseStore.knowledgeBases(for: domain.id)
-                    if !domainKBs.isEmpty {
-                        Section {
-                            ForEach(domainKBs) { kb in
-                                NavigationLink {
-                                    KnowledgeBaseDetailView(kb: kb, store: knowledgeBaseStore, wikiEngine: wikiEngine)
-                                } label: {
-                                    HStack(spacing: 12) {
-                                        Image(systemName: kb.documentType.icon)
-                                            .font(.title2)
-                                            .foregroundStyle(.secondary)
-                                            .frame(width: 32)
+                // Existing knowledge bases (flat list)
+                if !knowledgeBaseStore.knowledgeBases.isEmpty {
+                    Section {
+                        ForEach(knowledgeBaseStore.knowledgeBases) { kb in
+                            NavigationLink {
+                                KnowledgeBaseDetailView(kb: kb, store: knowledgeBaseStore, wikiEngine: wikiEngine)
+                            } label: {
+                                HStack(spacing: 12) {
+                                    Image(systemName: kb.documentType.icon)
+                                        .font(.title2)
+                                        .foregroundStyle(.secondary)
+                                        .frame(width: 32)
 
-                                        VStack(alignment: .leading, spacing: 4) {
-                                            Text(kb.name)
-                                                .font(.body)
-                                                .lineLimit(1)
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text(kb.name)
+                                            .font(.body)
+                                            .lineLimit(1)
 
-                                            HStack(spacing: 4) {
-                                                Text(kb.documentType.label)
-                                                Text("\u{00B7}")
-                                                Text("\(kb.chunkCount) chunks")
-                                                Text("\u{00B7}")
-                                                Text(ByteCountFormatter.string(
+                                        HStack(spacing: 4) {
+                                            Text(kb.documentType.label)
+                                            Text("\u{00B7}")
+                                            Text("\(kb.chunkCount) chunks")
+                                            Text("\u{00B7}")
+                                            Text(ByteCountFormatter.string(
                                                     fromByteCount: knowledgeBaseStore.storageSize(for: kb),
                                                     countStyle: .file
                                                 ))
@@ -265,18 +263,6 @@ struct KnowledgeBaseListView: View {
                                         Label("Rename", systemImage: "pencil")
                                     }
 
-                                    if knowledgeBaseStore.domains.count > 1 {
-                                        Menu {
-                                            ForEach(knowledgeBaseStore.domains.filter { $0.id != kb.effectiveDomainID }) { targetDomain in
-                                                Button(targetDomain.name) {
-                                                    knowledgeBaseStore.moveKnowledgeBase(kb, toDomain: targetDomain.id)
-                                                }
-                                            }
-                                        } label: {
-                                            Label("Move to Domain", systemImage: "arrow.right.square")
-                                        }
-                                    }
-
                                     Divider()
                                     Button(role: .destructive) {
                                         knowledgeBaseStore.deleteKnowledgeBase(kb)
@@ -284,15 +270,12 @@ struct KnowledgeBaseListView: View {
                                         Label("Delete", systemImage: "trash")
                                     }
                                 }
+                        }
+                        .onDelete { offsets in
+                            let toDelete = offsets.map { knowledgeBaseStore.knowledgeBases[$0] }
+                            for kb in toDelete {
+                                knowledgeBaseStore.deleteKnowledgeBase(kb)
                             }
-                            .onDelete { offsets in
-                                let toDelete = offsets.map { domainKBs[$0] }
-                                for kb in toDelete {
-                                    knowledgeBaseStore.deleteKnowledgeBase(kb)
-                                }
-                            }
-                        } header: {
-                            Text(domain.name)
                         }
                     }
                 }
@@ -305,7 +288,6 @@ struct KnowledgeBaseListView: View {
 
 struct TextInputSheet: View {
     var knowledgeBaseStore: KnowledgeBaseStore
-    var domainID: UUID = KnowledgeDomain.generalID
     @Environment(\.dismiss) private var dismiss
     @State private var name = ""
     @State private var text = ""
@@ -347,7 +329,7 @@ struct TextInputSheet: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Import") {
-                        knowledgeBaseStore.ingestText(name: name, text: text, domainID: domainID)
+                        knowledgeBaseStore.ingestText(name: name, text: text)
                         dismiss()
                     }
                     .bold()
@@ -529,7 +511,6 @@ struct KnowledgeBaseDetailView: View {
                 WikiExtractionProgressView(
                     sourceName: kb.name,
                     document: kb,
-                    domainID: kb.domainID,
                     wikiEngine: wikiEngine,
                     knowledgeBaseStore: store
                 )

@@ -11,81 +11,20 @@ import Foundation
 import SwiftData
 @testable import ChatBot
 
-// MARK: - Knowledge Domain Model Tests
-
-@Suite("KnowledgeDomain Model")
-struct KnowledgeDomainModelTests {
-
-    @Test("General ID is well-known UUID")
-    func generalIDIsWellKnown() {
-        let expected = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
-        #expect(KnowledgeDomain.generalID == expected)
-    }
-
-    @Test("general() factory creates default domain")
-    func generalFactory() {
-        let general = KnowledgeDomain.general()
-        #expect(general.id == KnowledgeDomain.generalID)
-        #expect(general.name == "General")
-        #expect(general.isDefault == true)
-    }
-
-    @Test("Custom domain has isDefault false")
-    func customDomain() {
-        let domain = KnowledgeDomain(name: "Medical")
-        #expect(domain.name == "Medical")
-        #expect(domain.isDefault == false)
-        #expect(domain.id != KnowledgeDomain.generalID)
-    }
-
-    @Test("Domain round-trips through Codable")
-    func codableRoundTrip() throws {
-        let original = KnowledgeDomain(name: "Cooking", isDefault: false)
-        let data = try JSONEncoder().encode(original)
-        let decoded = try JSONDecoder().decode(KnowledgeDomain.self, from: data)
-        #expect(decoded.id == original.id)
-        #expect(decoded.name == original.name)
-        #expect(decoded.isDefault == original.isDefault)
-        #expect(abs(decoded.createdAt.timeIntervalSince(original.createdAt)) < 0.001)
-    }
-
-    @Test("Domain with explicit ID preserves it")
-    func explicitID() {
-        let id = UUID()
-        let domain = KnowledgeDomain(id: id, name: "Work")
-        #expect(domain.id == id)
-    }
-}
 
 // MARK: - KnowledgeBase Model Tests
 
 @Suite("KnowledgeBase Model")
 struct KnowledgeBaseModelTests {
 
-    @Test("effectiveDomainID returns generalID when domainID is nil")
-    func effectiveDomainIDNil() {
-        let kb = KnowledgeBase(name: "Test", documentType: .pdf, chunkCount: 10, fileSize: 1024)
-        #expect(kb.domainID == nil)
-        #expect(kb.effectiveDomainID == KnowledgeDomain.generalID)
-    }
-
-    @Test("effectiveDomainID returns actual domainID when set")
-    func effectiveDomainIDSet() {
-        let domainID = UUID()
-        let kb = KnowledgeBase(name: "Test", documentType: .text, chunkCount: 5, fileSize: 512, domainID: domainID)
-        #expect(kb.effectiveDomainID == domainID)
-    }
-
     @Test("KnowledgeBase round-trips through Codable")
     func codableRoundTrip() throws {
-        let domainID = UUID()
         let original = KnowledgeBase(
             name: "My Doc",
             documentType: .epub,
             chunkCount: 42,
             fileSize: 2048,
-            embeddingModelID: "model-v1",
-            domainID: domainID
+            embeddingModelID: "model-v1"
         )
         let data = try JSONEncoder().encode(original)
         let decoded = try JSONDecoder().decode(KnowledgeBase.self, from: data)
@@ -95,12 +34,11 @@ struct KnowledgeBaseModelTests {
         #expect(decoded.chunkCount == 42)
         #expect(decoded.fileSize == 2048)
         #expect(decoded.embeddingModelID == "model-v1")
-        #expect(decoded.domainID == domainID)
     }
 
-    @Test("Backward-compatible decoding without domainID or updatedAt")
+    @Test("Backward-compatible decoding without updatedAt")
     func backwardCompatibleDecoding() throws {
-        // Simulate old JSON without domainID and updatedAt fields
+        // Simulate old JSON without updatedAt
         let json = """
         {
             "id": "11111111-1111-1111-1111-111111111111",
@@ -114,8 +52,6 @@ struct KnowledgeBaseModelTests {
         let data = json.data(using: .utf8)!
         let decoded = try JSONDecoder().decode(KnowledgeBase.self, from: data)
         #expect(decoded.name == "Old Doc")
-        #expect(decoded.domainID == nil)
-        #expect(decoded.effectiveDomainID == KnowledgeDomain.generalID)
         #expect(decoded.embeddingModelID == nil)
         // updatedAt falls back to createdAt
         #expect(abs(decoded.updatedAt.timeIntervalSince(decoded.createdAt)) < 0.001)
@@ -391,7 +327,6 @@ struct WikiPageModelTests {
             updatedAt: Date(),
             sourceConversationIDs: [],
             linkedPageIDs: [],
-            domainID: nil,
             accessCount: 0,
             lastAccessedAt: Date(),
             embedding: nil
@@ -399,48 +334,8 @@ struct WikiPageModelTests {
         #expect(page.tags == ["swift", "concurrency"])
     }
 
-    @Test("domainID defaults to nil")
-    func domainIDDefaultsNil() {
-        let page = WikiPage(
-            id: UUID(),
-            title: "Test",
-            body: "Body",
-            tags: [],
-            createdAt: Date(),
-            updatedAt: Date(),
-            sourceConversationIDs: [],
-            linkedPageIDs: [],
-            domainID: nil,
-            accessCount: 0,
-            lastAccessedAt: Date(),
-            embedding: nil
-        )
-        #expect(page.domainID == nil)
-    }
-
-    @Test("domainID can be set explicitly")
-    func domainIDExplicit() {
-        let domainID = UUID()
-        let page = WikiPage(
-            id: UUID(),
-            title: "Test",
-            body: "Body",
-            tags: [],
-            createdAt: Date(),
-            updatedAt: Date(),
-            sourceConversationIDs: [],
-            linkedPageIDs: [],
-            domainID: domainID,
-            accessCount: 0,
-            lastAccessedAt: Date(),
-            embedding: nil
-        )
-        #expect(page.domainID == domainID)
-    }
-
     @Test("WikiPage round-trips through Codable preserving all fields")
-    func codableRoundTripWithDomainID() throws {
-        let domainID = UUID()
+    func codableRoundTripPreservesFields() throws {
         let convID = UUID()
         let linkedID = UUID()
         let original = WikiPage(
@@ -452,7 +347,6 @@ struct WikiPageModelTests {
             updatedAt: Date(),
             sourceConversationIDs: [convID],
             linkedPageIDs: [linkedID],
-            domainID: domainID,
             accessCount: 5,
             lastAccessedAt: Date(),
             embedding: [1.0, 2.0, 3.0]
@@ -463,7 +357,6 @@ struct WikiPageModelTests {
         #expect(decoded.title == original.title)
         #expect(decoded.body == original.body)
         #expect(decoded.tags == ["swift", "concurrency"])
-        #expect(decoded.domainID == domainID)
         #expect(decoded.sourceConversationIDs == [convID])
         #expect(decoded.linkedPageIDs == [linkedID])
         #expect(decoded.accessCount == 5)
@@ -489,7 +382,6 @@ struct WikiPageModelTests {
         let data = json.data(using: .utf8)!
         let decoded = try JSONDecoder().decode(WikiPage.self, from: data)
         #expect(decoded.title == "Old Page")
-        #expect(decoded.domainID == nil)
         #expect(decoded.embedding == nil)
     }
 
@@ -505,7 +397,6 @@ struct WikiPageModelTests {
             updatedAt: Date(),
             sourceConversationIDs: [],
             linkedPageIDs: [],
-            domainID: nil,
             accessCount: 0,
             lastAccessedAt: Date(),
             embedding: nil
@@ -536,7 +427,6 @@ struct WikiStoreTests {
             title: "Test Page",
             body: "Content here",
             tags: ["test"],
-            domainID: nil,
             sourceConversationID: nil
         )
         #expect(page != nil)
@@ -549,8 +439,8 @@ struct WikiStoreTests {
     func deletePage() async throws {
         let store = try makeStore()
 
-        await store.createPage(title: "Keep", body: "A", tags: [], domainID: nil, sourceConversationID: nil)
-        let toDelete = await store.createPage(title: "Delete Me", body: "B", tags: [], domainID: nil, sourceConversationID: nil)
+        await store.createPage(title: "Keep", body: "A", tags: [], sourceConversationID: nil)
+        let toDelete = await store.createPage(title: "Delete Me", body: "B", tags: [], sourceConversationID: nil)
         #expect(store.pages.count == 2)
 
         await store.deletePage(id: toDelete!.id)
@@ -563,42 +453,12 @@ struct WikiStoreTests {
     func deleteAll() async throws {
         let store = try makeStore()
 
-        await store.createPage(title: "One", body: "A", tags: [], domainID: nil, sourceConversationID: nil)
-        await store.createPage(title: "Two", body: "B", tags: [], domainID: nil, sourceConversationID: nil)
+        await store.createPage(title: "One", body: "A", tags: [], sourceConversationID: nil)
+        await store.createPage(title: "Two", body: "B", tags: [], sourceConversationID: nil)
         #expect(store.pages.count == 2)
 
         await store.deleteAllPages()
         #expect(store.pages.isEmpty)
-    }
-
-    @Test("pages(forDomain:) filters by domain")
-    @MainActor
-    func pagesForDomain() async throws {
-        let store = try makeStore()
-        let medicalID = UUID()
-
-        await store.createPage(title: "General Fact", body: "A", tags: [], domainID: KnowledgeDomain.generalID, sourceConversationID: nil)
-        await store.createPage(title: "Medical Fact", body: "B", tags: [], domainID: medicalID, sourceConversationID: nil)
-        await store.createPage(title: "Another General", body: "C", tags: [], domainID: KnowledgeDomain.generalID, sourceConversationID: nil)
-
-        let generalPages = store.pages(forDomain: KnowledgeDomain.generalID)
-        let medicalPages = store.pages(forDomain: medicalID)
-
-        #expect(generalPages.count == 2)
-        #expect(medicalPages.count == 1)
-        #expect(medicalPages[0].title == "Medical Fact")
-    }
-
-    @Test("pages with nil domainID are treated as General")
-    @MainActor
-    func nilDomainTreatedAsGeneral() async throws {
-        let store = try makeStore()
-
-        await store.createPage(title: "No Domain", body: "A", tags: [], domainID: nil, sourceConversationID: nil)
-
-        let generalPages = store.pages(forDomain: KnowledgeDomain.generalID)
-        #expect(generalPages.count == 1)
-        #expect(generalPages[0].title == "No Domain")
     }
 
     @Test("findPageByTitle finds exact match case-insensitively")
@@ -606,7 +466,7 @@ struct WikiStoreTests {
     func findByTitle() async throws {
         let store = try makeStore()
 
-        await store.createPage(title: "Swift Concurrency", body: "Content", tags: [], domainID: nil, sourceConversationID: nil)
+        await store.createPage(title: "Swift Concurrency", body: "Content", tags: [], sourceConversationID: nil)
 
         #expect(store.findPageByTitle("Swift Concurrency") != nil)
         #expect(store.findPageByTitle("swift concurrency") != nil)
@@ -618,8 +478,8 @@ struct WikiStoreTests {
     func findByTag() async throws {
         let store = try makeStore()
 
-        await store.createPage(title: "Page A", body: "A", tags: ["swift", "ios"], domainID: nil, sourceConversationID: nil)
-        await store.createPage(title: "Page B", body: "B", tags: ["python"], domainID: nil, sourceConversationID: nil)
+        await store.createPage(title: "Page A", body: "A", tags: ["swift", "ios"], sourceConversationID: nil)
+        await store.createPage(title: "Page B", body: "B", tags: ["python"], sourceConversationID: nil)
 
         let swiftPages = store.findPages(withTag: "swift")
         #expect(swiftPages.count == 1)
@@ -635,7 +495,7 @@ struct WikiStoreTests {
     func updatePage() async throws {
         let store = try makeStore()
 
-        let page = await store.createPage(title: "Original", body: "Old body", tags: ["old"], domainID: nil, sourceConversationID: nil)
+        let page = await store.createPage(title: "Original", body: "Old body", tags: ["old"], sourceConversationID: nil)
         await store.updatePage(id: page!.id, body: "New body", tags: ["new"])
 
         let updated = store.pages.first { $0.id == page!.id }
@@ -643,20 +503,6 @@ struct WikiStoreTests {
         #expect(updated?.tags == ["new"])
     }
 
-    @Test("updatePage preserves domainID")
-    @MainActor
-    func updatePreservesDomain() async throws {
-        let store = try makeStore()
-        let domainID = UUID()
-
-        let page = await store.createPage(title: "Test", body: "Old", tags: ["old"], domainID: domainID, sourceConversationID: nil)
-        await store.updatePage(id: page!.id, body: "Updated", tags: ["new"])
-
-        let updated = store.pages.first { $0.id == page!.id }
-        #expect(updated?.body == "Updated")
-        #expect(updated?.tags == ["new"])
-        #expect(updated?.domainID == domainID)
-    }
 }
 
 // MARK: - ConversationData Model Tests
@@ -664,9 +510,8 @@ struct WikiStoreTests {
 @Suite("ConversationData Model")
 struct ConversationDataModelTests {
 
-    @Test("ConversationData round-trips through Codable with domainID")
+    @Test("ConversationData round-trips through Codable")
     func codableRoundTrip() throws {
-        let domainID = UUID()
         let original = ConversationData(
             id: UUID(),
             title: "Test Chat",
@@ -675,8 +520,7 @@ struct ConversationDataModelTests {
                 Message(role: .user, content: "Hello"),
                 Message(role: .assistant, content: "Hi there!")
             ],
-            customSystemPrompt: "Be helpful",
-            domainID: domainID
+            customSystemPrompt: "Be helpful"
         )
         let data = try JSONEncoder().encode(original)
         let decoded = try JSONDecoder().decode(ConversationData.self, from: data)
@@ -684,10 +528,9 @@ struct ConversationDataModelTests {
         #expect(decoded.title == "Test Chat")
         #expect(decoded.messages.count == 2)
         #expect(decoded.customSystemPrompt == "Be helpful")
-        #expect(decoded.domainID == domainID)
     }
 
-    @Test("ConversationData decodes without domainID (backward compat)")
+    @Test("ConversationData decodes minimal JSON (backward compat)")
     func backwardCompatDecoding() throws {
         let json = """
         {
@@ -700,7 +543,6 @@ struct ConversationDataModelTests {
         let data = json.data(using: .utf8)!
         let decoded = try JSONDecoder().decode(ConversationData.self, from: data)
         #expect(decoded.title == "Old Chat")
-        #expect(decoded.domainID == nil)
         #expect(decoded.customSystemPrompt == nil)
     }
 }

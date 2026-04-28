@@ -136,9 +136,6 @@ final class WikiLinter {
             for j in (i + 1)..<pagesWithEmbeddings.count {
                 let a = pagesWithEmbeddings[i]
                 let b = pagesWithEmbeddings[j]
-                if (a.domainID ?? KnowledgeDomain.generalID) != (b.domainID ?? KnowledgeDomain.generalID) {
-                    continue
-                }
                 guard let av = a.embedding, let bv = b.embedding else { continue }
                 let similarity = EmbeddingService.cosineSimilarity(av, bv)
                 if similarity >= similarityThreshold {
@@ -347,8 +344,7 @@ final class WikiLinter {
                 _ = await wikiStore.createPage(
                     title: title,
                     body: body,
-                    tags: tags,
-                    domainID: primary.domainID
+                    tags: tags
                 )
                 await wikiStore.deletePage(id: finding.primaryPageID)
             }
@@ -357,12 +353,11 @@ final class WikiLinter {
         case .keepBoth:
             break // dismiss only
 
-        case .createPage(let title, let body, let tags, let domainID):
+        case .createPage(let title, let body, let tags):
             _ = await wikiStore.createPage(
                 title: title,
                 body: body,
-                tags: tags,
-                domainID: domainID
+                tags: tags
             )
 
         case .rewriteLink(let from, let to):

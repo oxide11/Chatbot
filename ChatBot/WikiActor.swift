@@ -3,8 +3,7 @@
 //  ChatBot
 //
 //  Thread-safe SwiftData access for Wiki page persistence.
-//  Mirrors the KnowledgeBaseActor pattern: @ModelActor with a dedicated
-//  ModelContext on its own serial executor.
+//  @ModelActor with a dedicated ModelContext on its own serial executor.
 //
 //  All methods accept and return lightweight structs (WikiPage),
 //  never @Model objects, since those cannot cross actor boundaries.
@@ -32,16 +31,6 @@ actor WikiActor {
     /// Load all wiki pages as lightweight structs.
     func loadAllPages() throws -> [WikiPage] {
         let descriptor = FetchDescriptor<SDWikiPage>(
-            sortBy: [SortDescriptor(\.updatedAt, order: .reverse)]
-        )
-        return try modelContext.fetch(descriptor).map { $0.toStruct() }
-    }
-
-    /// Load pages for a specific domain.
-    func loadPages(forDomain domainID: UUID) throws -> [WikiPage] {
-        let predicate = #Predicate<SDWikiPage> { $0.domainID == domainID }
-        let descriptor = FetchDescriptor<SDWikiPage>(
-            predicate: predicate,
             sortBy: [SortDescriptor(\.updatedAt, order: .reverse)]
         )
         return try modelContext.fetch(descriptor).map { $0.toStruct() }
@@ -134,14 +123,8 @@ actor WikiActor {
         AppLogger.wiki.info("Deleted all wiki pages (\(all.count) total)")
     }
 
-    /// Count pages, optionally filtered by domain.
-    func pageCount(forDomain domainID: UUID? = nil) throws -> Int {
-        if let domainID {
-            let predicate = #Predicate<SDWikiPage> { $0.domainID == domainID }
-            let descriptor = FetchDescriptor<SDWikiPage>(predicate: predicate)
-            return try modelContext.fetchCount(descriptor)
-        } else {
-            return try modelContext.fetchCount(FetchDescriptor<SDWikiPage>())
-        }
+    /// Total number of wiki pages.
+    func pageCount() throws -> Int {
+        try modelContext.fetchCount(FetchDescriptor<SDWikiPage>())
     }
 }

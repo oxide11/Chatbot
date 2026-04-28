@@ -30,8 +30,6 @@ struct ConversationData: Identifiable, Codable, Sendable {
     let createdAt: Date
     var messages: [Message]
     var customSystemPrompt: String?
-    /// The knowledge domain assigned to this conversation (nil treated as General).
-    var domainID: UUID?
     /// Stored raw so unknown values from older / future builds decode cleanly.
     var providerIDRaw: String?
 
@@ -46,7 +44,6 @@ struct ConversationData: Identifiable, Codable, Sendable {
         createdAt: Date,
         messages: [Message],
         customSystemPrompt: String? = nil,
-        domainID: UUID? = nil,
         providerIDRaw: String? = nil
     ) {
         self.id = id
@@ -54,7 +51,6 @@ struct ConversationData: Identifiable, Codable, Sendable {
         self.createdAt = createdAt
         self.messages = messages
         self.customSystemPrompt = customSystemPrompt
-        self.domainID = domainID
         self.providerIDRaw = providerIDRaw
     }
 
@@ -65,7 +61,6 @@ struct ConversationData: Identifiable, Codable, Sendable {
         createdAt = try c.decode(Date.self, forKey: .createdAt)
         messages = try c.decodeIfPresent([Message].self, forKey: .messages) ?? []
         customSystemPrompt = try c.decodeIfPresent(String.self, forKey: .customSystemPrompt)
-        domainID = try c.decodeIfPresent(UUID.self, forKey: .domainID)
         providerIDRaw = try c.decodeIfPresent(String.self, forKey: .providerIDRaw)
     }
 }
@@ -80,7 +75,6 @@ final class ChatViewModel: Identifiable {
     var customSystemPrompt: String?
 
     /// The knowledge domain assigned to this conversation.
-    var domainID: UUID = KnowledgeDomain.generalID
 
     private(set) var messages: [Message] = []
     private(set) var streamingText = ""
@@ -203,7 +197,6 @@ final class ChatViewModel: Identifiable {
         self.createdAt = data.createdAt
         self.messages = data.messages
         self.customSystemPrompt = data.customSystemPrompt
-        self.domainID = data.domainID ?? KnowledgeDomain.generalID
         self.providerID = data.providerID
         self.hasAutoTitle = !data.messages.isEmpty
 
@@ -234,7 +227,6 @@ final class ChatViewModel: Identifiable {
             createdAt: createdAt,
             messages: messages,
             customSystemPrompt: customSystemPrompt,
-            domainID: domainID,
             providerIDRaw: providerID.rawValue
         )
     }
@@ -455,7 +447,7 @@ final class ChatViewModel: Identifiable {
 
         // Retrieve wiki pages (scoped to conversation's domain)
         if ragSettings.wikiRetrievalEnabled, let engine = wikiEngine {
-            let (wikiContext, pageCount) = engine.buildWikiContext(for: userText, domainID: domainID)
+            let (wikiContext, pageCount) = engine.buildWikiContext(for: userText)
             if !wikiContext.isEmpty {
                 wikiPageCount = pageCount
                 contextBlocks.append("Knowledge from your wiki:\n\(wikiContext)")
@@ -466,7 +458,7 @@ final class ChatViewModel: Identifiable {
         // Retrieve document chunks (scoped to conversation's domain)
         if ragSettings.knowledgeBaseRetrievalEnabled, let kbStore = knowledgeBaseStore, usedChars < maxContextChars {
             let budget = maxContextChars - usedChars
-            let relevantChunks = kbStore.retrieve(for: userText, domainID: domainID, limit: ragSettings.maxDocumentChunks)
+            let relevantChunks = kbStore.retrieve(for: userText, limit: ragSettings.maxDocumentChunks)
             if !relevantChunks.isEmpty {
                 let kbLookup = Dictionary(uniqueKeysWithValues: kbStore.knowledgeBases.map { ($0.id, $0.name) })
                 var chunkTexts: [String] = []
@@ -621,8 +613,7 @@ final class ChatViewModel: Identifiable {
             await engine.extractKnowledge(
                 from: transcript,
                 conversationID: id,
-                conversationTitle: title,
-                domainID: domainID
+                conversationTitle: title
             )
         }
 
@@ -825,8 +816,7 @@ final class ConversationStore {
                 _ = await self.wikiEngine.extractKnowledgeFromDocument(
                     text: text,
                     sourceName: kb.name,
-                    sourceDocumentID: kb.id,
-                    domainID: kb.domainID
+                    sourceDocumentID: kb.id
                 )
                 if self.ragSettings.lintAfterExtractions {
                     self.runStructuralLint()
@@ -922,7 +912,6 @@ final class ConversationStore {
                         title: String(text.prefix(60)),
                         body: text,
                         tags: Array(SharedDataManager.extractKeywords(from: text, limit: 5)),
-                        domainID: nil,
                         sourceConversationID: nil
                     )
                 }
@@ -942,7 +931,6 @@ final class ConversationStore {
                     title: pending.title,
                     body: pending.body,
                     tags: pending.tags,
-                    domainID: nil,
                     sourceConversationID: nil
                 )
             }

@@ -34,8 +34,12 @@ extension Color {
 
 enum AppInfo {
     static let name = "Engram"
-    static let version = "1.1.0"
-    static let build = "2"
+    /// Semantic version (MAJOR.MINOR.PATCH).
+    /// MAJOR: breaking schema or API changes.
+    /// MINOR: new user-visible features.
+    /// PATCH: bug fixes and tuning.
+    static let version = "1.0.0"
+    static let build = "1"
 }
 
 // MARK: - Content View
@@ -131,12 +135,6 @@ struct ContentView: View {
                                 }
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
-                                if let domainName = store.knowledgeBaseStore.domains.first(where: { $0.id == conversation.domainID })?.name,
-                                   domainName != "General" {
-                                    Text(domainName)
-                                        .font(.caption2)
-                                        .foregroundStyle(.tint)
-                                }
                             }
                         }
                         .contextMenu {

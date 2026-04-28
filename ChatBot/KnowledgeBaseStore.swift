@@ -45,10 +45,7 @@ struct KnowledgeBase: Identifiable, Codable, Sendable {
     /// Used to detect when re-embedding is needed (e.g. after an OS update).
     var embeddingModelID: String?
 
-    /// The domain this KB belongs to (nil treated as General).
-    var domainID: UUID?
-
-    nonisolated init(id: UUID = UUID(), name: String, documentType: DocumentType, chunkCount: Int, fileSize: Int64, embeddingModelID: String? = nil, createdAt: Date = Date(), updatedAt: Date = Date(), domainID: UUID? = nil) {
+    nonisolated init(id: UUID = UUID(), name: String, documentType: DocumentType, chunkCount: Int, fileSize: Int64, embeddingModelID: String? = nil, createdAt: Date = Date(), updatedAt: Date = Date()) {
         self.id = id
         self.name = name
         self.documentType = documentType
@@ -57,10 +54,9 @@ struct KnowledgeBase: Identifiable, Codable, Sendable {
         self.chunkCount = chunkCount
         self.fileSize = fileSize
         self.embeddingModelID = embeddingModelID
-        self.domainID = domainID
     }
 
-    /// Backward-compatible decoding: old data without `updatedAt`/`domainID` uses defaults.
+    /// Backward-compatible decoding: old data without `updatedAt` uses defaults.
     nonisolated init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(UUID.self, forKey: .id)
@@ -71,15 +67,14 @@ struct KnowledgeBase: Identifiable, Codable, Sendable {
         chunkCount = try container.decode(Int.self, forKey: .chunkCount)
         fileSize = try container.decode(Int64.self, forKey: .fileSize)
         embeddingModelID = try container.decodeIfPresent(String.self, forKey: .embeddingModelID)
-        domainID = try container.decodeIfPresent(UUID.self, forKey: .domainID)
     }
 }
 
-extension KnowledgeBase {
-    /// Domain ID for filtering, treating nil as General.
-    var effectiveDomainID: UUID {
-        domainID ?? KnowledgeDomain.generalID
-    }
+/// Sentinel used internally for the (now-flattened) embedding matrix /
+/// BM25 pool. Phase 2 of the KB rewrite will collapse the per-bucket
+/// plumbing entirely; for Phase 1 we just route everything through one id.
+enum KnowledgeBasePool {
+    static let id = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
 }
 
 struct DocumentChunk: Identifiable, Codable, Sendable {
@@ -117,7 +112,6 @@ struct IngestionJob: Identifiable {
     let url: URL
     let fileName: String
     var status: IngestionStatus
-    let domainID: UUID
 
     /// Whether this job has finished (completed or failed).
     var isFinished: Bool {
@@ -176,9 +170,6 @@ final class KnowledgeBaseStore {
     private(set) var processingProgress: Double = 0
     private(set) var processingError: String?
 
-    /// All knowledge domains.
-    private(set) var domains: [KnowledgeDomain] = []
-
     /// Batch ingestion queue
     private(set) var ingestionQueue: [IngestionJob] = []
 
@@ -224,44 +215,11 @@ final class KnowledgeBaseStore {
             // Load all data from SwiftData
             await loadFromSwiftData(actor: actor)
 
-            // Ensure domains exist (auto-create "General" on first launch)
-            await ensureDomainsExist(actor: actor)
-
             // Re-embed stale chunks if the OS embedding model has changed
             await reembedStaleKnowledgeBasesIfNeeded(actor: actor)
 
             isConfigured = true
-            AppLogger.kbStore.info("Configuration complete — \(self.domains.count) domains, \(self.knowledgeBases.count) KBs, \(self.chunkCache.values.reduce(0) { $0 + $1.count }) chunks loaded")
-        }
-    }
-
-    /// Ensure at least the "General" domain exists. Assigns orphan KBs to it.
-    private func ensureDomainsExist(actor: KnowledgeBaseActor) async {
-        do {
-            let loaded = try await actor.loadAllDomains()
-            if loaded.isEmpty {
-                let general = KnowledgeDomain.general()
-                try await actor.insertDomain(general)
-                try await actor.assignOrphanKBsToDomain(domainID: general.id)
-                self.domains = [general]
-                // Update in-memory KBs to reflect the domain assignment
-                for i in knowledgeBases.indices where knowledgeBases[i].domainID == nil {
-                    knowledgeBases[i].domainID = general.id
-                }
-            } else {
-                self.domains = loaded
-                // If there are orphan KBs (nil domain), assign to General
-                let generalID = loaded.first(where: { $0.isDefault })?.id ?? KnowledgeDomain.generalID
-                let hasOrphans = knowledgeBases.contains { $0.domainID == nil }
-                if hasOrphans {
-                    try await actor.assignOrphanKBsToDomain(domainID: generalID)
-                    for i in knowledgeBases.indices where knowledgeBases[i].domainID == nil {
-                        knowledgeBases[i].domainID = generalID
-                    }
-                }
-            }
-        } catch {
-            AppLogger.kbStore.error("Failed loading domains: \(error.localizedDescription)")
+            AppLogger.kbStore.info("Configuration complete — \(self.knowledgeBases.count) KBs, \(self.chunkCache.values.reduce(0) { $0 + $1.count }) chunks loaded")
         }
     }
 
@@ -354,7 +312,7 @@ final class KnowledgeBaseStore {
             }
 
             chunkCache[kb.id] = chunks
-            invalidateEmbeddingMatrix(for: kb.effectiveDomainID)
+            invalidateEmbeddingMatrix(for: KnowledgeBasePool.id)
             invertedKeywordIndex.removeAll()
 
             // Persist updated embeddings to SwiftData
@@ -376,14 +334,13 @@ final class KnowledgeBaseStore {
     // MARK: - Ingestion Pipeline
 
     /// Queue one or more documents for ingestion. Processing runs sequentially.
-    func queueDocuments(from urls: [URL], domainID: UUID = KnowledgeDomain.generalID) {
+    func queueDocuments(from urls: [URL]) {
         for url in urls {
             let job = IngestionJob(
                 id: UUID(),
                 url: url,
                 fileName: url.deletingPathExtension().lastPathComponent,
-                status: .queued,
-                domainID: domainID
+                status: .queued
             )
             ingestionQueue.append(job)
         }
@@ -454,11 +411,10 @@ final class KnowledgeBaseStore {
             }
 
             switch outcome {
-            case .success(var result):
-                result.kb.domainID = job.domainID
+            case .success(let result):
                 knowledgeBases.insert(result.kb, at: 0)
                 chunkCache[result.kb.id] = result.chunks
-                invalidateEmbeddingMatrix(for: job.domainID)
+                invalidateEmbeddingMatrix(for: KnowledgeBasePool.id)
                 invertedKeywordIndex.removeAll()
 
                 // Collect warnings for user display
@@ -472,7 +428,7 @@ final class KnowledgeBaseStore {
                 // Persist to SwiftData — await result so we can surface failures
                 if let actor = dbActor {
                     do {
-                        try await actor.insertKnowledgeBase(result.kb, chunks: result.chunks, domainID: job.domainID)
+                        try await actor.insertKnowledgeBase(result.kb, chunks: result.chunks)
                     } catch {
                         allWarnings.append("Failed to save to database — data may not persist after restart")
                         AppLogger.kbStore.error("Failed persisting ingestion result: \(error.localizedDescription)")
@@ -484,11 +440,6 @@ final class KnowledgeBaseStore {
                 } else {
                     ingestionQueue[idx].status = .completedWithWarnings("Done (\(allWarnings.count) warning\(allWarnings.count == 1 ? "" : "s"))")
                     AppLogger.kbStore.warning("Ingestion warnings for '\(job.fileName)': \(allWarnings.joined(separator: "; "))")
-                }
-
-                // Regenerate the domain summary now that new content has been added
-                Task { [weak self] in
-                    await self?.regenerateDomainSummary(for: job.domainID)
                 }
 
                 // Notify owner so it can optionally trigger wiki extraction.
@@ -1357,10 +1308,7 @@ final class KnowledgeBaseStore {
             embeddingMatrices[domainID] = nil
             return
         }
-        let filteredCache = chunkCache.filter { kbID, _ in
-            knowledgeBases.first(where: { $0.id == kbID })?.effectiveDomainID == domainID
-        }
-        embeddingMatrices[domainID] = EmbeddingMatrix.build(from: filteredCache, dimension: dim)
+        embeddingMatrices[domainID] = EmbeddingMatrix.build(from: chunkCache, dimension: dim)
     }
 
     /// Invalidate the embedding matrix for a specific domain.
@@ -1414,7 +1362,7 @@ final class KnowledgeBaseStore {
         guard !queryWords.isEmpty else { return [:] }
 
         // Collect domain chunk IDs and compute average document length
-        let domainKBIDs = Set(knowledgeBases.filter { $0.effectiveDomainID == domainID }.map(\.id))
+        let domainKBIDs = Set(knowledgeBases.map(\.id))
         var domainChunkIDs: [UUID] = []
         var totalWordCount: Double = 0
 
@@ -1494,15 +1442,15 @@ final class KnowledgeBaseStore {
         return scores
     }
 
-    /// Retrieve the most relevant document chunks for a query, scoped to a domain.
+    /// Retrieve the most relevant document chunks for a query.
     ///
     /// **Primary path:** Batch cosine similarity via Accelerate/vDSP against the
-    /// per-domain embedding matrix. With many chunks, uses a two-phase approach:
+    /// embedding matrix. With many chunks, uses a two-phase approach:
     /// keyword pre-filter → semantic re-rank on the smaller candidate set.
     ///
     /// **Fallback:** Keyword overlap (used when embedding assets aren't downloaded yet
     /// or chunks were imported before embeddings were available).
-    func retrieve(for query: String, domainID: UUID = KnowledgeDomain.generalID, limit: Int = 3, lexicalWeight: Float = 0.3) -> [DocumentChunk] {
+    func retrieve(for query: String, limit: Int = 3, lexicalWeight: Float = 0.3) -> [DocumentChunk] {
         ensureAllChunksLoaded()
 
         let embeddingService = EmbeddingService.shared
@@ -1513,52 +1461,16 @@ final class KnowledgeBaseStore {
         // Try hybrid retrieval (dense + lexical) first
         if let queryVector = embeddingService.embed(query) {
             // Compute BM25 lexical scores for score fusion
-            let bm25Scores = lexicalWeight > 0 ? computeBM25Scores(queryWords: queryWords, domainID: domainID) : [:]
+            let bm25Scores = lexicalWeight > 0 ? computeBM25Scores(queryWords: queryWords, domainID: KnowledgeBasePool.id) : [:]
 
-            let results = retrieveBySimilarity(
-                queryVector: queryVector, queryWords: queryWords, domainID: domainID,
+            return retrieveBySimilarity(
+                queryVector: queryVector, queryWords: queryWords, domainID: KnowledgeBasePool.id,
                 limit: limit, bm25Scores: bm25Scores, lexicalWeight: lexicalWeight
             )
-
-            // Cross-domain fallback: if the current domain yields no results and other domains
-            // have summaries, find the best-matching domain via embedding similarity and search there.
-            if results.isEmpty && domains.count > 1 {
-                if let bestDomain = bestDomainForQuery(queryVector: queryVector, excludingDomain: domainID) {
-                    let crossBM25 = lexicalWeight > 0 ? computeBM25Scores(queryWords: queryWords, domainID: bestDomain) : [:]
-                    return retrieveBySimilarity(
-                        queryVector: queryVector, queryWords: queryWords, domainID: bestDomain,
-                        limit: limit, bm25Scores: crossBM25, lexicalWeight: lexicalWeight
-                    )
-                }
-            }
-
-            return results
         }
 
         // Fallback: keyword matching (when embeddings unavailable)
-        return retrieveByKeywords(query: query, domainID: domainID, limit: limit)
-    }
-
-    /// Find the domain whose summary best matches the query, excluding the given domain.
-    /// Returns nil if no domain has a summary or if no match exceeds the threshold.
-    private func bestDomainForQuery(queryVector: [Double], excludingDomain: UUID) -> UUID? {
-        let embeddingService = EmbeddingService.shared
-        guard embeddingService.isAvailable else { return nil }
-
-        var bestScore: Double = 0.3 // Minimum threshold
-        var bestDomainID: UUID?
-
-        for domain in domains where domain.id != excludingDomain {
-            guard let summary = domain.summary, !summary.isEmpty else { continue }
-            guard let summaryVector = embeddingService.embed(summary) else { continue }
-            let score = EmbeddingService.cosineSimilarity(queryVector, summaryVector)
-            if score > bestScore {
-                bestScore = score
-                bestDomainID = domain.id
-            }
-        }
-
-        return bestDomainID
+        return retrieveByKeywords(query: query, domainID: KnowledgeBasePool.id, limit: limit)
     }
 
     /// Semantic retrieval using Accelerate-powered batch cosine similarity.
@@ -1786,7 +1698,7 @@ final class KnowledgeBaseStore {
         let queryCount = Double(queryWords.count)
 
         // Filter chunk cache to the requested domain
-        let domainKBIDs = Set(knowledgeBases.filter { $0.effectiveDomainID == domainID }.map { $0.id })
+        let domainKBIDs = Set(knowledgeBases.map { $0.id })
 
         var allScored: [(DocumentChunk, Double)] = []
 
@@ -1867,7 +1779,7 @@ final class KnowledgeBaseStore {
                 chunkKeywordCache.removeValue(forKey: chunk.id)
             }
         }
-        let affectedDomain = kb.effectiveDomainID
+        let affectedDomain = KnowledgeBasePool.id
         knowledgeBases.removeAll { $0.id == kb.id }
         chunkCache.removeValue(forKey: kb.id)
         invalidateEmbeddingMatrix(for: affectedDomain)
@@ -1928,7 +1840,7 @@ final class KnowledgeBaseStore {
         }
 
         // Invalidate matrices for the affected domain
-        let affectedDomain = knowledgeBases.first(where: { $0.id == kbID })?.effectiveDomainID ?? KnowledgeDomain.generalID
+        let affectedDomain = KnowledgeBasePool.id
         invalidateEmbeddingMatrix(for: affectedDomain)
         invertedKeywordIndex.removeAll()
 
@@ -1948,7 +1860,7 @@ final class KnowledgeBaseStore {
             url: url,
             fileName: "\(kb.name) (Update)",
             status: .queued,
-            domainID: kb.effectiveDomainID
+            domainID: KnowledgeBasePool.id
         )
         ingestionQueue.append(job)
 
@@ -2001,7 +1913,7 @@ final class KnowledgeBaseStore {
                     knowledgeBases[kbIndex].updatedAt = Date()
                     knowledgeBases[kbIndex].embeddingModelID = result.kb.embeddingModelID
 
-                    invalidateEmbeddingMatrix(for: kb.effectiveDomainID)
+                    invalidateEmbeddingMatrix(for: KnowledgeBasePool.id)
                     invertedKeywordIndex.removeAll()
 
                     // Persist to SwiftData — await to surface failures
@@ -2034,7 +1946,7 @@ final class KnowledgeBaseStore {
     }
 
     /// Ingest plain text directly (no file needed) — creates a new KB from pasted text.
-    func ingestText(name: String, text: String, domainID: UUID = KnowledgeDomain.generalID) {
+    func ingestText(name: String, text: String) {
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedName.isEmpty, !trimmedText.isEmpty else { return }
@@ -2053,11 +1965,10 @@ final class KnowledgeBaseStore {
 
             await MainActor.run {
                 switch result {
-                case .success(var ingestionResult):
-                    ingestionResult.kb.domainID = domainID
+                case .success(let ingestionResult):
                     self.knowledgeBases.insert(ingestionResult.kb, at: 0)
                     self.chunkCache[ingestionResult.kb.id] = ingestionResult.chunks
-                    self.invalidateEmbeddingMatrix(for: domainID)
+                    self.invalidateEmbeddingMatrix(for: KnowledgeBasePool.id)
                     self.invertedKeywordIndex.removeAll()
                     AppLogger.kbStore.info("Ingested text '\(trimmedName)' — \(ingestionResult.chunks.count) chunks")
 
@@ -2065,7 +1976,7 @@ final class KnowledgeBaseStore {
                     if let actor = self.dbActor {
                         Task {
                             do {
-                                try await actor.insertKnowledgeBase(ingestionResult.kb, chunks: ingestionResult.chunks, domainID: domainID)
+                                try await actor.insertKnowledgeBase(ingestionResult.kb, chunks: ingestionResult.chunks)
                             } catch {
                                 AppLogger.kbStore.error("Failed persisting text ingestion: \(error.localizedDescription)")
                             }
@@ -2215,168 +2126,20 @@ final class KnowledgeBaseStore {
     // MARK: - Domain Management
 
     /// Return KBs filtered for a specific domain.
-    func knowledgeBases(for domainID: UUID) -> [KnowledgeBase] {
-        knowledgeBases.filter { $0.effectiveDomainID == domainID }
-    }
-
-    /// Create a new domain and persist it.
-    func createDomain(name: String) -> KnowledgeDomain {
-        let domain = KnowledgeDomain(name: name)
-        domains.append(domain)
-        if let actor = dbActor {
-            Task {
-                do { try await actor.insertDomain(domain) }
-                catch { AppLogger.kbStore.error("Failed persisting new domain: \(error.localizedDescription)") }
-            }
-        }
-        return domain
-    }
-
-    /// Rename an existing domain.
-    func renameDomain(_ domain: KnowledgeDomain, to newName: String) {
-        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        guard let index = domains.firstIndex(where: { $0.id == domain.id }) else { return }
-        domains[index].name = trimmed
-        if let actor = dbActor {
-            Task {
-                do { try await actor.renameDomain(id: domain.id, to: trimmed) }
-                catch { AppLogger.kbStore.error("Failed renaming domain: \(error.localizedDescription)") }
-            }
-        }
-    }
-
-    /// Delete a domain, moving its KBs to the General domain first.
-    func deleteDomain(_ domain: KnowledgeDomain) {
-        guard !domain.isDefault else { return } // Cannot delete General
-
-        let generalID = domains.first(where: { $0.isDefault })?.id ?? KnowledgeDomain.generalID
-
-        // Capture IDs of KBs to move *before* the in-memory mutation.
-        let kbIDsToMove = knowledgeBases
-            .filter { $0.effectiveDomainID == domain.id }
-            .map(\.id)
-
-        // Move all KBs in this domain to General (in-memory)
-        for i in knowledgeBases.indices where knowledgeBases[i].effectiveDomainID == domain.id {
-            knowledgeBases[i].domainID = generalID
-        }
-        invalidateEmbeddingMatrix(for: generalID)
-        invalidateEmbeddingMatrix(for: domain.id)
-
-        domains.removeAll { $0.id == domain.id }
-
-        if let actor = dbActor {
-            let domainID = domain.id
-            Task {
-                do {
-                    // Move KBs to General in SwiftData, then delete the domain.
-                    for kbID in kbIDsToMove {
-                        try await actor.moveKnowledgeBase(kbID: kbID, toDomainID: generalID)
-                    }
-                    try await actor.deleteDomain(id: domainID)
-                } catch {
-                    AppLogger.kbStore.error("Failed deleting domain: \(error.localizedDescription)")
-                }
-            }
-        }
-    }
-
-    /// Move a knowledge base to a different domain.
-    func moveKnowledgeBase(_ kb: KnowledgeBase, toDomain targetDomainID: UUID) {
-        guard let index = knowledgeBases.firstIndex(where: { $0.id == kb.id }) else { return }
-        let oldDomainID = kb.effectiveDomainID
-        knowledgeBases[index].domainID = targetDomainID
-        invalidateEmbeddingMatrix(for: oldDomainID)
-        invalidateEmbeddingMatrix(for: targetDomainID)
-        invertedKeywordIndex.removeAll()
-
-        if let actor = dbActor {
-            Task {
-                do { try await actor.moveKnowledgeBase(kbID: kb.id, toDomainID: targetDomainID) }
-                catch { AppLogger.kbStore.error("Failed moving KB: \(error.localizedDescription)") }
-            }
-        }
-    }
-
-    // MARK: - Domain Summary Generation
-
-    /// Regenerate the LLM-generated summary for a domain based on its knowledge bases.
-    /// Called after ingestion or KB deletion to keep the domain summary current.
-    func regenerateDomainSummary(for domainID: UUID) async {
-        let domainKBs = knowledgeBases(for: domainID)
-        guard !domainKBs.isEmpty else {
-            // No KBs — clear any existing summary
-            if let idx = domains.firstIndex(where: { $0.id == domainID }) {
-                domains[idx].summary = nil
-                if let actor = dbActor {
-                    Task { try? await actor.updateDomainSummary(id: domainID, summary: "") }
-                }
-            }
-            return
-        }
-
-        // Collect chunk summaries (or first sentence of content) for each KB to build an overview
-        var kbDescriptions: [String] = []
-        for kb in domainKBs {
-            var chunkPreviews: [String] = []
-            if let cached = chunkCache[kb.id] {
-                for chunk in cached.prefix(5) {
-                    // Prefer the summary if available, otherwise use a truncated content preview
-                    if let summary = chunk.summary, !summary.isEmpty {
-                        chunkPreviews.append(summary)
-                    } else {
-                        let preview = String(chunk.content.prefix(150))
-                        chunkPreviews.append(preview)
-                    }
-                }
-            }
-            let previews = chunkPreviews.joined(separator: " ")
-            kbDescriptions.append("\(kb.name): \(previews)")
-        }
-
-        let input = kbDescriptions.joined(separator: "\n---\n")
-
-        do {
-            let session = LanguageModelSession {
-                """
-                You are a knowledge base cataloger. Given descriptions of documents in a knowledge domain, \
-                write a concise 2-3 sentence summary of what this domain covers. \
-                Focus on the main topics, subject areas, and types of information available. \
-                Do not list individual documents — describe the domain as a whole.
-                """
-            }
-            let options = GenerationOptions(sampling: .greedy, maximumResponseTokens: 120)
-            let response = try await session.respond(to: input, options: options)
-            let summary = response.content.trimmingCharacters(in: .whitespacesAndNewlines)
-
-            if !summary.isEmpty, let idx = domains.firstIndex(where: { $0.id == domainID }) {
-                domains[idx].summary = summary
-                if let actor = dbActor {
-                    try? await actor.updateDomainSummary(id: domainID, summary: summary)
-                }
-                AppLogger.kbStore.info("Generated domain summary for '\(self.domains[idx].name)': \(summary.prefix(80))...")
-            }
-        } catch {
-            AppLogger.kbStore.warning("Domain summary generation failed: \(error.localizedDescription)")
-        }
-    }
-
     // MARK: - Test Support
 
     #if DEBUG
     /// Inject test data directly without SwiftData. For unit tests only.
-    func injectTestData(knowledgeBases: [KnowledgeBase], chunks: [UUID: [DocumentChunk]], domains: [KnowledgeDomain]) {
+    func injectTestData(knowledgeBases: [KnowledgeBase], chunks: [UUID: [DocumentChunk]]) {
         self.knowledgeBases = knowledgeBases
         self.chunkCache = chunks
-        self.domains = domains
         invalidateAllEmbeddingMatrices()
         invertedKeywordIndex.removeAll()
         chunkKeywordCache.removeAll()
     }
 
     /// Retrieve using a pre-computed query vector (bypasses EmbeddingService). For unit tests only.
-    func retrieveWithVector(_ queryVector: [Double], query: String, domainID: UUID = KnowledgeDomain.generalID, limit: Int = 3, lexicalWeight: Float = 0.3) -> [DocumentChunk] {
+    func retrieveWithVector(_ queryVector: [Double], query: String, domainID: UUID = KnowledgeBasePool.id, limit: Int = 3, lexicalWeight: Float = 0.3) -> [DocumentChunk] {
         let queryWords = SharedDataManager.tokenize(query)
         let bm25Scores = lexicalWeight > 0 ? computeBM25Scores(queryWords: queryWords, domainID: domainID) : [:]
         return retrieveBySimilarity(
@@ -2386,13 +2149,13 @@ final class KnowledgeBaseStore {
     }
 
     /// Expose BM25 scores for testing. For unit tests only.
-    func testBM25Scores(query: String, domainID: UUID = KnowledgeDomain.generalID) -> [UUID: Float] {
+    func testBM25Scores(query: String, domainID: UUID = KnowledgeBasePool.id) -> [UUID: Float] {
         let queryWords = SharedDataManager.tokenize(query)
         return computeBM25Scores(queryWords: queryWords, domainID: domainID)
     }
 
     /// Expose keyword-only retrieval for testing. For unit tests only.
-    func testKeywordRetrieve(query: String, domainID: UUID = KnowledgeDomain.generalID, limit: Int = 3) -> [DocumentChunk] {
+    func testKeywordRetrieve(query: String, domainID: UUID = KnowledgeBasePool.id, limit: Int = 3) -> [DocumentChunk] {
         return retrieveByKeywords(query: query, domainID: domainID, limit: limit)
     }
     #endif

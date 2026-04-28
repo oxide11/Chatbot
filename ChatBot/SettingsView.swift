@@ -23,16 +23,6 @@ struct SettingsView: View {
             Form {
                 // MARK: Intelligence
                 Section {
-                    NavigationLink {
-                        DomainSettingsContent(store: store)
-                    } label: {
-                        HStack {
-                            Label("Knowledge Domains", systemImage: "square.stack.3d.up")
-                            Spacer()
-                            Text("\(store.knowledgeBaseStore.domains.count)")
-                                .foregroundStyle(.secondary)
-                        }
-                    }
 
                     Button {
                         showingWikiPages = true
@@ -347,7 +337,7 @@ struct SettingsView: View {
                 Text("This will permanently delete all conversations. Wiki pages and knowledge bases will be kept.")
             }
             .sheet(isPresented: $showingWikiPages) {
-                WikiPageListView(wikiStore: store.wikiStore, domains: store.knowledgeBaseStore.domains)
+                WikiPageListView(wikiStore: store.wikiStore)
             }
             .sheet(isPresented: $showingKnowledgeBases) {
                 KnowledgeBaseListView(

@@ -40,9 +40,8 @@ private func makeChunk(
     )
 }
 
-/// Set up a KnowledgeBaseStore with test data in a single domain.
+/// Set up a KnowledgeBaseStore with test data.
 private func makeStore(
-    domainID: UUID = KnowledgeDomain.generalID,
     kbID: UUID = UUID(),
     chunks: [DocumentChunk]
 ) -> KnowledgeBaseStore {
@@ -52,16 +51,11 @@ private func makeStore(
         name: "Test KB",
         documentType: .text,
         chunkCount: chunks.count,
-        fileSize: 1024,
-        domainID: domainID
+        fileSize: 1024
     )
-    let domain = domainID == KnowledgeDomain.generalID
-        ? KnowledgeDomain.general()
-        : KnowledgeDomain(id: domainID, name: "Test Domain")
     store.injectTestData(
         knowledgeBases: [kb],
-        chunks: [kbID: chunks],
-        domains: [domain]
+        chunks: [kbID: chunks]
     )
     return store
 }
@@ -191,13 +185,13 @@ struct HybridRetrievalTests {
         let store = makeStore(kbID: kbID, chunks: [chunkA, chunkB])
 
         // With zero lexical weight (pure dense), chunk A should rank first
-        let pureSemanticResults = store.retrieveWithVector(queryVec, query: "JWT specification token", domainID: KnowledgeDomain.generalID, limit: 2, lexicalWeight: 0)
+        let pureSemanticResults = store.retrieveWithVector(queryVec, query: "JWT specification token", limit: 2, lexicalWeight: 0)
         if !pureSemanticResults.isEmpty {
             #expect(pureSemanticResults[0].id == chunkA.id)
         }
 
         // With high lexical weight, chunk B should be boosted (it matches "jwt", "specification", "token")
-        let hybridResults = store.retrieveWithVector(queryVec, query: "JWT specification token", domainID: KnowledgeDomain.generalID, limit: 2, lexicalWeight: 0.5)
+        let hybridResults = store.retrieveWithVector(queryVec, query: "JWT specification token", limit: 2, lexicalWeight: 0.5)
         #expect(!hybridResults.isEmpty)
         // Chunk B should now appear in results (it was rescued by keyword match)
         let chunkBInResults = hybridResults.contains { $0.id == chunkB.id }
@@ -219,40 +213,12 @@ struct HybridRetrievalTests {
 
         let store = makeStore(kbID: kbID, chunks: [closeChunk, keywordChunk])
 
-        let results = store.retrieveWithVector(queryVec, query: "target keywords matching query", domainID: KnowledgeDomain.generalID, limit: 2, lexicalWeight: 0)
+        let results = store.retrieveWithVector(queryVec, query: "target keywords matching query", limit: 2, lexicalWeight: 0)
 
         // With zero lexical weight, only embedding similarity matters
         if !results.isEmpty {
             #expect(results[0].id == closeChunk.id)
         }
-    }
-
-    @Test("Retrieve returns empty for domain with no chunks")
-    func emptyDomain() {
-        let kbID = UUID()
-        let dim = 16
-        let queryVec = makeEmbedding(primaryAxis: 0, dimension: dim)
-
-        let chunk = makeChunk(kbID: kbID, content: "Some content", keywords: ["content"], index: 0, embedding: makeEmbedding(primaryAxis: 0, dimension: dim))
-
-        let domainA = UUID()
-        let domainB = UUID()
-
-        // Chunks are in domain A
-        let store = KnowledgeBaseStore()
-        let kb = KnowledgeBase(id: kbID, name: "Test", documentType: .text, chunkCount: 1, fileSize: 512, domainID: domainA)
-        store.injectTestData(
-            knowledgeBases: [kb],
-            chunks: [kbID: [chunk]],
-            domains: [
-                KnowledgeDomain(id: domainA, name: "Domain A"),
-                KnowledgeDomain(id: domainB, name: "Domain B"),
-            ]
-        )
-
-        // Query domain B — should find nothing
-        let results = store.retrieveWithVector(queryVec, query: "content", domainID: domainB, limit: 3)
-        #expect(results.isEmpty)
     }
 
     @Test("Retrieve respects limit parameter")
@@ -267,85 +233,8 @@ struct HybridRetrievalTests {
         }
         let store = makeStore(kbID: kbID, chunks: chunks)
 
-        let results = store.retrieveWithVector(queryVec, query: "content topic relevant", domainID: KnowledgeDomain.generalID, limit: 3)
+        let results = store.retrieveWithVector(queryVec, query: "content topic relevant", limit: 3)
         #expect(results.count <= 3)
-    }
-}
-
-// MARK: - Domain Scoping Tests
-
-@Suite("Domain-Scoped Retrieval")
-struct DomainScopingTests {
-
-    @Test("BM25 scores are scoped to the requested domain")
-    func bm25ScopedToDomain() {
-        let kbA = UUID()
-        let kbB = UUID()
-        let domainA = UUID()
-        let domainB = UUID()
-
-        let chunkA = makeChunk(kbID: kbA, content: "Swift concurrency with async await patterns", keywords: ["swift", "concurrency", "async", "await", "patterns"], index: 0)
-        let chunkB = makeChunk(kbID: kbB, content: "Swift concurrency in server side applications", keywords: ["swift", "concurrency", "server", "applications"], index: 0)
-
-        let store = KnowledgeBaseStore()
-        store.injectTestData(
-            knowledgeBases: [
-                KnowledgeBase(id: kbA, name: "KB A", documentType: .text, chunkCount: 1, fileSize: 512, domainID: domainA),
-                KnowledgeBase(id: kbB, name: "KB B", documentType: .text, chunkCount: 1, fileSize: 512, domainID: domainB),
-            ],
-            chunks: [kbA: [chunkA], kbB: [chunkB]],
-            domains: [
-                KnowledgeDomain(id: domainA, name: "Domain A"),
-                KnowledgeDomain(id: domainB, name: "Domain B"),
-            ]
-        )
-
-        let scoresA = store.testBM25Scores(query: "swift concurrency", domainID: domainA)
-        let scoresB = store.testBM25Scores(query: "swift concurrency", domainID: domainB)
-
-        // Domain A scores should only contain chunk A
-        #expect(scoresA[chunkA.id] != nil)
-        #expect(scoresA[chunkB.id] == nil)
-
-        // Domain B scores should only contain chunk B
-        #expect(scoresB[chunkB.id] != nil)
-        #expect(scoresB[chunkA.id] == nil)
-    }
-
-    @Test("Hybrid retrieval isolates domains even with shared keywords")
-    func hybridRetrievalIsolatesDomains() {
-        let kbA = UUID()
-        let kbB = UUID()
-        let domainA = UUID()
-        let domainB = UUID()
-        let dim = 16
-
-        let queryVec = makeEmbedding(primaryAxis: 0, dimension: dim)
-
-        // Both chunks have the same keyword "swift" and similar embeddings
-        let chunkA = makeChunk(kbID: kbA, content: "Swift programming in domain A context", keywords: ["swift", "programming", "domain"], index: 0, embedding: makeEmbedding(primaryAxis: 0, dimension: dim))
-        let chunkB = makeChunk(kbID: kbB, content: "Swift programming in domain B context", keywords: ["swift", "programming", "domain"], index: 0, embedding: makeEmbedding(primaryAxis: 0, dimension: dim))
-
-        let store = KnowledgeBaseStore()
-        store.injectTestData(
-            knowledgeBases: [
-                KnowledgeBase(id: kbA, name: "KB A", documentType: .text, chunkCount: 1, fileSize: 512, domainID: domainA),
-                KnowledgeBase(id: kbB, name: "KB B", documentType: .text, chunkCount: 1, fileSize: 512, domainID: domainB),
-            ],
-            chunks: [kbA: [chunkA], kbB: [chunkB]],
-            domains: [
-                KnowledgeDomain(id: domainA, name: "Domain A"),
-                KnowledgeDomain(id: domainB, name: "Domain B"),
-            ]
-        )
-
-        let resultsA = store.retrieveWithVector(queryVec, query: "swift programming", domainID: domainA, limit: 5)
-        let resultsB = store.retrieveWithVector(queryVec, query: "swift programming", domainID: domainB, limit: 5)
-
-        // Domain A should only return chunk A
-        #expect(resultsA.allSatisfy { $0.knowledgeBaseID == kbA })
-        // Domain B should only return chunk B
-        #expect(resultsB.allSatisfy { $0.knowledgeBaseID == kbB })
     }
 }
 
@@ -398,16 +287,14 @@ struct RetrievalEdgeCaseTests {
     @Test("Retrieve with no chunks returns empty")
     func noChunks() {
         let store = KnowledgeBaseStore()
-        let domainID = KnowledgeDomain.generalID
         store.injectTestData(
             knowledgeBases: [],
-            chunks: [:],
-            domains: [KnowledgeDomain.general()]
+            chunks: [:]
         )
 
         let dim = 16
         let queryVec = makeEmbedding(primaryAxis: 0, dimension: dim)
-        let results = store.retrieveWithVector(queryVec, query: "anything", domainID: domainID, limit: 3)
+        let results = store.retrieveWithVector(queryVec, query: "anything", limit: 3)
         #expect(results.isEmpty)
     }
 
@@ -422,7 +309,7 @@ struct RetrievalEdgeCaseTests {
         let withoutEmb = makeChunk(kbID: kbID, content: "Chunk without any embedding", keywords: ["chunk", "without", "embedding"], index: 1, embedding: nil)
         let store = makeStore(kbID: kbID, chunks: [withEmb, withoutEmb])
 
-        let results = store.retrieveWithVector(queryVec, query: "chunk embedding", domainID: KnowledgeDomain.generalID, limit: 5)
+        let results = store.retrieveWithVector(queryVec, query: "chunk embedding", limit: 5)
         // Only the chunk with embedding should appear in dense retrieval results
         #expect(results.allSatisfy { $0.id == withEmb.id })
     }
@@ -435,7 +322,7 @@ struct RetrievalEdgeCaseTests {
         let chunk = makeChunk(kbID: kbID, content: "The only chunk in the entire knowledge base", keywords: ["only", "chunk", "knowledge", "base"], index: 0, embedding: makeEmbedding(primaryAxis: 0, dimension: dim))
         let store = makeStore(kbID: kbID, chunks: [chunk])
 
-        let results = store.retrieveWithVector(queryVec, query: "chunk knowledge base", domainID: KnowledgeDomain.generalID, limit: 3)
+        let results = store.retrieveWithVector(queryVec, query: "chunk knowledge base", limit: 3)
         #expect(results.count == 1)
         #expect(results[0].id == chunk.id)
     }
@@ -451,12 +338,11 @@ struct RetrievalEdgeCaseTests {
         #expect(scores[chunk.id]! > 0)
     }
 
-    @Test("Multiple knowledge bases in same domain are all searched")
-    func multipleKBsSameDomain() {
+    @Test("Multiple knowledge bases are all searched")
+    func multipleKBs() {
         let kbA = UUID()
         let kbB = UUID()
         let dim = 16
-        let domainID = KnowledgeDomain.generalID
         let queryVec = makeEmbedding(primaryAxis: 0, dimension: dim)
 
         let chunkA = makeChunk(kbID: kbA, content: "Content from knowledge base alpha", keywords: ["content", "knowledge", "alpha"], index: 0, embedding: makeEmbedding(primaryAxis: 0, dimension: dim))
@@ -465,15 +351,14 @@ struct RetrievalEdgeCaseTests {
         let store = KnowledgeBaseStore()
         store.injectTestData(
             knowledgeBases: [
-                KnowledgeBase(id: kbA, name: "KB Alpha", documentType: .text, chunkCount: 1, fileSize: 512, domainID: domainID),
-                KnowledgeBase(id: kbB, name: "KB Beta", documentType: .text, chunkCount: 1, fileSize: 512, domainID: domainID),
+                KnowledgeBase(id: kbA, name: "KB Alpha", documentType: .text, chunkCount: 1, fileSize: 512),
+                KnowledgeBase(id: kbB, name: "KB Beta", documentType: .text, chunkCount: 1, fileSize: 512),
             ],
-            chunks: [kbA: [chunkA], kbB: [chunkB]],
-            domains: [KnowledgeDomain.general()]
+            chunks: [kbA: [chunkA], kbB: [chunkB]]
         )
 
-        let results = store.retrieveWithVector(queryVec, query: "content knowledge", domainID: domainID, limit: 5)
-        // Both chunks should appear since they're in the same domain
+        let results = store.retrieveWithVector(queryVec, query: "content knowledge", limit: 5)
+        // Both chunks should appear
         let foundIDs = Set(results.map(\.id))
         #expect(foundIDs.contains(chunkA.id))
         #expect(foundIDs.contains(chunkB.id))
