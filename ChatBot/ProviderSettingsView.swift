@@ -426,7 +426,9 @@ struct ProviderDetailView: View {
         switch id {
         case .anthropic:
             return AnthropicProvider(apiKey: key, model: model)
-        case .openAI, .gemini:
+        case .openAI:
+            return OpenAIProvider(apiKey: key, model: model)
+        case .gemini:
             throw ChatProviderError.providerUnavailable(id)
         case .foundationModels:
             throw ChatProviderError.providerUnavailable(id)
