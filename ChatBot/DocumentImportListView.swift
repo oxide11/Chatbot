@@ -13,13 +13,15 @@ import UniformTypeIdentifiers
 
 struct DocumentImportListView: View {
     var importer: DocumentImporter
+    var wikiStore: WikiStore
     @Environment(\.dismiss) private var dismiss
 
     @State private var showingPicker = false
     @State private var pendingDelete: DocumentImport?
+    @State private var path: [DocumentImport] = []
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
             content
                 .scrollEdgeEffectStyle(.soft, for: .top)
                 .navigationTitle("Imported Documents")
@@ -38,12 +40,14 @@ struct DocumentImportListView: View {
                         }
                     }
                     ToolbarItem(placement: .automatic) {
-                        if importer.queue.contains(where: { $0.isFinished }) {
+                        if importer.queue.contains(where: { $0.isFinished }) || importer.isProcessing {
                             Menu {
-                                Button {
-                                    importer.clearFinishedJobs()
-                                } label: {
-                                    Label("Clear Finished Jobs", systemImage: "checkmark.circle")
+                                if importer.queue.contains(where: { $0.isFinished }) {
+                                    Button {
+                                        importer.clearFinishedJobs()
+                                    } label: {
+                                        Label("Clear Finished Jobs", systemImage: "checkmark.circle")
+                                    }
                                 }
                                 if importer.isProcessing {
                                     Button(role: .destructive) {
@@ -57,6 +61,16 @@ struct DocumentImportListView: View {
                             }
                         }
                     }
+                }
+                .navigationDestination(for: DocumentImport.self) { record in
+                    DocumentImportDetailView(
+                        record: record,
+                        wikiStore: wikiStore,
+                        onReimport: { importer.reimport(record) },
+                        onDelete: {
+                            pendingDelete = record
+                        }
+                    )
                 }
                 .fileImporter(
                     isPresented: $showingPicker,
@@ -81,11 +95,17 @@ struct DocumentImportListView: View {
                     if !record.sourceWikiPageIDs.isEmpty {
                         Button("Delete & Remove \(record.sourceWikiPageIDs.count) Wiki Page\(record.sourceWikiPageIDs.count == 1 ? "" : "s")",
                                role: .destructive) {
-                            Task { await importer.delete(record, alsoDeleteWikiPages: true) }
+                            Task {
+                                await importer.delete(record, alsoDeleteWikiPages: true)
+                                if path.last == record { path.removeLast() }
+                            }
                         }
                     }
                     Button("Forget Import", role: .destructive) {
-                        Task { await importer.delete(record, alsoDeleteWikiPages: false) }
+                        Task {
+                            await importer.delete(record, alsoDeleteWikiPages: false)
+                            if path.last == record { path.removeLast() }
+                        }
                     }
                     Button("Cancel", role: .cancel) {}
                 } message: { record in
@@ -123,26 +143,143 @@ struct DocumentImportListView: View {
             }
         } else {
             List {
+                if importer.isProcessing
+                    || !importer.queue.isEmpty
+                    || !importer.imports.isEmpty {
+                    Section {
+                        StatusBanner(importer: importer)
+                            .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+                            .listRowBackground(Color.clear)
+                    }
+                }
+
                 if !importer.queue.isEmpty {
-                    Section("In Progress") {
+                    Section {
                         ForEach(importer.queue) { job in
                             ImportJobRow(job: job)
                         }
+                    } header: {
+                        sectionHeader("In Progress",
+                                      count: importer.queue.count,
+                                      systemImage: "arrow.triangle.2.circlepath")
                     }
                 }
+
                 if !importer.imports.isEmpty {
-                    Section("Imported") {
+                    Section {
                         ForEach(importer.imports) { record in
-                            DocumentImportRow(
-                                record: record,
-                                onReimport: { importer.reimport(record) },
-                                onDelete: { pendingDelete = record }
-                            )
+                            NavigationLink(value: record) {
+                                DocumentImportRow(record: record)
+                            }
+                            .swipeActions(edge: .trailing) {
+                                Button(role: .destructive) {
+                                    pendingDelete = record
+                                } label: {
+                                    Label("Delete", systemImage: "trash")
+                                }
+                                Button {
+                                    importer.reimport(record)
+                                } label: {
+                                    Label("Re-import", systemImage: "arrow.clockwise")
+                                }
+                                .tint(.indigo)
+                            }
                         }
+                    } header: {
+                        sectionHeader("Imported",
+                                      count: importer.imports.count,
+                                      systemImage: "checkmark.seal")
                     }
                 }
             }
         }
+    }
+
+    private func sectionHeader(_ title: String, count: Int, systemImage: String) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: systemImage)
+            Text(title)
+            Spacer()
+            Text("\(count)")
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+        }
+    }
+}
+
+// MARK: - Status Banner
+
+private struct StatusBanner: View {
+    var importer: DocumentImporter
+
+    private var inProgressCount: Int {
+        importer.queue.filter {
+            switch $0.status {
+            case .completed, .failed: return false
+            default:                  return true
+            }
+        }.count
+    }
+
+    private var importedCount: Int { importer.imports.count }
+    private var totalPages: Int {
+        importer.imports.reduce(0) { $0 + $1.sourceWikiPageIDs.count }
+    }
+
+    var body: some View {
+        HStack(spacing: 14) {
+            statusIcon
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(headline)
+                    .font(.callout.weight(.medium))
+                Text(subhead)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer(minLength: 8)
+
+            if inProgressCount > 0 {
+                ProgressView()
+                    .controlSize(.small)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .glassEffect(.regular, in: .rect(cornerRadius: 14))
+    }
+
+    private var headline: String {
+        if inProgressCount > 0 {
+            return "Importing \(inProgressCount) document\(inProgressCount == 1 ? "" : "s")"
+        }
+        if importedCount == 0 { return "No imports yet" }
+        return "\(importedCount) imported"
+    }
+
+    private var subhead: String {
+        if inProgressCount > 0 {
+            if importedCount > 0 {
+                return "\(importedCount) already imported · \(totalPages) wiki page\(totalPages == 1 ? "" : "s")"
+            }
+            return "Reading and extracting…"
+        }
+        if importedCount == 0 { return "Tap + to add a document" }
+        return "\(totalPages) wiki page\(totalPages == 1 ? "" : "s") created from your documents"
+    }
+
+    @ViewBuilder
+    private var statusIcon: some View {
+        Image(systemName: inProgressCount > 0 ? "arrow.triangle.2.circlepath" : "checkmark.seal.fill")
+            .font(.title3)
+            .foregroundStyle(inProgressCount > 0 ? Color.accentColor : Color.green)
+            .frame(width: 32, height: 32)
+            .background(
+                (inProgressCount > 0 ? Color.accentColor : Color.green).opacity(0.15),
+                in: .circle
+            )
+            .symbolEffect(.rotate, options: .repeating, isActive: inProgressCount > 0)
     }
 }
 
@@ -152,48 +289,117 @@ private struct ImportJobRow: View {
     let job: DocumentImportJob
 
     var body: some View {
-        HStack(spacing: 12) {
-            Image(systemName: job.documentType.icon)
-                .font(.title3)
-                .foregroundStyle(.secondary)
-                .frame(width: 28)
+        HStack(alignment: .top, spacing: 12) {
+            typeBadge
 
-            VStack(alignment: .leading, spacing: 4) {
-                Text(job.fileName)
-                    .font(.body)
-                    .lineLimit(1)
-                statusRow
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text(job.fileName)
+                        .font(.body.weight(.medium))
+                        .lineLimit(1)
+                    Spacer(minLength: 8)
+                    statusGlyph
+                }
+
+                progressBlock
             }
-
-            Spacer(minLength: 8)
-
-            statusGlyph
         }
-        .padding(.vertical, 2)
+        .padding(.vertical, 4)
+        .animation(.easeInOut(duration: 0.2), value: descriptionForAnimation)
+    }
+
+    /// A stable string that captures whatever bit of state should drive
+    /// SwiftUI's transition animation (label + percent).
+    private var descriptionForAnimation: String {
+        switch job.status {
+        case .queued:               return "queued"
+        case .extractingText:       return "extracting"
+        case .importing(let p):
+            if let p { return "import:\(p.chunkIndex)/\(p.chunkCount)" }
+            return "import:start"
+        case .completed:            return "completed"
+        case .failed(let m):        return "failed:\(m)"
+        }
+    }
+
+    private var typeBadge: some View {
+        Image(systemName: job.documentType.icon)
+            .font(.body)
+            .foregroundStyle(.secondary)
+            .frame(width: 30, height: 30)
+            .background(.fill.tertiary, in: .rect(cornerRadius: 7))
     }
 
     @ViewBuilder
-    private var statusRow: some View {
+    private var progressBlock: some View {
         switch job.status {
-        case .importing(let p) where p != nil:
-            ProgressView(value: p!.fractionComplete)
-                .progressViewStyle(.linear)
-                .tint(.accentColor)
-            Text(job.label)
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
+        case .queued:
+            HStack(spacing: 6) {
+                Image(systemName: "clock").font(.caption2)
+                Text("Queued")
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+
+        case .extractingText:
+            VStack(alignment: .leading, spacing: 4) {
+                ProgressView()
+                    .progressViewStyle(.linear)
+                    .tint(.accentColor)
+                Text("Reading document…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+        case .importing(let p):
+            VStack(alignment: .leading, spacing: 4) {
+                ProgressView(value: p?.fractionComplete ?? 0)
+                    .progressViewStyle(.linear)
+                    .tint(.accentColor)
+                HStack(spacing: 6) {
+                    if let p {
+                        Text("Chunk \(p.chunkIndex) of \(p.chunkCount)")
+                            .monospacedDigit()
+                        if p.pagesCreated > 0 || p.pagesMerged > 0 {
+                            Text("\u{00B7}")
+                            Text("\(p.pagesCreated) created, \(p.pagesMerged) merged")
+                                .foregroundStyle(.secondary)
+                        }
+                    } else {
+                        Text("Sending to model…")
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 4)
+                    if let p {
+                        Text("\(Int(p.fractionComplete * 100))%")
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                }
+                .font(.caption)
+            }
+
         case .completed(let s):
-            Text("\(s.pagesCreated) created, \(s.pagesMerged) merged")
-                .font(.caption)
-                .foregroundStyle(.green)
+            HStack(spacing: 6) {
+                Image(systemName: "checkmark.circle.fill")
+                Text("\(s.pagesCreated) created, \(s.pagesMerged) merged")
+                if s.failedChunks > 0 {
+                    Text("\u{00B7}")
+                    Text("\(s.failedChunks) failed")
+                        .foregroundStyle(.orange)
+                }
+            }
+            .font(.caption.weight(.medium))
+            .foregroundStyle(.green)
+
         case .failed(let msg):
-            Text(msg)
-                .font(.caption)
-                .foregroundStyle(.red)
-        default:
-            Text(job.label)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            HStack(spacing: 6) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                Text(msg)
+                    .lineLimit(2)
+            }
+            .font(.caption)
+            .foregroundStyle(.red)
         }
     }
 
@@ -216,19 +422,18 @@ private struct ImportJobRow: View {
 
 private struct DocumentImportRow: View {
     let record: DocumentImport
-    let onReimport: () -> Void
-    let onDelete: () -> Void
 
     var body: some View {
         HStack(spacing: 12) {
             Image(systemName: record.documentType.icon)
-                .font(.title3)
+                .font(.body)
                 .foregroundStyle(.secondary)
-                .frame(width: 28)
+                .frame(width: 30, height: 30)
+                .background(.fill.tertiary, in: .rect(cornerRadius: 7))
 
             VStack(alignment: .leading, spacing: 4) {
                 Text(record.fileName)
-                    .font(.body)
+                    .font(.body.weight(.medium))
                     .lineLimit(1)
 
                 HStack(spacing: 4) {
@@ -237,19 +442,14 @@ private struct DocumentImportRow: View {
                     Text(ByteCountFormatter.string(fromByteCount: record.fileSize, countStyle: .file))
                     Text("\u{00B7}")
                     Text("\(record.sourceWikiPageIDs.count) page\(record.sourceWikiPageIDs.count == 1 ? "" : "s")")
+                        .foregroundStyle(record.sourceWikiPageIDs.isEmpty ? .tertiary : .secondary)
                 }
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
-                HStack(spacing: 4) {
-                    Text("Imported \(record.importedAt, style: .relative) ago")
-                    if record.lastImportedAt > record.importedAt.addingTimeInterval(60) {
-                        Text("\u{00B7}")
-                        Text("Re-run \(record.lastImportedAt, style: .relative) ago")
-                    }
-                }
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
+                Text("Imported \(record.importedAt, style: .relative) ago")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
 
                 if let err = record.lastErrorMessage {
                     Label(err, systemImage: "exclamationmark.triangle")
@@ -259,23 +459,136 @@ private struct DocumentImportRow: View {
             }
         }
         .padding(.vertical, 2)
-        .swipeActions(edge: .trailing) {
-            Button(role: .destructive, action: onDelete) {
-                Label("Delete", systemImage: "trash")
+    }
+}
+
+// MARK: - Detail View
+
+struct DocumentImportDetailView: View {
+    let record: DocumentImport
+    var wikiStore: WikiStore
+    var onReimport: () -> Void
+    var onDelete: () -> Void
+
+    private var producedPages: [WikiPage] {
+        let ids = Set(record.sourceWikiPageIDs)
+        return wikiStore.pages.filter { ids.contains($0.id) }
+    }
+
+    var body: some View {
+        Form {
+            Section {
+                HStack(spacing: 14) {
+                    Image(systemName: record.documentType.icon)
+                        .font(.system(size: 28))
+                        .foregroundStyle(.tint)
+                        .frame(width: 56, height: 56)
+                        .background(Color.accentColor.opacity(0.15), in: .rect(cornerRadius: 14))
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(record.fileName)
+                            .font(.title3.weight(.semibold))
+                            .lineLimit(2)
+                        HStack(spacing: 4) {
+                            Text(record.documentType.label)
+                            Text("\u{00B7}")
+                            Text(ByteCountFormatter.string(fromByteCount: record.fileSize, countStyle: .file))
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.vertical, 4)
+                .listRowBackground(Color.clear)
             }
-            Button(action: onReimport) {
-                Label("Re-import", systemImage: "arrow.clockwise")
+
+            Section {
+                LabeledContent("Imported") {
+                    Text(record.importedAt.formatted(date: .abbreviated, time: .shortened))
+                }
+                if record.lastImportedAt > record.importedAt.addingTimeInterval(60) {
+                    LabeledContent("Last re-imported") {
+                        Text(record.lastImportedAt.formatted(date: .abbreviated, time: .shortened))
+                    }
+                }
+                LabeledContent("Wiki pages produced") {
+                    Text("\(record.sourceWikiPageIDs.count)")
+                        .monospacedDigit()
+                }
+                if let err = record.lastErrorMessage {
+                    Label(err, systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                        .font(.caption)
+                }
+            } header: {
+                Text("Details")
             }
-            .tint(.indigo)
+
+            if !producedPages.isEmpty {
+                Section {
+                    ForEach(producedPages) { page in
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(page.title).font(.body.weight(.medium))
+                            Text(page.body)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                        }
+                        .padding(.vertical, 2)
+                    }
+                } header: {
+                    HStack {
+                        Text("Wiki Pages")
+                        Spacer()
+                        Text("\(producedPages.count)")
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                } footer: {
+                    let missing = record.sourceWikiPageIDs.count - producedPages.count
+                    if missing > 0 {
+                        Text("\(missing) page\(missing == 1 ? " was" : "s were") deleted from the wiki since this import.")
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+            } else if !record.sourceWikiPageIDs.isEmpty {
+                Section {
+                    Text("All \(record.sourceWikiPageIDs.count) page\(record.sourceWikiPageIDs.count == 1 ? "" : "s") this import created have been deleted from the wiki.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                Section {
+                    Text("No wiki pages were produced from this import. Re-import after configuring a more capable provider — the same file will be re-extracted.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Section {
+                Button {
+                    onReimport()
+                } label: {
+                    Label("Re-import", systemImage: "arrow.clockwise")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.glass)
+
+                Button(role: .destructive) {
+                    onDelete()
+                } label: {
+                    Label("Delete\u{2026}", systemImage: "trash")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.glass)
+            }
         }
-        .contextMenu {
-            Button(action: onReimport) {
-                Label("Re-import", systemImage: "arrow.clockwise")
-            }
-            Divider()
-            Button(role: .destructive, action: onDelete) {
-                Label("Delete\u{2026}", systemImage: "trash")
-            }
-        }
+        .formStyle(.grouped)
+        .scrollEdgeEffectStyle(.soft, for: .top)
+        .navigationTitle(record.fileName)
+        #if os(iOS)
+        .navigationBarTitleDisplayMode(.inline)
+        #endif
     }
 }

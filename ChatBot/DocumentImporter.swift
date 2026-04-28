@@ -401,7 +401,12 @@ final class DocumentImporter {
         while let nextIndex = queue.firstIndex(where: { $0.status == .queued }) {
             if Task.isCancelled { break }
 
-            queue[nextIndex].status = .extractingText
+            // Capture the job by id, not by index — the queue can be mutated
+            // (clear-finished, cancel-all, more enqueues) while extraction
+            // runs, and the index would drift. Look the row up by id every
+            // time we update it.
+            let jobID = queue[nextIndex].id
+            updateJob(id: jobID) { $0.status = .extractingText }
             let job = queue[nextIndex]
 
             // Resolve the source file. New imports use the storage UUID-named
@@ -420,7 +425,9 @@ final class DocumentImporter {
             }.value
 
             guard let text = extractionResult, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                queue[nextIndex].status = .failed("Couldn't read text from \(job.fileName).\(extensionFor(job.documentType))")
+                updateJob(id: jobID) {
+                    $0.status = .failed("Couldn't read text from \(job.fileName).\(extensionFor(job.documentType))")
+                }
                 if let record = imports.first(where: { $0.id == job.id }) {
                     try? await actor.updateResult(
                         id: record.id,
@@ -460,7 +467,7 @@ final class DocumentImporter {
                 await loadAll()
             }
 
-            queue[nextIndex].status = .importing(nil)
+            updateJob(id: jobID) { $0.status = .importing(nil) }
 
             // Capture the wiki page count delta so we can record exactly which
             // pages came from this import (for delete-with-pages later).
@@ -471,8 +478,10 @@ final class DocumentImporter {
                 sourceName: job.fileName,
                 sourceDocumentID: job.id
             ) { progress in
-                self.queue[nextIndex].status = .importing(progress)
-                self.queue[nextIndex].progress = progress
+                self.updateJob(id: jobID) {
+                    $0.status = .importing(progress)
+                    $0.progress = progress
+                }
             }
 
             let newPageIDs = wikiEngine.wikiStore.pages
@@ -493,9 +502,16 @@ final class DocumentImporter {
                 AppLogger.importer.error("Failed updating import record: \(error.localizedDescription)")
             }
 
-            queue[nextIndex].status = .completed(summary)
+            updateJob(id: jobID) { $0.status = .completed(summary) }
             await loadAll()
         }
+    }
+
+    /// Mutate a queued job by id. Safe against array reordering — looks up
+    /// the index fresh on every call.
+    private func updateJob(id: UUID, _ mutate: (inout DocumentImportJob) -> Void) {
+        guard let i = queue.firstIndex(where: { $0.id == id }) else { return }
+        mutate(&queue[i])
     }
 
     private func extensionFor(_ type: DocumentType) -> String {

@@ -19,6 +19,9 @@ import AppKit
 
 struct ChatDetailView: View {
     var viewModel: ChatViewModel
+    /// Optional callback for the toolbar "+ New Chat" button. When nil
+    /// the button is hidden (e.g. preview / share-extension contexts).
+    var onNewChat: (() -> Void)? = nil
     @State private var inputText = ""
     @State private var showingSystemPrompt = false
     @State private var systemPromptDraft = ""
@@ -44,12 +47,29 @@ struct ChatDetailView: View {
         #endif
         #if os(macOS)
         .toolbar {
+            if let onNewChat {
+                ToolbarItem(placement: .automatic) {
+                    Button(action: onNewChat) {
+                        Label("New Chat", systemImage: "square.and.pencil")
+                    }
+                    .keyboardShortcut("n", modifiers: .command)
+                    .help("New Chat (\u{2318}N)")
+                }
+            }
             ToolbarItem(placement: .automatic) {
                 chatMenu
             }
         }
         #else
         .toolbar {
+            if let onNewChat {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button(action: onNewChat) {
+                        Label("New Chat", systemImage: "square.and.pencil")
+                    }
+                    .keyboardShortcut("n", modifiers: .command)
+                }
+            }
             ToolbarItem(placement: .topBarTrailing) {
                 chatMenu
             }
