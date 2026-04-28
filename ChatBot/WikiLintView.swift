@@ -483,7 +483,7 @@ private struct BrokenLinkView: View {
                         Button {
                             Task {
                                 await linter.apply(
-                                    .createPage(title: title, body: body, tags: tags, domainID: p.domainID),
+                                    .createPage(title: title, body: body, tags: tags),
                                     to: finding
                                 )
                                 onClose()
@@ -615,8 +615,7 @@ private struct MissingPageView: View {
                                 .createPage(
                                     title: draftTitle.trimmingCharacters(in: .whitespacesAndNewlines),
                                     body: draftBody.trimmingCharacters(in: .whitespacesAndNewlines),
-                                    tags: tags,
-                                    domainID: page?.domainID
+                                    tags: tags
                                 ),
                                 to: finding
                             )

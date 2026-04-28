@@ -3,7 +3,6 @@
 //  ChatBot
 //
 //  SwiftData persistence model and lightweight transfer struct for LLM Wiki pages.
-//  Follows the same pattern as KnowledgeBaseModels.swift:
 //  - @Model class (SDWikiPage) is the on-disk representation
 //  - WikiPage struct is the in-memory transfer type used by the retrieval pipeline
 //
@@ -36,9 +35,6 @@ final class SDWikiPage {
 
     /// IDs of other wiki pages this page references (simpler than self-referential relationships).
     var linkedPageIDsRaw: String
-
-    /// Domain scoping (consistent with KnowledgeBase architecture).
-    var domainID: UUID?
 
     /// Access tracking for retrieval prioritization.
     var accessCount: Int
@@ -82,7 +78,6 @@ final class SDWikiPage {
         title: String,
         body: String,
         tags: [String] = [],
-        domainID: UUID? = nil,
         sourceConversationIDs: [UUID] = [],
         sourceDocumentIDs: [UUID] = [],
         linkedPageIDs: [UUID] = []
@@ -96,7 +91,6 @@ final class SDWikiPage {
         self.sourceConversationIDsRaw = encodeJSONArray(sourceConversationIDs)
         self.sourceDocumentIDsRaw = encodeJSONArray(sourceDocumentIDs)
         self.linkedPageIDsRaw = encodeJSONArray(linkedPageIDs)
-        self.domainID = domainID
         self.accessCount = 0
         self.lastAccessedAt = Date()
         self.embeddingData = EmbeddingService.shared.embed("\(title)\n\(body)")?.asData
@@ -109,7 +103,6 @@ final class SDWikiPage {
             title: page.title,
             body: page.body,
             tags: page.tags,
-            domainID: page.domainID,
             sourceConversationIDs: page.sourceConversationIDs,
             sourceDocumentIDs: page.sourceDocumentIDs,
             linkedPageIDs: page.linkedPageIDs
@@ -133,7 +126,6 @@ final class SDWikiPage {
             sourceConversationIDs: sourceConversationIDs,
             sourceDocumentIDs: sourceDocumentIDs,
             linkedPageIDs: linkedPageIDs,
-            domainID: domainID,
             accessCount: accessCount,
             lastAccessedAt: lastAccessedAt,
             embedding: embedding
@@ -153,7 +145,6 @@ struct WikiPage: Identifiable, Codable, Hashable, Sendable {
     var sourceConversationIDs: [UUID]
     var sourceDocumentIDs: [UUID] = []
     var linkedPageIDs: [UUID]
-    var domainID: UUID?
     var accessCount: Int
     var lastAccessedAt: Date
     var embedding: [Double]?

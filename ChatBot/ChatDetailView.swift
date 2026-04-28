@@ -97,26 +97,6 @@ struct ChatDetailView: View {
                 Divider()
             }
 
-            let domains = viewModel.knowledgeBaseStore?.domains ?? []
-            if !domains.isEmpty {
-                Picker(selection: Binding(
-                    get: { viewModel.domainID },
-                    set: { newID in
-                        viewModel.domainID = newID
-                        viewModel.notifyChanged()
-                    }
-                )) {
-                    ForEach(domains) { domain in
-                        Text(domain.name).tag(domain.id)
-                    }
-                } label: {
-                    Label("Domain", systemImage: "square.stack.3d.up")
-                }
-                .pickerStyle(.menu)
-
-                Divider()
-            }
-
             Button {
                 systemPromptDraft = viewModel.customSystemPrompt ?? ""
                 showingSystemPrompt = true

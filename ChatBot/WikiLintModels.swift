@@ -167,7 +167,7 @@ enum WikiLintAction: Sendable {
     /// Keep both pages — record that the user reviewed this pair.
     case keepBoth
     /// Create a new page from a stub draft (missingPage / brokenLink).
-    case createPage(title: String, body: String, tags: [String], domainID: UUID?)
+    case createPage(title: String, body: String, tags: [String])
     /// Rewrite occurrences of `[[from]]` → `[[to]]` in the primary page.
     case rewriteLink(from: String, to: String)
     /// Strip the broken `[[from]]` markup, leaving the visible text.

@@ -17,94 +17,6 @@ import os
 @ModelActor
 actor KnowledgeBaseActor {
 
-    // MARK: - Domain CRUD
-
-    /// Insert a new knowledge domain.
-    func insertDomain(_ domain: KnowledgeDomain) throws {
-        let sd = SDKnowledgeDomain(from: domain)
-        modelContext.insert(sd)
-        try modelContext.save()
-        AppLogger.kbActor.info("Inserted domain '\(domain.name)' (\(domain.id))")
-    }
-
-    /// Load all domains as lightweight structs.
-    func loadAllDomains() throws -> [KnowledgeDomain] {
-        let descriptor = FetchDescriptor<SDKnowledgeDomain>(
-            sortBy: [SortDescriptor(\.createdAt)]
-        )
-        return try modelContext.fetch(descriptor).map { $0.toStruct() }
-    }
-
-    /// Rename a domain.
-    func renameDomain(id: UUID, to newName: String) throws {
-        let predicate = #Predicate<SDKnowledgeDomain> { $0.id == id }
-        let descriptor = FetchDescriptor<SDKnowledgeDomain>(predicate: predicate)
-        if let sd = try modelContext.fetch(descriptor).first {
-            sd.name = newName
-            try modelContext.save()
-            AppLogger.kbActor.info("Renamed domain \(id) to '\(newName)'")
-        }
-    }
-
-    /// Delete a domain. KBs cascade-delete via the relationship.
-    func deleteDomain(id: UUID) throws {
-        let predicate = #Predicate<SDKnowledgeDomain> { $0.id == id }
-        let descriptor = FetchDescriptor<SDKnowledgeDomain>(predicate: predicate)
-        if let sd = try modelContext.fetch(descriptor).first {
-            let name = sd.name
-            modelContext.delete(sd)
-            try modelContext.save()
-            AppLogger.kbActor.info("Deleted domain '\(name)' (\(id))")
-        }
-    }
-
-    /// Move a knowledge base to a different domain.
-    func moveKnowledgeBase(kbID: UUID, toDomainID: UUID) throws {
-        let kbPredicate = #Predicate<SDKnowledgeBase> { $0.id == kbID }
-        let kbDescriptor = FetchDescriptor<SDKnowledgeBase>(predicate: kbPredicate)
-
-        let domainPredicate = #Predicate<SDKnowledgeDomain> { $0.id == toDomainID }
-        let domainDescriptor = FetchDescriptor<SDKnowledgeDomain>(predicate: domainPredicate)
-
-        if let sdKB = try modelContext.fetch(kbDescriptor).first,
-           let sdDomain = try modelContext.fetch(domainDescriptor).first {
-            sdKB.domain = sdDomain
-            try modelContext.save()
-            AppLogger.kbActor.info("Moved KB \(kbID) to domain '\(sdDomain.name)'")
-        }
-    }
-
-    /// Assign all KBs with nil domain to the specified domain (migration helper).
-    func assignOrphanKBsToDomain(domainID: UUID) throws {
-        let domainPredicate = #Predicate<SDKnowledgeDomain> { $0.id == domainID }
-        let domainDescriptor = FetchDescriptor<SDKnowledgeDomain>(predicate: domainPredicate)
-        guard let sdDomain = try modelContext.fetch(domainDescriptor).first else { return }
-
-        let allDescriptor = FetchDescriptor<SDKnowledgeBase>()
-        let allKBs = try modelContext.fetch(allDescriptor)
-        var count = 0
-        for sdKB in allKBs where sdKB.domain == nil {
-            sdKB.domain = sdDomain
-            count += 1
-        }
-
-        if count > 0 {
-            try modelContext.save()
-            AppLogger.kbActor.info("Assigned \(count) orphan KBs to domain '\(sdDomain.name)'")
-        }
-    }
-
-    /// Update the summary for a domain.
-    func updateDomainSummary(id: UUID, summary: String) throws {
-        let predicate = #Predicate<SDKnowledgeDomain> { $0.id == id }
-        let descriptor = FetchDescriptor<SDKnowledgeDomain>(predicate: predicate)
-        if let sd = try modelContext.fetch(descriptor).first {
-            sd.summary = summary
-            try modelContext.save()
-            AppLogger.kbActor.info("Updated summary for domain '\(sd.name)'")
-        }
-    }
-
     /// Update the summary for a single chunk.
     func updateChunkSummary(chunkID: UUID, summary: String) throws {
         let predicate = #Predicate<SDDocumentChunk> { $0.id == chunkID }
@@ -134,17 +46,9 @@ actor KnowledgeBaseActor {
 
     // MARK: - Insert
 
-    /// Insert a new knowledge base with all its chunks, optionally in a domain.
-    func insertKnowledgeBase(_ kb: KnowledgeBase, chunks: [DocumentChunk], domainID: UUID? = nil) throws {
+    /// Insert a new knowledge base with all its chunks.
+    func insertKnowledgeBase(_ kb: KnowledgeBase, chunks: [DocumentChunk]) throws {
         let sdKB = SDKnowledgeBase(from: kb)
-
-        // Assign to domain if provided
-        if let domainID {
-            let predicate = #Predicate<SDKnowledgeDomain> { $0.id == domainID }
-            let descriptor = FetchDescriptor<SDKnowledgeDomain>(predicate: predicate)
-            sdKB.domain = try modelContext.fetch(descriptor).first
-        }
-
         modelContext.insert(sdKB)
 
         for chunk in chunks {

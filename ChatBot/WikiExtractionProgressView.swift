@@ -13,7 +13,6 @@ import SwiftUI
 struct WikiExtractionProgressView: View {
     let sourceName: String
     let document: KnowledgeBase?
-    let domainID: UUID?
     var wikiEngine: WikiEngine
     var knowledgeBaseStore: KnowledgeBaseStore
 
@@ -171,8 +170,7 @@ struct WikiExtractionProgressView: View {
                 let result = await wikiEngine.extractKnowledgeFromDocument(
                     text: documentText,
                     sourceName: ref.name,
-                    sourceDocumentID: ref.id,
-                    domainID: domainID
+                    sourceDocumentID: ref.id
                 ) { p in
                     progress = p
                 }

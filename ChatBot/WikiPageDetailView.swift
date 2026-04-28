@@ -21,7 +21,6 @@ struct WikiPageDetailView: View {
     private struct PendingCreation: Identifiable {
         let id = UUID()
         let title: String
-        let domainID: UUID?
     }
 
     var body: some View {
@@ -58,14 +57,13 @@ struct WikiPageDetailView: View {
         .sheet(item: $pendingCreation) { creation in
             WikiPageEditorView(
                 wikiStore: wikiStore,
-                seedTitle: creation.title,
-                domainID: creation.domainID
+                seedTitle: creation.title
             )
         }
         .alert("No page titled \u{201C}\(missingTitle)\u{201D}",
                isPresented: $showMissingAlert) {
             Button("Create") {
-                pendingCreation = PendingCreation(title: missingTitle, domainID: page.domainID)
+                pendingCreation = PendingCreation(title: missingTitle)
             }
             Button("Cancel", role: .cancel) {}
         } message: {

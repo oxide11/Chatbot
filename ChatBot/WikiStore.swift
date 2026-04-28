@@ -60,7 +60,6 @@ final class WikiStore {
         title: String,
         body: String,
         tags: [String],
-        domainID: UUID?,
         sourceConversationID: UUID? = nil,
         sourceDocumentID: UUID? = nil
     ) async -> WikiPage? {
@@ -74,7 +73,6 @@ final class WikiStore {
             sourceConversationIDs: sourceConversationID.map { [$0] } ?? [],
             sourceDocumentIDs: sourceDocumentID.map { [$0] } ?? [],
             linkedPageIDs: [],
-            domainID: domainID,
             accessCount: 0,
             lastAccessedAt: Date(),
             embedding: EmbeddingService.shared.embed("\(title)\n\(body)")
@@ -144,16 +142,9 @@ final class WikiStore {
     /// Falls back to keyword matching if embeddings are unavailable.
     func findRelevantPages(
         for query: String,
-        domainID: UUID?,
         limit: Int = 3
     ) -> [WikiPage] {
-        let pool: [WikiPage]
-        if let domainID {
-            pool = pages.filter { ($0.domainID ?? KnowledgeDomain.generalID) == domainID }
-        } else {
-            pool = pages
-        }
-
+        let pool = pages
         guard !pool.isEmpty else { return [] }
 
         // Semantic retrieval
@@ -189,11 +180,6 @@ final class WikiStore {
     func findPages(withTag tag: String) -> [WikiPage] {
         let lowered = tag.lowercased()
         return pages.filter { $0.tags.contains { $0.lowercased() == lowered } }
-    }
-
-    /// Pages for a specific domain.
-    func pages(forDomain domainID: UUID) -> [WikiPage] {
-        pages.filter { ($0.domainID ?? KnowledgeDomain.generalID) == domainID }
     }
 
     /// Record an access for prioritization.

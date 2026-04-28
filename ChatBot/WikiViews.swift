@@ -13,7 +13,6 @@ struct WikiPageEditorView: View {
     var wikiStore: WikiStore
     var existing: WikiPage?
     var seedTitle: String?
-    var domainID: UUID?
     @Environment(\.dismiss) private var dismiss
     @State private var title = ""
     @State private var pageBody = ""
@@ -117,7 +116,6 @@ struct WikiPageEditorView: View {
                     title: trimmedTitle,
                     body: trimmedBody,
                     tags: tags,
-                    domainID: domainID,
                     sourceConversationID: nil
                 )
             }
@@ -171,7 +169,6 @@ struct FlowLayout: Layout {
 
 struct WikiPageListView: View {
     var wikiStore: WikiStore
-    var domains: [KnowledgeDomain] = []
     @Environment(\.dismiss) private var dismiss
     @State private var path: [WikiPage] = []
     @State private var showingDeleteAllConfirmation = false
@@ -252,30 +249,21 @@ struct WikiPageListView: View {
             }
         } else {
             List {
-                ForEach(domains.isEmpty ? [KnowledgeDomain.general()] : domains) { domain in
-                    let domainPages = wikiStore.pages(forDomain: domain.id)
-                    if !domainPages.isEmpty {
-                        Section {
-                            ForEach(domainPages) { page in
-                                NavigationLink(value: page) {
-                                    WikiPageRow(page: page)
-                                }
-                                .contextMenu {
-                                    Button {
-                                        path.append(page)
-                                    } label: {
-                                        Label("Open", systemImage: "doc.text")
-                                    }
+                ForEach(wikiStore.pages) { page in
+                    NavigationLink(value: page) {
+                        WikiPageRow(page: page)
+                    }
+                    .contextMenu {
+                        Button {
+                            path.append(page)
+                        } label: {
+                            Label("Open", systemImage: "doc.text")
+                        }
 
-                                    Button(role: .destructive) {
-                                        Task { await wikiStore.deletePage(id: page.id) }
-                                    } label: {
-                                        Label("Delete", systemImage: "trash")
-                                    }
-                                }
-                            }
-                        } header: {
-                            Text(domain.name)
+                        Button(role: .destructive) {
+                            Task { await wikiStore.deletePage(id: page.id) }
+                        } label: {
+                            Label("Delete", systemImage: "trash")
                         }
                     }
                 }

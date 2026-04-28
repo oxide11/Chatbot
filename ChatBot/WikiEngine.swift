@@ -55,8 +55,7 @@ final class WikiEngine {
     func extractKnowledge(
         from transcript: String,
         conversationID: UUID,
-        conversationTitle: String,
-        domainID: UUID?
+        conversationTitle: String
     ) async {
         guard extractionEnabled else { return }
         guard !transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
@@ -107,7 +106,6 @@ final class WikiEngine {
                         title: item.title,
                         body: item.body,
                         tags: item.tags,
-                        domainID: domainID,
                         sourceConversationID: conversationID
                     )
                     AppLogger.wiki.info("Created new wiki page '\(item.title)'")
@@ -125,8 +123,7 @@ final class WikiEngine {
     /// Query the wiki for relevant pages and format them for injection into the prompt.
     /// Returns a formatted context string and the number of pages included.
     func buildWikiContext(
-        for query: String,
-        domainID: UUID?
+        for query: String
     ) -> (context: String, pageCount: Int) {
         guard injectionEnabled else { return ("", 0) }
 
@@ -135,7 +132,6 @@ final class WikiEngine {
 
         let relevantPages = wikiStore.findRelevantPages(
             for: query,
-            domainID: domainID,
             limit: maxPages
         )
 
@@ -246,7 +242,6 @@ extension WikiEngine {
         text: String,
         sourceName: String,
         sourceDocumentID: UUID?,
-        domainID: UUID?,
         onProgress: @MainActor @Sendable (WikiDocumentExtractionProgress) -> Void = { _ in }
     ) async -> WikiDocumentExtractionSummary {
         guard extractionEnabled else {
@@ -322,7 +317,6 @@ extension WikiEngine {
                             title: item.title,
                             body: item.body,
                             tags: item.tags,
-                            domainID: domainID,
                             sourceDocumentID: sourceDocumentID
                         )
                         pagesCreated += 1
