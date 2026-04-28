@@ -86,6 +86,9 @@ struct DocumentImportListView: View {
                         importer.enqueue(urls: urls)
                     }
                 }
+                .onDrop(of: Self.acceptedDropTypes, isTargeted: nil) { providers in
+                    handleDrop(providers: providers)
+                }
                 .confirmationDialog(
                     "Delete \(pendingDelete?.fileName ?? "")?",
                     isPresented: deleteBinding,
@@ -117,6 +120,67 @@ struct DocumentImportListView: View {
                 }
         }
         .presentationDragIndicator(.visible)
+    }
+
+    // MARK: - Drag-and-drop
+
+    /// UTI types accepted by the drop target. Mirrors the fileImporter
+    /// allowedContentTypes so users can drag the same files they could
+    /// pick through the dialog.
+    private static var acceptedDropTypes: [UTType] {
+        var types: [UTType] = [.pdf, .epub, .plainText]
+        if let md = UTType(filenameExtension: "md") { types.append(md) }
+        return types
+    }
+
+    /// Resolve dropped NSItemProviders to local file URLs and hand them
+    /// to the importer's queue.
+    private func handleDrop(providers: [NSItemProvider]) -> Bool {
+        guard !providers.isEmpty else { return false }
+
+        Task {
+            var resolved: [URL] = []
+            for provider in providers {
+                if let url = await Self.loadFileURL(from: provider) {
+                    resolved.append(url)
+                }
+            }
+            if !resolved.isEmpty {
+                await MainActor.run {
+                    importer.enqueue(urls: resolved)
+                }
+            }
+        }
+        return true
+    }
+
+    /// Pull a file URL out of an NSItemProvider for any accepted type.
+    /// Returns nil when the provider can't surface a usable URL — e.g. the
+    /// drop is plain text rather than a file reference.
+    private static func loadFileURL(from provider: NSItemProvider) async -> URL? {
+        for type in acceptedDropTypes where provider.hasItemConformingToTypeIdentifier(type.identifier) {
+            return await withCheckedContinuation { continuation in
+                _ = provider.loadFileRepresentation(forTypeIdentifier: type.identifier) { url, error in
+                    if let url, error == nil {
+                        // The system gives us a temp URL that's reaped after
+                        // this completion handler returns. Copy into our
+                        // tmp dir so the caller can safely import it later.
+                        let dest = FileManager.default.temporaryDirectory
+                            .appendingPathComponent(UUID().uuidString)
+                            .appendingPathExtension(url.pathExtension)
+                        do {
+                            try FileManager.default.copyItem(at: url, to: dest)
+                            continuation.resume(returning: dest)
+                        } catch {
+                            continuation.resume(returning: nil)
+                        }
+                    } else {
+                        continuation.resume(returning: nil)
+                    }
+                }
+            }
+        }
+        return nil
     }
 
     private var deleteBinding: Binding<Bool> {

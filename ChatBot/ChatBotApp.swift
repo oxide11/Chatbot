@@ -13,6 +13,10 @@ struct ChatBotApp: App {
     @State private var store = ConversationStore()
     @Environment(\.scenePhase) private var scenePhase
 
+    #if canImport(UIKit) && !os(macOS) && !os(visionOS)
+    @UIApplicationDelegateAdaptor(ChatBotAppDelegate.self) private var appDelegate
+    #endif
+
     init() {
         WikiLintScheduler.shared.register(with: store)
         WikiLintScheduler.shared.reschedule(enabled: store.ragSettings.dailyBackgroundLintEnabled)
