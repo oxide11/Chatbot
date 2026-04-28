@@ -11,7 +11,7 @@
 //  ChatBot
 //
 //  In-memory cache + semantic retrieval for wiki pages.
-//  Mirrors the KnowledgeBaseStore pattern: loads pages from SwiftData via WikiActor
+//  Loads pages from SwiftData via WikiActor
 //  into lightweight structs, then uses EmbeddingService for vector-based retrieval.
 //
 //  Replaces MemoryStore as the primary long-term knowledge system.

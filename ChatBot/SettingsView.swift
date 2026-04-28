@@ -12,7 +12,7 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var showingDeleteAllConfirmation = false
     @State private var showingWikiPages = false
-    @State private var showingKnowledgeBases = false
+    @State private var showingImports = false
     @State private var showingWorkers = false
     @State private var showingWikiLint = false
     @State private var defaultPromptDraft = ""
@@ -41,12 +41,12 @@ struct SettingsView: View {
                     .buttonStyle(.plain)
 
                     Button {
-                        showingKnowledgeBases = true
+                        showingImports = true
                     } label: {
                         HStack {
-                            Label("Knowledge Bases", systemImage: "books.vertical")
+                            Label("Import Documents", systemImage: "doc.badge.plus")
                             Spacer()
-                            Text("\(store.knowledgeBaseStore.knowledgeBases.count)")
+                            Text("\(store.documentImporter.imports.count)")
                                 .foregroundStyle(.secondary)
                             Image(systemName: "chevron.right")
                                 .font(.caption.weight(.semibold))
@@ -74,7 +74,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Intelligence")
                 } footer: {
-                    Text("Wiki pages are extracted from conversations. Knowledge bases are imported documents. Workers are specialized AI personas for task delegation.")
+                    Text("Wiki pages are extracted from conversations and imported documents. Workers are specialized AI personas for task delegation.")
                 }
 
                 // MARK: Providers
@@ -118,14 +118,6 @@ struct SettingsView: View {
                         }
                     ))
 
-                    Toggle("Document Retrieval", isOn: Binding(
-                        get: { store.ragSettings.knowledgeBaseRetrievalEnabled },
-                        set: { newValue in
-                            store.ragSettings.knowledgeBaseRetrievalEnabled = newValue
-                            store.applyRAGSettings()
-                        }
-                    ))
-
                     Toggle("Auto-Extract from Conversations", isOn: Binding(
                         get: { store.ragSettings.autoExtractKnowledge },
                         set: { newValue in
@@ -133,30 +125,10 @@ struct SettingsView: View {
                             store.applyRAGSettings()
                         }
                     ))
-
-                    Toggle("Auto-Extract from Documents", isOn: Binding(
-                        get: { store.ragSettings.autoExtractWikiFromDocuments },
-                        set: { newValue in
-                            store.ragSettings.autoExtractWikiFromDocuments = newValue
-                            store.applyRAGSettings()
-                        }
-                    ))
-
-                    Stepper(
-                        "Document chunks: \(store.ragSettings.maxDocumentChunks)",
-                        value: Binding(
-                            get: { store.ragSettings.maxDocumentChunks },
-                            set: { newValue in
-                                store.ragSettings.maxDocumentChunks = newValue
-                                store.applyRAGSettings()
-                            }
-                        ),
-                        in: 1...5
-                    )
                 } header: {
                     Text("Retrieval")
                 } footer: {
-                    Text("Auto-Extract from Documents runs each newly imported PDF / ePub / text file through the LLM to populate wiki pages — long documents can take several minutes on-device.")
+                    Text("Wiki retrieval pulls relevant pages into chat context. Auto-Extract from Conversations creates new wiki pages from each conversation as it grows.")
                 }
 
                 // MARK: Wiki Maintenance
@@ -265,13 +237,14 @@ struct SettingsView: View {
                     }
 
                     HStack {
-                        Label("Knowledge Bases", systemImage: "books.vertical")
+                        Label("Imported Documents", systemImage: "doc.badge.plus")
                         Spacer()
-                        if store.knowledgeBaseStore.knowledgeBases.isEmpty {
+                        if store.documentImporter.imports.isEmpty {
                             Text("None")
                                 .foregroundStyle(.secondary)
                         } else {
-                            Text("\(store.knowledgeBaseStore.knowledgeBases.count) docs \u{00B7} \(store.knowledgeBaseStore.totalChunkCount) chunks \u{00B7} \(ByteCountFormatter.string(fromByteCount: store.knowledgeBaseStore.totalChunkStorageSize, countStyle: .file))")
+                            let totalBytes = store.documentImporter.imports.reduce(Int64(0)) { $0 + $1.fileSize }
+                            Text("\(store.documentImporter.imports.count) \u{00B7} \(ByteCountFormatter.string(fromByteCount: totalBytes, countStyle: .file))")
                                 .foregroundStyle(.secondary)
                         }
                     }
@@ -339,11 +312,8 @@ struct SettingsView: View {
             .sheet(isPresented: $showingWikiPages) {
                 WikiPageListView(wikiStore: store.wikiStore)
             }
-            .sheet(isPresented: $showingKnowledgeBases) {
-                KnowledgeBaseListView(
-                    knowledgeBaseStore: store.knowledgeBaseStore,
-                    wikiEngine: store.wikiEngine
-                )
+            .sheet(isPresented: $showingImports) {
+                DocumentImportListView(importer: store.documentImporter)
             }
             .sheet(isPresented: $showingWorkers) {
                 WorkerLibraryView(orchestrator: store.orchestrator)

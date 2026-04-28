@@ -102,9 +102,6 @@ final class ChatViewModel: Identifiable {
     /// Reference to the shared wiki engine for knowledge retrieval and extraction
     var wikiEngine: WikiEngine?
 
-    /// Reference to the shared knowledge base store for document RAG retrieval
-    var knowledgeBaseStore: KnowledgeBaseStore?
-
     /// RAG configuration
     var ragSettings: RAGSettings = .default
 
@@ -455,30 +452,6 @@ final class ChatViewModel: Identifiable {
             }
         }
 
-        // Retrieve document chunks (scoped to conversation's domain)
-        if ragSettings.knowledgeBaseRetrievalEnabled, let kbStore = knowledgeBaseStore, usedChars < maxContextChars {
-            let budget = maxContextChars - usedChars
-            let relevantChunks = kbStore.retrieve(for: userText, limit: ragSettings.maxDocumentChunks)
-            if !relevantChunks.isEmpty {
-                let kbLookup = Dictionary(uniqueKeysWithValues: kbStore.knowledgeBases.map { ($0.id, $0.name) })
-                var chunkTexts: [String] = []
-                var chunkChars = 0
-                for chunk in relevantChunks {
-                    let text = "[\(chunk.locationLabel)] \(chunk.content)"
-                    if chunkChars + text.count > budget { break }
-                    chunkTexts.append(text)
-                    chunkChars += text.count
-                    chunkCount += 1
-                    if let name = kbLookup[chunk.knowledgeBaseID] {
-                        docNames.insert(name)
-                    }
-                }
-                if !chunkTexts.isEmpty {
-                    contextBlocks.append("Relevant knowledge base excerpts:\n\(chunkTexts.joined(separator: "\n---\n"))")
-                }
-            }
-        }
-
         let ragContext = RAGContext(
             wikiPageCount: wikiPageCount,
             documentChunkCount: chunkCount,
@@ -702,13 +675,8 @@ struct RAGContext {
 
 struct RAGSettings: Codable, Sendable {
     var wikiRetrievalEnabled: Bool = true
-    var knowledgeBaseRetrievalEnabled: Bool = true
-    var maxDocumentChunks: Int = 3
     var contextBudgetCharacters: Int = 1500
     var autoExtractKnowledge: Bool = true
-    /// When true, every newly imported document is automatically run through
-    /// wiki extraction in addition to being chunked for RAG retrieval.
-    var autoExtractWikiFromDocuments: Bool = false
     /// Run the structural lint pass after every successful extraction.
     var lintAfterExtractions: Bool = false
     /// Allow iOS to schedule a daily background structural lint pass.
@@ -719,17 +687,13 @@ struct RAGSettings: Codable, Sendable {
 
     static let `default` = RAGSettings()
 
-    /// Backward-compatible decoding for the wiki-from-documents toggle.
     init() {}
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         wikiRetrievalEnabled = try c.decodeIfPresent(Bool.self, forKey: .wikiRetrievalEnabled) ?? true
-        knowledgeBaseRetrievalEnabled = try c.decodeIfPresent(Bool.self, forKey: .knowledgeBaseRetrievalEnabled) ?? true
-        maxDocumentChunks = try c.decodeIfPresent(Int.self, forKey: .maxDocumentChunks) ?? 3
         contextBudgetCharacters = try c.decodeIfPresent(Int.self, forKey: .contextBudgetCharacters) ?? 1500
         autoExtractKnowledge = try c.decodeIfPresent(Bool.self, forKey: .autoExtractKnowledge) ?? true
-        autoExtractWikiFromDocuments = try c.decodeIfPresent(Bool.self, forKey: .autoExtractWikiFromDocuments) ?? false
         lintAfterExtractions = try c.decodeIfPresent(Bool.self, forKey: .lintAfterExtractions) ?? false
         dailyBackgroundLintEnabled = try c.decodeIfPresent(Bool.self, forKey: .dailyBackgroundLintEnabled) ?? false
         lintSimilarityThreshold = try c.decodeIfPresent(Double.self, forKey: .lintSimilarityThreshold) ?? 0.85
@@ -743,7 +707,7 @@ final class ConversationStore {
     let wikiStore = WikiStore()
     let wikiEngine: WikiEngine
     let wikiLinter: WikiLinter
-    let knowledgeBaseStore = KnowledgeBaseStore()
+    let documentImporter = DocumentImporter()
     let providers = ProviderRegistry()
     var ragSettings: RAGSettings = .default
     var defaultSystemPrompt: String = ChatViewModel.defaultInstructions
@@ -767,7 +731,6 @@ final class ConversationStore {
         } else {
             for conversation in conversations {
                 conversation.wikiEngine = wikiEngine
-                conversation.knowledgeBaseStore = knowledgeBaseStore
                 conversation.ragSettings = ragSettings
                 conversation.orchestrator = orchestrator
                 conversation.providerRegistry = providers
@@ -786,43 +749,9 @@ final class ConversationStore {
         }
     }
 
-    /// Provide the SwiftData ModelContainer to the knowledge base store. Call from the view layer.
-    func configureKnowledgeBaseStore(with modelContext: ModelContext) {
-        knowledgeBaseStore.configure(with: modelContext.container)
-        knowledgeBaseStore.onIngestionCompleted = { [weak self] kb in
-            self?.autoExtractWikiIfEnabled(for: kb)
-        }
-    }
-
-    /// Auto-extract wiki pages from a freshly ingested document if the
-    /// "Auto-Extract from Documents" toggle is on. Runs detached and
-    /// optionally chains into a lint pass when "Lint after extractions" is on.
-    private func autoExtractWikiIfEnabled(for kb: KnowledgeBase) {
-        guard ragSettings.autoExtractWikiFromDocuments else {
-            // Even without extraction, give the user the option to lint after
-            // any fresh content lands.
-            if ragSettings.lintAfterExtractions {
-                runStructuralLint()
-            }
-            return
-        }
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            await BackgroundTask.run("Auto Wiki Extraction") {
-                let chunks = self.knowledgeBaseStore.allChunks(for: kb.id)
-                    .sorted { $0.index < $1.index }
-                let text = chunks.map(\.content).joined(separator: "\n\n")
-                guard !text.isEmpty else { return }
-                _ = await self.wikiEngine.extractKnowledgeFromDocument(
-                    text: text,
-                    sourceName: kb.name,
-                    sourceDocumentID: kb.id
-                )
-                if self.ragSettings.lintAfterExtractions {
-                    self.runStructuralLint()
-                }
-            }
-        }
+    /// Provide the SwiftData ModelContainer to the document importer.
+    func configureDocumentImporter(with modelContext: ModelContext) {
+        documentImporter.configure(with: modelContext.container, wikiEngine: wikiEngine)
     }
 
     /// Apply the current similarity threshold to the linter and run a
@@ -845,7 +774,6 @@ final class ConversationStore {
         conversation.providerRegistry = providers
         conversation.checkAvailability()
         conversation.wikiEngine = wikiEngine
-        conversation.knowledgeBaseStore = knowledgeBaseStore
         conversation.ragSettings = ragSettings
         conversation.orchestrator = orchestrator
         // Apply the default system prompt if user has customized it
@@ -950,9 +878,9 @@ final class ConversationStore {
         wikiStore.pages.count
     }
 
-    /// Total approximate on-disk footprint (conversations + knowledge bases).
+    /// Total approximate on-disk footprint (conversations + imported documents).
     var totalStorageBytes: Int64 {
-        Int64(conversationDataSize) + knowledgeBaseStore.totalChunkStorageSize
+        Int64(conversationDataSize) + documentImporter.imports.reduce(0) { $0 + $1.fileSize }
     }
 
     // MARK: - Persistence

@@ -30,7 +30,7 @@ final class SDWikiPage {
     /// Which conversations contributed knowledge to this page.
     var sourceConversationIDsRaw: String
 
-    /// Which imported documents (KnowledgeBase entries) contributed knowledge to this page.
+    /// Which imported documents contributed knowledge to this page.
     var sourceDocumentIDsRaw: String = "[]"
 
     /// IDs of other wiki pages this page references (simpler than self-referential relationships).
