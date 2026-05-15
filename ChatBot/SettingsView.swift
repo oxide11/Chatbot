@@ -155,6 +155,8 @@ struct SettingsView: View {
                     }
                     .buttonStyle(.plain)
 
+                    SummaryBackfillRow(engine: store.wikiEngine)
+
                     Toggle("Lint After Extractions", isOn: Binding(
                         get: { store.ragSettings.lintAfterExtractions },
                         set: { newValue in
@@ -202,7 +204,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Wiki Maintenance")
                 } footer: {
-                    Text("Lint surfaces broken links, orphans, duplicates, stale and missing pages. AI Review (inside Lint Wiki) drafts merge / stub proposals. Nothing is changed without your confirmation.")
+                    Text("Lint surfaces broken links, orphans, duplicates, stale and missing pages. Summarise Pages writes a one-line LLM summary for each page so the model can browse the wiki by table of contents. Nothing is changed without your confirmation.")
                 }
 
                 // MARK: System Prompt
@@ -329,5 +331,60 @@ struct SettingsView: View {
         #if os(macOS)
         .frame(minWidth: 480, idealWidth: 520, minHeight: 540, idealHeight: 600)
         #endif
+    }
+}
+
+// MARK: - Summary Backfill Row
+
+/// Settings row that drives `WikiEngine.runSummaryBackfill`. Shows the
+/// pending count when idle, a progress bar + cancel button while
+/// running, and hides itself when nothing is pending. Routes through
+/// whichever provider the user has bound to the `.extraction` task —
+/// remote callers will incur per-page cost, surfaced in the footer.
+private struct SummaryBackfillRow: View {
+    let engine: WikiEngine
+
+    var body: some View {
+        Group {
+            if engine.isBackfillingSummaries, let progress = engine.summaryBackfillProgress {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Label("Summarising Pages", systemImage: "text.book.closed")
+                        Spacer()
+                        Button("Stop") {
+                            engine.cancelSummaryBackfill()
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .tint(.red)
+                    }
+                    ProgressView(
+                        value: Double(progress.processed),
+                        total: Double(max(progress.total, 1))
+                    )
+                    Text("\(progress.processed) of \(progress.total)\(progress.failed > 0 ? " · \(progress.failed) failed" : "")")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+            } else if engine.pagesMissingSummary > 0 {
+                Button {
+                    engine.runSummaryBackfill()
+                } label: {
+                    HStack {
+                        Label("Summarise Pages", systemImage: "text.book.closed")
+                        Spacer()
+                        Text("\(engine.pagesMissingSummary)")
+                            .font(.caption.weight(.medium))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 2)
+                            .background(.blue.opacity(0.18), in: .capsule)
+                            .foregroundStyle(.blue)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
     }
 }

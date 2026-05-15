@@ -128,14 +128,15 @@ final class WikiEngine {
             AppLogger.wiki.info("Merged into existing wiki page '\(page.title)'")
             return .merged
         } else {
-            let summary = page.summary.isEmpty
-                ? WikiExtractionPrompts.deriveSummary(fromBody: page.body, title: page.title)
-                : page.summary
+            // Persist the model's summary as-is (may be empty if the
+            // model dropped the field). `WikiStore.tableOfContents`
+            // derives a fallback at display time, and the backfill in
+            // Settings can upgrade empty summaries to LLM quality.
             await wikiStore.createPage(
                 title: page.title,
                 body: page.body,
                 tags: page.tags,
-                summary: summary,
+                summary: page.summary,
                 sourceConversationID: sourceConversationID,
                 sourceDocumentID: sourceDocumentID
             )
@@ -184,27 +185,115 @@ final class WikiEngine {
         )
     }
 
-    /// Lazy backfill: walk pages with empty `summary` and persist a
-    /// deterministic fallback derived from the body's first line.
-    /// Detached so it doesn't block the turn that triggered it. Cheap —
-    /// no LLM calls, just string ops + a SwiftData write per page.
-    func backfillMissingSummaries() {
-        let needsBackfill = wikiStore.pages.filter { $0.summary.isEmpty }
-        guard !needsBackfill.isEmpty else { return }
+    // MARK: - Summary Backfill
+    //
+    // New pages created via extraction get their `summary` from the
+    // model directly (it's a `WikiPageDraft` field). Pre-existing pages
+    // — created before the field was added, or via lint stubs / manual
+    // creation — store an empty summary; `WikiStore.tableOfContents`
+    // derives a first-line fallback at display time so the TOC still
+    // works. This backfill upgrades them to LLM-quality summaries
+    // when the user explicitly runs it from Settings.
 
-        let store = wikiStore
-        Task {
-            for page in needsBackfill {
-                let summary = WikiExtractionPrompts.deriveSummary(
-                    fromBody: page.body,
-                    title: page.title
-                )
-                if !summary.isEmpty {
-                    await store.setSummary(pageID: page.id, summary: summary)
-                }
-            }
+    /// True while `runSummaryBackfill` is in flight. Drives the spinner
+    /// and "Cancel" button in Settings → Wiki Maintenance.
+    private(set) var isBackfillingSummaries: Bool = false
+
+    /// Progress through the current backfill, or nil when idle.
+    private(set) var summaryBackfillProgress: (processed: Int, total: Int, failed: Int)?
+
+    /// Cached so the user can request cancellation from the UI.
+    private var summaryBackfillTask: Task<Void, Never>?
+
+    /// Run an LLM-quality summary backfill across every page that
+    /// doesn't have a stored summary yet. Routes through whichever
+    /// provider the user has bound to the `.extraction` task (on-device
+    /// by default — free; remote will incur per-page cost). Serialised
+    /// — one page at a time — so it doesn't thrash rate limits or burn
+    /// a phone battery. Honours `Task.cancel()`.
+    @discardableResult
+    func runSummaryBackfill() -> Task<Void, Never> {
+        if let existing = summaryBackfillTask {
+            return existing
         }
+
+        // Observable state lives on WikiEngine, which isn't @MainActor —
+        // pin the task body to main so the mutations don't race UI reads.
+        // The actual `respondGenerable` await hops off main on its own.
+        let task = Task { @MainActor [self] in
+            let needsBackfill = wikiStore.pages.filter {
+                $0.summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
+            guard !needsBackfill.isEmpty else {
+                summaryBackfillTask = nil
+                return
+            }
+
+            isBackfillingSummaries = true
+            summaryBackfillProgress = (processed: 0, total: needsBackfill.count, failed: 0)
+            defer {
+                isBackfillingSummaries = false
+                summaryBackfillProgress = nil
+                summaryBackfillTask = nil
+            }
+
+            var processed = 0
+            var failed = 0
+            for page in needsBackfill {
+                if Task.isCancelled { break }
+
+                do {
+                    let draft = try await respondGenerable(
+                        systemPrompt: Self.summarySystemPrompt,
+                        userPrompt: WikiExtractionPrompts.summaryPrompt(
+                            title: page.title,
+                            body: page.body
+                        ),
+                        maxTokens: 80,
+                        task: .extraction,
+                        generating: WikiSummaryDraft.self,
+                        decodeText: WikiExtractionPrompts.parseSummary
+                    )
+                    let summary = draft.summary.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !summary.isEmpty {
+                        await wikiStore.setSummary(pageID: page.id, summary: summary)
+                    } else {
+                        failed += 1
+                    }
+                } catch {
+                    failed += 1
+                    AppLogger.wiki.error("Summary backfill failed for '\(page.title)': \(error.localizedDescription)")
+                }
+
+                processed += 1
+                summaryBackfillProgress = (processed: processed, total: needsBackfill.count, failed: failed)
+            }
+
+            AppLogger.wiki.info("Summary backfill done: \(processed)/\(needsBackfill.count) processed, \(failed) failed")
+        }
+
+        summaryBackfillTask = task
+        return task
     }
+
+    /// Cancel an in-flight backfill. Safe to call when none is running.
+    func cancelSummaryBackfill() {
+        summaryBackfillTask?.cancel()
+    }
+
+    /// Count of pages that would be touched if backfill were started
+    /// now. Drives the "X pages need summaries" affordance in Settings.
+    var pagesMissingSummary: Int {
+        wikiStore.pages.filter {
+            $0.summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }.count
+    }
+
+    private static let summarySystemPrompt = """
+        You write one-sentence wiki page summaries for a table of contents. \
+        Each summary names the key concept (≤120 chars, no quotes, no \
+        markdown). Output exactly one line.
+        """
 
     // MARK: - Provider Routing
 
