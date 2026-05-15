@@ -429,7 +429,7 @@ struct ProviderDetailView: View {
         case .openAI:
             return OpenAIProvider(apiKey: key, model: model)
         case .gemini:
-            throw ChatProviderError.providerUnavailable(id)
+            return GeminiProvider(apiKey: key, model: model)
         case .foundationModels:
             throw ChatProviderError.providerUnavailable(id)
         }
