@@ -743,15 +743,24 @@ struct RAGIndicatorView: View {
 
     var body: some View {
         HStack(spacing: 4) {
-            Image(systemName: "sparkles")
+            Image(systemName: iconName)
                 .font(.system(size: 9))
             Text(context.summary)
                 .font(.system(size: 10))
+                .lineLimit(1)
+                .truncationMode(.tail)
         }
         .foregroundStyle(.secondary)
         .padding(.horizontal, 8)
         .padding(.vertical, 3)
         .background(.fill.quaternary, in: .capsule)
+        .accessibilityLabel(context.summary)
+    }
+
+    private var iconName: String {
+        // Closed-book glyph reads as "wiki page" once the model has
+        // actually pulled something; sparkles for the generic case.
+        context.wikiPageTitles.isEmpty ? "sparkles" : "text.book.closed"
     }
 }
 

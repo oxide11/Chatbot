@@ -153,31 +153,35 @@ final class WikiEngine {
     func buildWikiContext(
         for query: String,
         budget: WikiContextBudget
-    ) -> (context: String, pageCount: Int) {
-        guard injectionEnabled else { return ("", 0) }
+    ) -> (context: String, pageCount: Int, titles: [String]) {
+        guard injectionEnabled else { return ("", 0, []) }
 
         let relevantPages = wikiStore.findRelevantPages(
             for: query,
             limit: budget.preInjectPageLimit
         )
 
-        guard !relevantPages.isEmpty else { return ("", 0) }
+        guard !relevantPages.isEmpty else { return ("", 0, []) }
 
         var context = ""
         var usedChars = 0
-        var includedCount = 0
+        var includedTitles: [String] = []
 
         for page in relevantPages {
             let formatted = "## \(page.title)\n\(page.body)"
             if usedChars + formatted.count > budget.preInjectCharBudget { break }
             context += formatted + "\n\n"
             usedChars += formatted.count
-            includedCount += 1
+            includedTitles.append(page.title)
 
             wikiStore.recordAccess(pageID: page.id)
         }
 
-        return (context.trimmingCharacters(in: .whitespacesAndNewlines), includedCount)
+        return (
+            context.trimmingCharacters(in: .whitespacesAndNewlines),
+            includedTitles.count,
+            includedTitles
+        )
     }
 
     /// Lazy backfill: walk pages with empty `summary` and persist a
