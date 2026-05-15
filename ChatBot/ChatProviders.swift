@@ -327,8 +327,9 @@ final class ProviderRegistry {
                   !key.isEmpty else { return nil }
             return OpenAIProvider(apiKey: key, model: modelID(for: id))
         case .gemini:
-            // Implementation to follow.
-            return nil
+            guard let key = KeychainManager.getAPIKey(for: id.keychainAccount),
+                  !key.isEmpty else { return nil }
+            return GeminiProvider(apiKey: key, model: modelID(for: id))
         }
     }
 
