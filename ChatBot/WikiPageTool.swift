@@ -16,27 +16,49 @@ import Foundation
 import FoundationModels
 import Synchronization
 
-// MARK: - Per-turn Fetch Counter
+// MARK: - Per-turn Usage Tracker
 
-/// Thread-safe counter that bounds how many pages the model can fetch
-/// during a single conversational turn. Reset between turns by the
-/// session creator (`ChatViewModel`); incremented by the tools.
-nonisolated final class WikiToolBudgetTracker: Sendable {
+/// Thread-safe per-turn tracker for the wiki tool layer. Tracks two
+/// things: the fetch count (used by `getWikiPage` to enforce
+/// `WikiContextBudget.pageFetchCap`) and the titles of pages the model
+/// actually pulled (so the chat UI can surface "used [[X]], [[Y]]"
+/// after the reply, instead of just "saw N TOC entries"). Reset by
+/// `ChatViewModel` at the start of each turn; drained at the end.
+nonisolated final class WikiToolUsageTracker: Sendable {
     private let _count = Mutex<Int>(0)
+    private let _titles = Mutex<[String]>([])
 
     nonisolated func reset() {
         _count.withLock { $0 = 0 }
+        _titles.withLock { $0 = [] }
     }
 
-    /// Returns the new count after incrementing.
-    nonisolated func increment() -> Int {
+    /// Returns the new count after incrementing. Called before any
+    /// store work so the cap check is honoured even on lookup failure.
+    nonisolated func incrementFetchCount() -> Int {
         _count.withLock { count in
             count += 1
             return count
         }
     }
 
-    nonisolated func current() -> Int {
+    /// Record a successful page fetch (after the cap check passed and
+    /// the page was found). Deduplicates so a model that fetches the
+    /// same page twice only shows once in the chip.
+    nonisolated func recordFetched(title: String) {
+        _titles.withLock { titles in
+            if !titles.contains(where: { $0.caseInsensitiveCompare(title) == .orderedSame }) {
+                titles.append(title)
+            }
+        }
+    }
+
+    /// Snapshot the titles fetched this turn (does not reset).
+    nonisolated func fetchedTitles() -> [String] {
+        _titles.withLock { $0 }
+    }
+
+    nonisolated func currentFetchCount() -> Int {
         _count.withLock { $0 }
     }
 }
@@ -75,9 +97,9 @@ struct WikiSearchTool: Tool {
 
     private let store: WikiStore
     private let budget: WikiContextBudget
-    private let tracker: WikiToolBudgetTracker
+    private let tracker: WikiToolUsageTracker
 
-    init(store: WikiStore, budget: WikiContextBudget, tracker: WikiToolBudgetTracker) {
+    init(store: WikiStore, budget: WikiContextBudget, tracker: WikiToolUsageTracker) {
         self.store = store
         self.budget = budget
         self.tracker = tracker
@@ -124,9 +146,9 @@ struct WikiGetPageTool: Tool {
 
     private let store: WikiStore
     private let budget: WikiContextBudget
-    private let tracker: WikiToolBudgetTracker
+    private let tracker: WikiToolUsageTracker
 
-    init(store: WikiStore, budget: WikiContextBudget, tracker: WikiToolBudgetTracker) {
+    init(store: WikiStore, budget: WikiContextBudget, tracker: WikiToolUsageTracker) {
         self.store = store
         self.budget = budget
         self.tracker = tracker
@@ -139,7 +161,7 @@ struct WikiGetPageTool: Tool {
         }
 
         // Enforce the per-turn fetch cap before doing any work.
-        let count = tracker.increment()
+        let count = tracker.incrementFetchCount()
         if count > budget.pageFetchCap {
             return "Page fetch limit reached for this turn (\(budget.pageFetchCap)). Answer with what you already have."
         }
@@ -152,7 +174,9 @@ struct WikiGetPageTool: Tool {
             return "No wiki page titled '\(title)'. Use the table of contents or searchWiki to find similar titles."
         }
 
-        // Record access asynchronously — analytics/recency boost.
+        // Record both for the chat-UI usage chip and for the recency
+        // boost that prioritises frequently-used pages in retrieval.
+        tracker.recordFetched(title: page.title)
         await MainActor.run {
             store.recordAccess(pageID: page.id)
         }

@@ -112,7 +112,7 @@ final class ChatViewModel: Identifiable {
     /// start of each user turn so the cap applies per-question, not per-
     /// session. Lives here (not on the orchestrator) because it's tied to
     /// the conversation lifecycle, not the worker registry.
-    private let wikiToolTracker = WikiToolBudgetTracker()
+    private let wikiToolTracker = WikiToolUsageTracker()
 
     /// Provider this conversation routes through. `.foundationModels` uses
     /// the on-device path; others stream via the matching ChatProvider.
@@ -229,6 +229,22 @@ final class ChatViewModel: Identifiable {
         - The wiki is the user's source of truth for their own decisions \
           and notes. Prefer it over generic knowledge when both apply.
         """
+
+    /// After the on-device tool path has run, fold the titles the model
+    /// actually fetched into `lastRAGContext` so the chat-UI chip shows
+    /// "Used [[X]], [[Y]]" instead of "Browsed N TOC entries".
+    /// No-op for the remote pre-injection path (titles are already set
+    /// at prompt-build time).
+    private func mergeWikiToolUsageIntoLastRAGContext() {
+        let titles = wikiToolTracker.fetchedTitles()
+        guard !titles.isEmpty, let context = lastRAGContext else { return }
+        lastRAGContext = RAGContext(
+            wikiPageCount: max(context.wikiPageCount, titles.count),
+            wikiPageTitles: titles,
+            documentChunkCount: context.documentChunkCount,
+            documentNames: context.documentNames
+        )
+    }
 
     // MARK: - Init
 
@@ -381,6 +397,10 @@ final class ChatViewModel: Identifiable {
             isWaitingForFirstToken = false
             // Drain any worker invocations that occurred during this turn
             lastWorkerInvocations = orchestrator?.invocationTracker.drain() ?? []
+            // Promote tool-fetched wiki titles into the RAG context so the
+            // chip shows what the model actually used (vs. just what was
+            // visible in the TOC).
+            mergeWikiToolUsageIntoLastRAGContext()
             updateContextEstimate()
             notifyChanged()
         }
@@ -480,6 +500,7 @@ final class ChatViewModel: Identifiable {
             isResponding = false
             isWaitingForFirstToken = false
             lastWorkerInvocations = orchestrator?.invocationTracker.drain() ?? []
+            mergeWikiToolUsageIntoLastRAGContext()
             updateContextEstimate()
             notifyChanged()
         }
@@ -571,15 +592,19 @@ final class ChatViewModel: Identifiable {
 
             \(toc.text)
             """
+            // Start the turn empty — `mergeWikiToolUsageIntoLastRAGContext`
+            // will fill in the titles the model actually fetched. This
+            // way the chip stays hidden when the model decides the wiki
+            // isn't relevant, instead of "Browsed N pages" noise.
             return (enriched, RAGContext(
-                wikiPageCount: toc.entryCount,
+                wikiPageCount: 0,
                 documentChunkCount: 0,
                 documentNames: []
             ))
         }
 
         // Remote pre-injection path: full pages, larger budget.
-        let (wikiContext, pageCount) = engine.buildWikiContext(for: userText, budget: budget)
+        let (wikiContext, pageCount, titles) = engine.buildWikiContext(for: userText, budget: budget)
         guard !wikiContext.isEmpty else {
             return (userText, RAGContext(wikiPageCount: 0, documentChunkCount: 0, documentNames: []))
         }
@@ -598,6 +623,7 @@ final class ChatViewModel: Identifiable {
         """
         return (enriched, RAGContext(
             wikiPageCount: pageCount,
+            wikiPageTitles: titles,
             documentChunkCount: 0,
             documentNames: []
         ))
@@ -805,17 +831,45 @@ final class ChatViewModel: Identifiable {
 // MARK: - RAG Settings
 
 /// Describes what RAG context was injected for a given response.
+/// `wikiPageTitles` are the titles the model actually used (fetched via
+/// the on-device tool, or pre-injected for remote providers) — surfaced
+/// in the chat UI as a chip beneath the assistant bubble.
 struct RAGContext {
     let wikiPageCount: Int
+    let wikiPageTitles: [String]
     let documentChunkCount: Int
     let documentNames: [String]
 
-    var isEmpty: Bool { wikiPageCount == 0 && documentChunkCount == 0 }
+    init(
+        wikiPageCount: Int,
+        wikiPageTitles: [String] = [],
+        documentChunkCount: Int,
+        documentNames: [String]
+    ) {
+        self.wikiPageCount = wikiPageCount
+        self.wikiPageTitles = wikiPageTitles
+        self.documentChunkCount = documentChunkCount
+        self.documentNames = documentNames
+    }
+
+    var isEmpty: Bool {
+        wikiPageCount == 0 && wikiPageTitles.isEmpty && documentChunkCount == 0
+    }
 
     var summary: String {
         var parts: [String] = []
-        if wikiPageCount > 0 {
-            parts.append("\(wikiPageCount) wiki page\(wikiPageCount == 1 ? "" : "s")")
+        if !wikiPageTitles.isEmpty {
+            // Cap the inline list at 3 titles so the chip doesn't sprawl;
+            // overflow gets a "+N more" suffix.
+            let shown = wikiPageTitles.prefix(3).map { "[[\($0)]]" }.joined(separator: ", ")
+            let extra = wikiPageTitles.count - 3
+            if extra > 0 {
+                parts.append("Used \(shown) +\(extra) more")
+            } else {
+                parts.append("Used \(shown)")
+            }
+        } else if wikiPageCount > 0 {
+            parts.append("Browsed \(wikiPageCount) wiki page\(wikiPageCount == 1 ? "" : "s")")
         }
         if documentChunkCount > 0 {
             let names = documentNames.joined(separator: ", ")
