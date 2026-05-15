@@ -577,11 +577,6 @@ final class ChatViewModel: Identifiable {
                 return (userText, RAGContext(wikiPageCount: 0, documentChunkCount: 0, documentNames: []))
             }
 
-            // Kick off lazy summary backfill for any TOC entries that
-            // still don't have one — the next turn will see the new
-            // summary. Detached because we don't want to block this turn.
-            engine.backfillMissingSummaries()
-
             let enriched = """
             \(userText)
 

@@ -55,9 +55,11 @@ final class WikiStore {
     // MARK: - CRUD
 
     /// Create a new wiki page. Returns the created page.
-    /// If `summary` is empty, falls back to `deriveSummary` so every page
-    /// has a usable TOC entry — even ones created outside of extraction
-    /// (lint stubs, manual creation in the wiki UI).
+    /// `summary` is stored as-is — empty means "no LLM summary yet";
+    /// `tableOfContents` derives a fallback inline at display time, and
+    /// `WikiEngine.runSummaryBackfill` upgrades it to an LLM summary on
+    /// demand. Storing only LLM-generated summaries lets the backfill
+    /// know which pages still need work without an extra "quality" flag.
     @discardableResult
     func createPage(
         title: String,
@@ -67,14 +69,11 @@ final class WikiStore {
         sourceConversationID: UUID? = nil,
         sourceDocumentID: UUID? = nil
     ) async -> WikiPage? {
-        let resolvedSummary = summary.isEmpty
-            ? WikiExtractionPrompts.deriveSummary(fromBody: body, title: title)
-            : summary
         let page = WikiPage(
             id: UUID(),
             title: title,
             body: body,
-            summary: resolvedSummary,
+            summary: summary,
             tags: tags,
             createdAt: Date(),
             updatedAt: Date(),
@@ -233,7 +232,13 @@ final class WikiStore {
         }
 
         let lines = selected.map { page -> String in
-            let summary = page.summary.trimmingCharacters(in: .whitespacesAndNewlines)
+            let stored = page.summary.trimmingCharacters(in: .whitespacesAndNewlines)
+            // Fall back to a deterministic first-line summary at display
+            // time when the LLM hasn't backfilled this page yet — keeps
+            // the TOC useful without forcing a write.
+            let summary = stored.isEmpty
+                ? WikiExtractionPrompts.deriveSummary(fromBody: page.body, title: page.title)
+                : stored
             if summary.isEmpty {
                 return "- [[\(page.title)]]"
             }

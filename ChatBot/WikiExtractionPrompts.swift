@@ -70,6 +70,15 @@ struct WikiStubDecision: Sendable {
     var stub: WikiPageDraft?
 }
 
+/// Backfill output: a one-line summary for an existing wiki page that
+/// pre-dates the `SUMMARY:` extraction field. Used as a TOC entry when
+/// the model browses the wiki, so it has to be tight and informative.
+@Generable
+struct WikiSummaryDraft: Sendable {
+    @Guide(description: "One sentence (≤120 chars) describing what the page covers — the key concept, not just the title restated. Used as a TOC entry, so it should make obvious whether the page would answer a related question.")
+    var summary: String
+}
+
 // MARK: - Prompts
 
 enum WikiExtractionPrompts {
@@ -275,6 +284,35 @@ enum WikiExtractionPrompts {
         return cleaned
     }
 
+    /// Build the prompt used by the summary backfill — a single short
+    /// LLM call that produces a one-sentence TOC entry for a legacy
+    /// page. Routed through the `.extraction` provider task so it
+    /// honours whatever the user has bound there (on-device by default).
+    static func summaryPrompt(title: String, body: String) -> String {
+        // Cap the body slice we send to ~1500 chars — summaries don't
+        // need the whole page, and on-device extraction has 4k tokens.
+        let trimmedBody: String
+        if body.count > 1500 {
+            let cutoff = body.index(body.startIndex, offsetBy: 1500)
+            trimmedBody = String(body[..<cutoff]) + "\n…(truncated)"
+        } else {
+            trimmedBody = body
+        }
+
+        return """
+        Write one sentence (≤120 chars) describing what this wiki page covers. \
+        It will be used as a TOC entry — the reader is deciding whether to \
+        click through, so name the key concept, not just restate the title. \
+        No quotes, no leading "This page describes…", no markdown.
+
+        Output exactly one line in this format (no preamble):
+        SUMMARY: <your one sentence>
+
+        --- Page: \(title) ---
+        \(trimmedBody)
+        """
+    }
+
     // MARK: - Text → Generable Adapters
     //
     // The remote providers (Anthropic / OpenAI / Gemini) still emit the
@@ -295,6 +333,47 @@ enum WikiExtractionPrompts {
             nothingExtracted: pages.isEmpty,
             pages: pages
         )
+    }
+
+    /// Parse a text-format summary backfill response. Tolerates a leading
+    /// `SUMMARY:` label, surrounding quotes, and stray markdown bullet
+    /// markers — small models drift on the format but the payload itself
+    /// is usually fine. Caps the output at 120 chars to honour the TOC
+    /// budget; returns an empty `WikiSummaryDraft` when there's nothing
+    /// usable.
+    static func parseSummary(_ response: String) -> WikiSummaryDraft {
+        var text = response.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Strip the optional SUMMARY: label.
+        if let range = text.range(of: "SUMMARY:", options: .caseInsensitive) {
+            text = String(text[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        // Take the first non-empty line — the model sometimes follows up
+        // with explanation we don't want in the TOC entry.
+        if let firstLine = text.components(separatedBy: "\n")
+            .map({ $0.trimmingCharacters(in: .whitespaces) })
+            .first(where: { !$0.isEmpty }) {
+            text = firstLine
+        }
+
+        // Strip surrounding quotes / markdown bullet markers.
+        for prefix in ["- ", "* ", "• "] where text.hasPrefix(prefix) {
+            text = String(text.dropFirst(prefix.count))
+        }
+        if text.hasPrefix("\"") && text.hasSuffix("\"") && text.count >= 2 {
+            text = String(text.dropFirst().dropLast())
+        }
+        if text.hasPrefix("'") && text.hasSuffix("'") && text.count >= 2 {
+            text = String(text.dropFirst().dropLast())
+        }
+
+        if text.count > 120 {
+            let cutoff = text.index(text.startIndex, offsetBy: 117)
+            text = text[..<cutoff].trimmingCharacters(in: .whitespaces) + "…"
+        }
+
+        return WikiSummaryDraft(summary: text)
     }
 
     /// Parse a text-format lint merge response. The literal "KEEP_BOTH"
