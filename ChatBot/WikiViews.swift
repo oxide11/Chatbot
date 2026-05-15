@@ -169,6 +169,10 @@ struct FlowLayout: Layout {
 
 struct WikiPageListView: View {
     var wikiStore: WikiStore
+    /// When non-nil, the navigation stack opens with this page already
+    /// pushed — used for the "tap an inline citation in chat" flow.
+    var initialPage: WikiPage? = nil
+
     @Environment(\.dismiss) private var dismiss
     @State private var path: [WikiPage] = []
     @State private var showingDeleteAllConfirmation = false
@@ -224,6 +228,11 @@ struct WikiPageListView: View {
                 }
                 .sheet(isPresented: $showingAddPage) {
                     WikiPageEditorView(wikiStore: wikiStore)
+                }
+                .onAppear {
+                    if let initialPage, path.isEmpty {
+                        path = [initialPage]
+                    }
                 }
         }
         .presentationDragIndicator(.visible)

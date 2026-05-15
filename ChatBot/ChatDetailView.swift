@@ -32,6 +32,14 @@ struct ChatDetailView: View {
     @State private var searchText = ""
     @State private var isSearching = false
     @FocusState private var isInputFocused: Bool
+    /// Set when the user taps an inline `[[Page]]` citation in an
+    /// assistant reply. Drives the `WikiPageListView` sheet, which
+    /// opens with `initialPage` already pushed onto its nav stack.
+    @State private var wikilinkTarget: WikiPage?
+    /// Title the model cited that doesn't resolve to an existing page.
+    /// Drives a small "no such page" alert so the tap isn't silently
+    /// swallowed.
+    @State private var missingWikilinkTitle: String?
 
     var body: some View {
         Group {
@@ -86,6 +94,22 @@ struct ChatDetailView: View {
                     showingSystemPrompt = false
                 }
             )
+        }
+        .sheet(item: $wikilinkTarget) { page in
+            if let store = viewModel.wikiEngine?.wikiStore {
+                WikiPageListView(wikiStore: store, initialPage: page)
+            }
+        }
+        .alert(
+            "No wiki page titled \u{201C}\(missingWikilinkTitle ?? "")\u{201D}",
+            isPresented: Binding(
+                get: { missingWikilinkTitle != nil },
+                set: { if !$0 { missingWikilinkTitle = nil } }
+            )
+        ) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("The model referenced this page but it doesn't exist in your wiki.")
         }
         .onAppear {
             viewModel.checkAvailability()
@@ -310,7 +334,11 @@ struct ChatDetailView: View {
                                     editBubble(for: message)
                                 } else {
                                     VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 4) {
-                                        MessageBubble(message: message, highlightText: searchText)
+                                        MessageBubble(
+                                            message: message,
+                                            highlightText: searchText,
+                                            wikilinkAction: wikilinkAction
+                                        )
 
                                         // Timestamp
                                         Text(message.timestamp, format: .dateTime.hour().minute())
@@ -414,7 +442,10 @@ struct ChatDetailView: View {
                         }
 
                         if !viewModel.streamingText.isEmpty {
-                            MessageBubble(message: Message(role: .assistant, content: viewModel.streamingText))
+                            MessageBubble(
+                                message: Message(role: .assistant, content: viewModel.streamingText),
+                                wikilinkAction: wikilinkAction
+                            )
                                 .id("streaming")
                         }
 
@@ -507,6 +538,23 @@ struct ChatDetailView: View {
         let current = messages[index].timestamp
         let previous = messages[index - 1].timestamp
         return !Calendar.current.isDate(current, inSameDayAs: previous)
+    }
+
+    /// Closure passed to `MessageBubble` so inline `[[Page]]` citations
+    /// in assistant replies become tappable. Nil when no wiki store is
+    /// attached — `RichContentView` then drops the brackets and renders
+    /// plain text.
+    private var wikilinkAction: ((String) -> Void)? {
+        guard let store = viewModel.wikiEngine?.wikiStore else { return nil }
+        return { title in
+            let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return }
+            if let page = store.findPageByTitle(trimmed) {
+                wikilinkTarget = page
+            } else {
+                missingWikilinkTitle = trimmed
+            }
+        }
     }
 
     private func scrollToBottom(proxy: ScrollViewProxy) {
@@ -675,6 +723,9 @@ struct TypingIndicator: View {
 struct MessageBubble: View {
     let message: Message
     var highlightText: String = ""
+    /// Tap handler for inline `[[Page]]` citations in assistant replies.
+    /// Receives the page title; nil disables the link rendering entirely.
+    var wikilinkAction: ((String) -> Void)? = nil
 
     var body: some View {
         HStack {
@@ -697,7 +748,7 @@ struct MessageBubble: View {
     @ViewBuilder
     private var messageContent: some View {
         if message.role == .assistant {
-            RichContentView(message.content)
+            RichContentView(message.content, wikilinkAction: wikilinkAction)
         } else if let attributed = try? AttributedString(
             markdown: message.content,
             options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
