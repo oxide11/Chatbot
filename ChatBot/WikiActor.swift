@@ -103,6 +103,20 @@ actor WikiActor {
         try modelContext.save()
     }
 
+    /// Replace just the `linkedPageIDs` relationship for a page. Used by
+    /// the post-extraction reconciliation pass: chunk 5 may reference
+    /// `[[Chunk 9 Topic]]` before chunk 9 has created that page, leaving
+    /// the link orphaned in `linkedPageIDs`. A separate write that
+    /// doesn't touch `body`, `updatedAt`, or the embedding lets us fix
+    /// the relationship without spurious bumps to recency-sorted UI.
+    func setLinkedPageIDs(pageID: UUID, linkedPageIDs: [UUID]) throws {
+        let predicate = #Predicate<SDWikiPage> { $0.id == pageID }
+        let descriptor = FetchDescriptor<SDWikiPage>(predicate: predicate)
+        guard let sd = try modelContext.fetch(descriptor).first else { return }
+        sd.linkedPageIDs = linkedPageIDs
+        try modelContext.save()
+    }
+
     /// Record an access (for retrieval prioritization).
     func recordAccess(pageID: UUID) throws {
         let predicate = #Predicate<SDWikiPage> { $0.id == pageID }

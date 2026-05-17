@@ -82,6 +82,11 @@ final class WikiEngine {
                 )
             }
 
+            // Reconcile so a page created here links cleanly to any
+            // pages a previous extraction left as orphan targets, and
+            // vice versa.
+            await reconcileWikilinks()
+
             AppLogger.wiki.info("Extracted \(draft.pages.count) wiki page(s) from '\(conversationTitle)'")
         } catch {
             AppLogger.wiki.error("Wiki extraction failed: \(error.localizedDescription)")
@@ -143,6 +148,55 @@ final class WikiEngine {
             AppLogger.wiki.info("Created new wiki page '\(page.title)'")
             return .created
         }
+    }
+
+    // MARK: - Wikilink Reconciliation
+    //
+    // `applyExtractedPage` resolves a page's `[[wikilinks]]` to ids at
+    // the moment that page is saved. For multi-chunk document extraction
+    // that's not enough: chunk 5 may reference `[[Chunk 9 Topic]]` before
+    // chunk 9 has created the page, leaving the link orphaned even after
+    // both pages exist. The same shape catches orphans from prior
+    // extractions whose targets only got written today.
+
+    /// Walk every page, re-resolve its `[[wikilinks]]` against the
+    /// current title index, and persist the updated `linkedPageIDs`
+    /// when it differs. Returns the number of pages whose link set
+    /// actually changed (zero on a no-op pass). Cheap: title→id lookup
+    /// is O(1) via a one-shot dictionary, so the whole pass is O(pages
+    /// × links/page).
+    @discardableResult
+    func reconcileWikilinks() async -> Int {
+        let allPages = wikiStore.pages
+        guard !allPages.isEmpty else { return 0 }
+
+        // Title→id index. If two pages share a title (case-insensitive)
+        // we keep the first — same behaviour as `findPageByTitle`.
+        var titleToID: [String: UUID] = [:]
+        for page in allPages {
+            let key = page.title.lowercased()
+            if titleToID[key] == nil { titleToID[key] = page.id }
+        }
+
+        var changedCount = 0
+        for page in allPages {
+            let references = WikiExtractionPrompts.extractWikilinks(from: page.body)
+            let resolved = references.compactMap { titleToID[$0.lowercased()] }
+            let resolvedSet = Set(resolved)
+            let existingSet = Set(page.linkedPageIDs)
+            if resolvedSet != existingSet {
+                await wikiStore.setLinkedPageIDs(
+                    pageID: page.id,
+                    linkedPageIDs: Array(resolvedSet)
+                )
+                changedCount += 1
+            }
+        }
+
+        if changedCount > 0 {
+            AppLogger.wiki.info("Reconciled wikilinks on \(changedCount) page(s)")
+        }
+        return changedCount
     }
 
     // MARK: - Context Injection
@@ -420,6 +474,10 @@ extension WikiEngine {
 
         for (index, chunk) in chunks.enumerated() {
             if Task.isCancelled {
+                // Run reconciliation even on cancellation — partial
+                // extraction may have created targets that earlier
+                // chunks referenced as orphans.
+                await reconcileWikilinks()
                 return WikiDocumentExtractionSummary(
                     chunksProcessed: processed,
                     chunkCount: chunks.count,
@@ -473,6 +531,13 @@ extension WikiEngine {
             )
             onProgress(progress)
         }
+
+        // Reconcile wikilinks now that every chunk's pages exist:
+        // earlier chunks that referenced [[Title]] targets created by
+        // later chunks would otherwise stay orphaned. Also catches
+        // orphans from previous extractions whose targets only got
+        // written this round.
+        await reconcileWikilinks()
 
         AppLogger.wiki.info("Document extraction done: \(pagesCreated) created, \(pagesMerged) merged across \(chunks.count) chunks (\(sourceName))")
 
