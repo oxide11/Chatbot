@@ -15,7 +15,7 @@ This file tracks deferred work — features and polish items I've explicitly cho
 - [ ] **Wiki page detail: source documents.** Show which imports / conversations a wiki page came from (via `sourceDocumentIDs` / `sourceConversationIDs`). Tap the source to open it.
 - [ ] **Worker library polish.** The Workers list works but could surface "active in this conversation" hints more clearly.
 - [ ] **Search improvements.** Sidebar search is title + message-content substring. A semantic search across messages and wiki pages (using existing embeddings) would be more useful.
-- [ ] **Drag and drop into chat.** Currently only the Imports sheet accepts drops. Dropping a doc onto a chat should attach it to that conversation (or import + summarise inline).
+- [ ] **Link in-chat imports to the conversation.** The chat composer's paperclip / drag-drop already routes through `DocumentImporter`, but the resulting wiki pages aren't yet tagged with `sourceConversationIDs` — only the document is. Threading the active conversation id through `extractKnowledgeFromDocument` would make the Sources section on a page show both "from `PDF.pdf`" and "while chatting in `Thread Title`".
 - [ ] **App Shortcuts surface.** Already have Siri intents. Could expose more (Open Wiki Page, Run Lint, Import Document) and add Spotlight donation for chats.
 
 ## High-leverage, high-effort

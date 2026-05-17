@@ -102,6 +102,13 @@ final class ChatViewModel: Identifiable {
     /// Reference to the shared wiki engine for knowledge retrieval and extraction
     var wikiEngine: WikiEngine?
 
+    /// Reference to the shared document importer. Set by ConversationStore.
+    /// Backs the chat composer's attachment button and drag-and-drop —
+    /// dropping or picking a file enqueues an import that runs through
+    /// the same pipeline as Settings → Import Documents, then the new
+    /// wiki pages become available to the model via the wiki tools.
+    var documentImporter: DocumentImporter?
+
     /// RAG configuration
     var ragSettings: RAGSettings = .default
 
@@ -944,6 +951,7 @@ final class ConversationStore {
                 conversation.ragSettings = ragSettings
                 conversation.orchestrator = orchestrator
                 conversation.providerRegistry = providers
+                conversation.documentImporter = documentImporter
                 conversation.onChange { [weak self] in self?.saveToDisk() }
             }
             selectedConversation()?.prewarmSession()
@@ -986,6 +994,7 @@ final class ConversationStore {
         conversation.wikiEngine = wikiEngine
         conversation.ragSettings = ragSettings
         conversation.orchestrator = orchestrator
+        conversation.documentImporter = documentImporter
         // Apply the default system prompt if user has customized it
         if defaultSystemPrompt != ChatViewModel.defaultInstructions {
             conversation.updateSystemPrompt(defaultSystemPrompt)
