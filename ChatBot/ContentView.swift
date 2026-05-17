@@ -52,6 +52,19 @@ struct ContentView: View {
     @State private var renamingConversationID: UUID?
     @State private var renameDraft = ""
     @State private var deletingConversationID: UUID?
+    /// When set, presents `WikiPageListView` with this page already
+    /// pushed — used by the in-sidebar wiki search results.
+    @State private var openedWikiPage: WikiPage?
+
+    /// Semantic + keyword search hits across the wiki for the current
+    /// `searchText`. Empty when search is inactive. Top 5 by relevance.
+    /// Uses the same `findRelevantPages` path that powers the
+    /// on-device wiki tool, so ranking matches what the model sees.
+    private var searchedWikiPages: [WikiPage] {
+        let trimmed = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+        return store.wikiStore.findRelevantPages(for: trimmed, limit: 5)
+    }
 
     /// Flattened, in-display order. Used by the keyboard shortcuts so
     /// `⌘1`-`⌘9` jump to the visible position, and `⌘[` / `⌘]` walk in the
@@ -190,6 +203,35 @@ struct ContentView: View {
             get: { store.selectedConversationID },
             set: { store.selectedConversationID = $0 }
         )) {
+            if !searchedWikiPages.isEmpty {
+                Section("Wiki Pages") {
+                    ForEach(searchedWikiPages) { page in
+                        Button {
+                            openedWikiPage = page
+                        } label: {
+                            VStack(alignment: .leading, spacing: 2) {
+                                HStack(spacing: 6) {
+                                    Image(systemName: "book.pages")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                    Text(page.title)
+                                        .lineLimit(1)
+                                        .font(.body)
+                                }
+                                let summary = page.summary.trimmingCharacters(in: .whitespacesAndNewlines)
+                                if !summary.isEmpty {
+                                    Text(summary)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(2)
+                                }
+                            }
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+
             ForEach(groupedConversations, id: \.0) { section, conversations in
                 Section(section) {
                     ForEach(conversations) { conversation in
@@ -235,7 +277,7 @@ struct ContentView: View {
             }
         }
         .background { keyboardShortcutSink }
-        .searchable(text: $searchText, prompt: "Search chats")
+        .searchable(text: $searchText, prompt: "Search chats and wiki")
         #if os(iOS) || os(tvOS) || os(visionOS)
         .searchToolbarBehavior(.minimize)
         #endif
@@ -285,6 +327,13 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showingSettings) {
             SettingsView(store: store)
+        }
+        .sheet(item: $openedWikiPage) { page in
+            WikiPageListView(
+                wikiStore: store.wikiStore,
+                initialPage: page,
+                documentImporter: store.documentImporter
+            )
         }
         .alert("Rename Chat", isPresented: Binding(
             get: { renamingConversationID != nil },
