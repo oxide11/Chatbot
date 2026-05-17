@@ -204,6 +204,13 @@ struct DocumentImportJob: Identifiable, Sendable {
     let documentType: DocumentType
     var status: Status
     var progress: WikiDocumentExtractionProgress?
+    /// When the job originated from an in-chat attachment, the id of
+    /// the conversation that triggered it. The extraction pass passes
+    /// this through to `WikiEngine` so the resulting pages get tagged
+    /// with `sourceConversationIDs` — answering "which chat was I in
+    /// when I imported this?" on the Sources section of each page.
+    /// Nil for jobs queued from the Settings → Imports sheet.
+    var sourceConversationID: UUID? = nil
 
     enum Status: Equatable, Sendable {
         case queued
@@ -294,16 +301,24 @@ final class DocumentImporter {
     // MARK: - Queue
 
     /// Enqueue one or more files for import. Each picked URL is copied into
-    /// our Imports directory and processed sequentially.
-    func enqueue(urls: [URL]) {
-        let prepared = urls.compactMap { prepare(url: $0) }
+    /// our Imports directory and processed sequentially. Pass
+    /// `sourceConversationID` when the user is attaching from inside a
+    /// chat so the wiki pages produced get linked back to that thread.
+    func enqueue(urls: [URL], sourceConversationID: UUID? = nil) {
+        let prepared = urls.compactMap {
+            prepare(url: $0, sourceConversationID: sourceConversationID)
+        }
         for job in prepared {
             queue.append(job)
         }
         if !isProcessing { currentTask = Task { await processQueue() } }
     }
 
-    /// Re-run extraction against an already-imported document.
+    /// Re-run extraction against an already-imported document. The original
+    /// import's conversation linkage is preserved on existing pages — the
+    /// merge path in `WikiActor.updatePage` only appends new ids, never
+    /// removes — so re-imports from Settings without a chat context leave
+    /// `sourceConversationID` nil.
     func reimport(_ record: DocumentImport) {
         let job = DocumentImportJob(
             id: record.id,
@@ -359,7 +374,7 @@ final class DocumentImporter {
 
     // MARK: - Pipeline
 
-    private func prepare(url: URL) -> DocumentImportJob? {
+    private func prepare(url: URL, sourceConversationID: UUID?) -> DocumentImportJob? {
         let ext = url.pathExtension
         guard let docType = DocumentType.from(fileExtension: ext) else {
             AppLogger.importer.warning("Unsupported file type for import: \(ext)")
@@ -389,7 +404,8 @@ final class DocumentImporter {
             fileName: fileName,
             documentType: docType,
             status: .queued,
-            progress: nil
+            progress: nil,
+            sourceConversationID: sourceConversationID
         )
     }
 
@@ -476,7 +492,8 @@ final class DocumentImporter {
             let summary = await wikiEngine.extractKnowledgeFromDocument(
                 text: text,
                 sourceName: job.fileName,
-                sourceDocumentID: job.id
+                sourceDocumentID: job.id,
+                sourceConversationID: job.sourceConversationID
             ) { progress in
                 self.updateJob(id: jobID) {
                     $0.status = .importing(progress)

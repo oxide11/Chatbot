@@ -442,11 +442,14 @@ extension WikiEngine {
 
     /// Extract wiki pages from arbitrary document text. Honors cancellation
     /// (call `Task.cancel()` on the launching task) and reports progress
-    /// after each chunk completes.
+    /// after each chunk completes. Pass `sourceConversationID` when the
+    /// import was triggered from inside a chat so resulting pages get
+    /// linked back to that thread on top of the document linkage.
     func extractKnowledgeFromDocument(
         text: String,
         sourceName: String,
         sourceDocumentID: UUID?,
+        sourceConversationID: UUID? = nil,
         onProgress: @MainActor @Sendable (WikiDocumentExtractionProgress) -> Void = { _ in }
     ) async -> WikiDocumentExtractionSummary {
         guard extractionEnabled else {
@@ -508,7 +511,7 @@ extension WikiEngine {
                     for page in draft.pages {
                         let result = await applyExtractedPage(
                             page,
-                            sourceConversationID: nil,
+                            sourceConversationID: sourceConversationID,
                             sourceDocumentID: sourceDocumentID
                         )
                         switch result {

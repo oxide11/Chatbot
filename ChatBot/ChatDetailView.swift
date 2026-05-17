@@ -201,7 +201,10 @@ struct ChatDetailView: View {
             allowsMultipleSelection: true
         ) { result in
             if case .success(let urls) = result, !urls.isEmpty {
-                viewModel.documentImporter?.enqueue(urls: urls)
+                viewModel.documentImporter?.enqueue(
+                    urls: urls,
+                    sourceConversationID: viewModel.id
+                )
             }
         }
     }
@@ -332,10 +335,13 @@ struct ChatDetailView: View {
     /// Imports sheet does.
     private func handleDocumentDrop(providers: [NSItemProvider]) -> Bool {
         guard let importer = viewModel.documentImporter, !providers.isEmpty else { return false }
+        let conversationID = viewModel.id
         Task {
             let resolved = await DocumentDropSupport.loadFileURLs(from: providers)
             if !resolved.isEmpty {
-                await MainActor.run { importer.enqueue(urls: resolved) }
+                await MainActor.run {
+                    importer.enqueue(urls: resolved, sourceConversationID: conversationID)
+                }
             }
         }
         return true
