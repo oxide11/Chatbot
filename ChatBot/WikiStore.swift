@@ -26,15 +26,19 @@ final class WikiStore {
     private(set) var pages: [WikiPage] = []
     private(set) var isConfigured = false
 
-    /// Resolves a `sourceDocumentIDs` entry to a human-readable file
-    /// name. Set by `ConversationStore` to its `DocumentImporter`; nil
+    /// Resolves a `sourceDocumentIDs` entry to the full `DocumentImport`
+    /// record. Set by `ConversationStore` to its `DocumentImporter`; nil
     /// in contexts that don't have one (previews, share extension).
     /// Returns nil for ids the importer no longer knows about (deleted).
-    var documentTitleResolver: ((UUID) -> String?)?
+    /// Returns the full struct (not just the title) so source rows in
+    /// `WikiPageDetailView` can navigate to the import detail.
+    var documentResolver: ((UUID) -> DocumentImport?)?
 
     /// Resolves a `sourceConversationIDs` entry to a conversation title.
-    /// Same lifecycle as `documentTitleResolver`. Returns nil for ids
-    /// the store no longer knows about (deleted conversation).
+    /// Same lifecycle as `documentResolver`. Returns nil for ids the
+    /// store no longer knows about (deleted conversation). Title-only
+    /// (not the live `ChatViewModel`) because cross-sheet navigation
+    /// to a chat is out of scope here.
     var conversationTitleResolver: ((UUID) -> String?)?
 
     private var actor: WikiActor?

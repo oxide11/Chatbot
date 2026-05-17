@@ -930,8 +930,8 @@ final class ConversationStore {
         // Wire the wiki-page Sources section: WikiStore doesn't know
         // about DocumentImporter / ConversationStore, so closures
         // bridge across without a circular type dependency.
-        wikiStore.documentTitleResolver = { [weak self] id in
-            self?.documentImporter.imports.first { $0.id == id }?.fileName
+        wikiStore.documentResolver = { [weak self] id in
+            self?.documentImporter.imports.first { $0.id == id }
         }
         wikiStore.conversationTitleResolver = { [weak self] id in
             self?.conversations.first { $0.id == id }?.title
