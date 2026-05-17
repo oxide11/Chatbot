@@ -26,6 +26,17 @@ final class WikiStore {
     private(set) var pages: [WikiPage] = []
     private(set) var isConfigured = false
 
+    /// Resolves a `sourceDocumentIDs` entry to a human-readable file
+    /// name. Set by `ConversationStore` to its `DocumentImporter`; nil
+    /// in contexts that don't have one (previews, share extension).
+    /// Returns nil for ids the importer no longer knows about (deleted).
+    var documentTitleResolver: ((UUID) -> String?)?
+
+    /// Resolves a `sourceConversationIDs` entry to a conversation title.
+    /// Same lifecycle as `documentTitleResolver`. Returns nil for ids
+    /// the store no longer knows about (deleted conversation).
+    var conversationTitleResolver: ((UUID) -> String?)?
+
     private var actor: WikiActor?
 
     // MARK: - Configuration
