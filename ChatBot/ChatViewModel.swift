@@ -431,6 +431,12 @@ final class ChatViewModel: Identifiable {
             }
         } catch let error as LanguageModelSession.GenerationError {
             await handleGenerationError(error, originalPrompt: text)
+        } catch let error as ChatProviderError {
+            // Provider errors already carry user-facing copy — skip the
+            // generic "Something went wrong:" wrapper so the path to
+            // the fix (e.g. Settings → Providers → Test Connection) is
+            // the first thing the user reads.
+            messages.append(Message(role: .system, content: error.localizedDescription))
         } catch {
             messages.append(Message(role: .system, content: "Something went wrong: \(error.localizedDescription)"))
         }
@@ -521,6 +527,8 @@ final class ChatViewModel: Identifiable {
             if !streamingText.isEmpty {
                 messages.append(Message(role: .assistant, content: streamingText))
             }
+        } catch let error as ChatProviderError {
+            messages.append(Message(role: .system, content: error.localizedDescription))
         } catch {
             messages.append(Message(role: .system, content: "Regeneration failed: \(error.localizedDescription)"))
         }

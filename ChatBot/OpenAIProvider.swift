@@ -132,6 +132,9 @@ struct OpenAIProvider: ChatProvider {
         }
         let message = parseErrorMessage(from: data)
 
+        if status == 401 || status == 403 {
+            throw ChatProviderError.invalidAPIKey(id, detail: message)
+        }
         if status == 429 {
             // OpenAI uses retry-after as either seconds or HTTP-date; we
             // treat it as seconds for parity with Anthropic.

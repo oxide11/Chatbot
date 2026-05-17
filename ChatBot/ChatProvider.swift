@@ -93,6 +93,12 @@ extension ChatProvider {
 
 enum ChatProviderError: LocalizedError {
     case missingAPIKey(ChatProviderID)
+    /// The provider rejected the credential (HTTP 401, or 403 from a
+    /// quota-style "key not authorised for this resource" response).
+    /// Distinguished from `invalidResponse` so the chat can route the
+    /// user to Settings → Providers → <provider> → Test Connection
+    /// instead of dumping a raw HTTP error.
+    case invalidAPIKey(ChatProviderID, detail: String?)
     case invalidResponse(status: Int, message: String?)
     case decodingFailed(String)
     case providerUnavailable(ChatProviderID)
@@ -102,6 +108,10 @@ enum ChatProviderError: LocalizedError {
         switch self {
         case .missingAPIKey(let id):
             return "No API key configured for \(id.displayName). Add one in Settings → Providers."
+        case .invalidAPIKey(let id, let detail):
+            let base = "Your \(id.displayName) API key was rejected — it may be invalid, expired, or revoked. Open Settings → Providers → \(id.displayName) → Test Connection to refresh it."
+            if let detail, !detail.isEmpty { return "\(base)\n\nProvider said: \(detail)" }
+            return base
         case .invalidResponse(let status, let message):
             if let message { return "\(message) (HTTP \(status))" }
             return "Provider returned HTTP \(status)."
