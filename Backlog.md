@@ -22,7 +22,7 @@ This file tracks deferred work — features and polish items I've explicitly cho
 - [ ] **iCloud sync for wiki pages.** `CKSyncEngine` + the existing SwiftData schema. Sync wiki pages, conversations, and worker profiles across iPhone / iPad / Mac. Big feature; would justify a `2.1.0` minor.
 - [ ] **App icon redesign + launch screen polish.** Current icon and launch screen are auto-generated.
 - [ ] **Localization.** English-only right now. Even just `en-GB` plus `fr` doubles reach. String catalogs are configured; just need translations.
-- [ ] **Wiki export.** Export the entire wiki as a folder of markdown files with `[[wikilinks]]` preserved. Pairs well with iCloud sync.
+- [ ] **Wiki import.** Mirror of export — read an Obsidian-style folder of markdown back into the wiki, including frontmatter and `[[wikilinks]]`. Pairs with iCloud sync for cross-device moves.
 - [ ] **Citation rendering in chat.** When the model uses a wiki page or document chunk, render the source as a small chip at the end of the bubble that taps into the source.
 - [ ] **Provider cost ledger.** Surface estimated tokens / cost per remote provider call so users can see how much an extraction cost.
 

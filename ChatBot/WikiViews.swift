@@ -187,6 +187,20 @@ struct WikiPageListView: View {
     @State private var showingDeleteAllConfirmation = false
     @State private var showingAddPage = false
     @State private var pendingDelete: DocumentImport?
+    /// Drives the `.fileExporter` for "Export Wiki…". The actual
+    /// document is constructed lazily from the current `wikiStore.pages`
+    /// each time the sheet is presented so an export reflects the
+    /// latest state, not whatever was loaded when the view first
+    /// appeared.
+    @State private var isExporting = false
+
+    /// Default folder name suggested by the file exporter. Date-stamped
+    /// so successive exports don't collide in the picker.
+    private var exportDefaultFilename: String {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        return "Engram Wiki \(f.string(from: Date()))"
+    }
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -210,6 +224,12 @@ struct WikiPageListView: View {
                     ToolbarItem(placement: .automatic) {
                         if !wikiStore.pages.isEmpty {
                             Menu {
+                                Button {
+                                    isExporting = true
+                                } label: {
+                                    Label("Export Wiki\u{2026}", systemImage: "square.and.arrow.up")
+                                }
+                                Divider()
                                 Button(role: .destructive) {
                                     showingDeleteAllConfirmation = true
                                 } label: {
@@ -271,6 +291,20 @@ struct WikiPageListView: View {
                 }
                 .sheet(isPresented: $showingAddPage) {
                     WikiPageEditorView(wikiStore: wikiStore)
+                }
+                .fileExporter(
+                    isPresented: $isExporting,
+                    document: WikiExportDocument(
+                        pages: wikiStore.pages,
+                        conversationTitle: { wikiStore.conversationTitleResolver?($0) },
+                        documentName: { wikiStore.documentResolver?($0)?.fileName }
+                    ),
+                    contentType: .folder,
+                    defaultFilename: exportDefaultFilename
+                ) { result in
+                    if case .failure(let error) = result {
+                        AppLogger.wiki.error("Wiki export failed: \(error.localizedDescription)")
+                    }
                 }
                 .onAppear {
                     if let initialPage, path.isEmpty {
