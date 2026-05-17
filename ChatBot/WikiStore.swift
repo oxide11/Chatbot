@@ -139,6 +139,22 @@ final class WikiStore {
         }
     }
 
+    /// Replace just the `linkedPageIDs` relationship for a page. Patches
+    /// in-memory so the wiki UI reflects the new graph without a full
+    /// reload. Used by `WikiEngine.reconcileWikilinks`.
+    @MainActor
+    func setLinkedPageIDs(pageID: UUID, linkedPageIDs: [UUID]) async {
+        guard let actor else { return }
+        do {
+            try await actor.setLinkedPageIDs(pageID: pageID, linkedPageIDs: linkedPageIDs)
+            if let i = pages.firstIndex(where: { $0.id == pageID }) {
+                pages[i].linkedPageIDs = linkedPageIDs
+            }
+        } catch {
+            AppLogger.wiki.error("Failed to set linked page IDs on \(pageID): \(error.localizedDescription)")
+        }
+    }
+
     /// Delete a wiki page.
     func deletePage(id: UUID) async {
         guard let actor else { return }
