@@ -172,11 +172,21 @@ struct WikiPageListView: View {
     /// When non-nil, the navigation stack opens with this page already
     /// pushed — used for the "tap an inline citation in chat" flow.
     var initialPage: WikiPage? = nil
+    /// Optional `DocumentImporter` reference. When set, source-document
+    /// rows in `WikiPageDetailView` become tappable and push
+    /// `DocumentImportDetailView` onto this view's nav stack.
+    /// Contexts that can't host that detail (e.g. the wiki sheet
+    /// presented from inline chat citations) leave it nil and source
+    /// rows render as plain text.
+    var documentImporter: DocumentImporter? = nil
 
     @Environment(\.dismiss) private var dismiss
-    @State private var path: [WikiPage] = []
+    /// `NavigationPath` instead of `[WikiPage]` so the stack can hold
+    /// both `WikiPage` and `DocumentImport` destinations.
+    @State private var path = NavigationPath()
     @State private var showingDeleteAllConfirmation = false
     @State private var showingAddPage = false
+    @State private var pendingDelete: DocumentImport?
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -215,8 +225,19 @@ struct WikiPageListView: View {
                     WikiPageDetailView(
                         page: destination,
                         wikiStore: wikiStore,
-                        pushPage: { path.append($0) }
+                        pushPage: { path.append($0) },
+                        pushDocument: documentImporter == nil ? nil : { path.append($0) }
                     )
+                }
+                .navigationDestination(for: DocumentImport.self) { record in
+                    if let importer = documentImporter {
+                        DocumentImportDetailView(
+                            record: record,
+                            wikiStore: wikiStore,
+                            onReimport: { importer.reimport(record) },
+                            onDelete: { pendingDelete = record }
+                        )
+                    }
                 }
                 .alert("Clear All Wiki Pages?", isPresented: $showingDeleteAllConfirmation) {
                     Button("Clear All", role: .destructive) {
@@ -226,12 +247,34 @@ struct WikiPageListView: View {
                 } message: {
                     Text("This will permanently delete all wiki pages.")
                 }
+                .confirmationDialog(
+                    "Delete \(pendingDelete?.fileName ?? "")?",
+                    isPresented: Binding(
+                        get: { pendingDelete != nil },
+                        set: { if !$0 { pendingDelete = nil } }
+                    ),
+                    titleVisibility: .visible
+                ) {
+                    Button("Delete Import Only", role: .destructive) {
+                        if let record = pendingDelete, let importer = documentImporter {
+                            Task { await importer.delete(record, alsoDeleteWikiPages: false) }
+                        }
+                        pendingDelete = nil
+                    }
+                    Button("Delete Import + Wiki Pages", role: .destructive) {
+                        if let record = pendingDelete, let importer = documentImporter {
+                            Task { await importer.delete(record, alsoDeleteWikiPages: true) }
+                        }
+                        pendingDelete = nil
+                    }
+                    Button("Cancel", role: .cancel) { pendingDelete = nil }
+                }
                 .sheet(isPresented: $showingAddPage) {
                     WikiPageEditorView(wikiStore: wikiStore)
                 }
                 .onAppear {
                     if let initialPage, path.isEmpty {
-                        path = [initialPage]
+                        path.append(initialPage)
                     }
                 }
         }

@@ -12,6 +12,11 @@ struct WikiPageDetailView: View {
     var wikiStore: WikiStore
     /// Pushes another page onto the parent NavigationStack when a wikilink is tapped.
     var pushPage: (WikiPage) -> Void
+    /// Pushes a `DocumentImport` onto the parent NavigationStack when a
+    /// source-document row is tapped. Nil in contexts that can't host a
+    /// document detail view (e.g. the wiki sheet presented over a chat
+    /// without an importer ref) — source rows render as plain text then.
+    var pushDocument: ((DocumentImport) -> Void)? = nil
 
     @State private var editing: WikiPage?
     @State private var pendingCreation: PendingCreation?
@@ -144,8 +149,8 @@ struct WikiPageDetailView: View {
     private var sources: [SourceItem] {
         var items: [SourceItem] = []
         for id in page.sourceDocumentIDs {
-            if let name = wikiStore.documentTitleResolver?(id) {
-                items.append(SourceItem(kind: .document, label: name))
+            if let record = wikiStore.documentResolver?(id) {
+                items.append(SourceItem(kind: .document(record), label: record.fileName))
             }
         }
         for id in page.sourceConversationIDs {
@@ -163,34 +168,64 @@ struct WikiPageDetailView: View {
                 .foregroundStyle(.secondary)
             VStack(alignment: .leading, spacing: 6) {
                 ForEach(sources) { item in
-                    HStack(spacing: 8) {
-                        Image(systemName: item.kind.icon)
-                            .foregroundStyle(.tertiary)
-                            .frame(width: 14)
-                        Text(item.label)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                        Spacer(minLength: 0)
-                    }
-                    .font(.callout)
+                    sourceRow(for: item)
                 }
             }
         }
     }
 
+    @ViewBuilder
+    private func sourceRow(for item: SourceItem) -> some View {
+        // Tappable only when (a) we know how to push a document onto the
+        // parent nav stack and (b) the source is a document. Conversation
+        // sources stay non-tappable here — cross-sheet nav to a chat is
+        // a separate problem.
+        if case let .document(record) = item.kind, let pushDocument {
+            Button {
+                pushDocument(record)
+            } label: {
+                sourceRowContent(item: item, tappable: true)
+            }
+            .buttonStyle(.plain)
+        } else {
+            sourceRowContent(item: item, tappable: false)
+        }
+    }
+
+    private func sourceRowContent(item: SourceItem, tappable: Bool) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: item.iconName)
+                .foregroundStyle(.tertiary)
+                .frame(width: 14)
+            Text(item.label)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .foregroundStyle(tappable ? Color.accentColor : .primary)
+            Spacer(minLength: 0)
+            if tappable {
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .font(.callout)
+        .contentShape(Rectangle())
+    }
+
     private struct SourceItem: Identifiable {
         enum Kind {
-            case document, conversation
-
-            var icon: String {
-                switch self {
-                case .document:     return "doc.text"
-                case .conversation: return "bubble.left.and.bubble.right"
-                }
-            }
+            case document(DocumentImport)
+            case conversation
         }
         let id = UUID()
         let kind: Kind
         let label: String
+
+        var iconName: String {
+            switch kind {
+            case .document:     return "doc.text"
+            case .conversation: return "bubble.left.and.bubble.right"
+            }
+        }
     }
 }

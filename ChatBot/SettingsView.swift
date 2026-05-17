@@ -312,7 +312,10 @@ struct SettingsView: View {
                 Text("This will permanently delete all conversations. Wiki pages and knowledge bases will be kept.")
             }
             .sheet(isPresented: $showingWikiPages) {
-                WikiPageListView(wikiStore: store.wikiStore)
+                WikiPageListView(
+                    wikiStore: store.wikiStore,
+                    documentImporter: store.documentImporter
+                )
             }
             .sheet(isPresented: $showingImports) {
                 DocumentImportListView(importer: store.documentImporter, wikiStore: store.wikiStore)
