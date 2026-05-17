@@ -130,6 +130,9 @@ struct AnthropicProvider: ChatProvider {
         }
         let message = parseErrorMessage(from: data)
 
+        if status == 401 || status == 403 {
+            throw ChatProviderError.invalidAPIKey(id, detail: message)
+        }
         if status == 429 {
             let retry = headers?.value(forHTTPHeaderField: "retry-after").flatMap(Double.init)
             throw ChatProviderError.rateLimited(retryAfterSeconds: retry)

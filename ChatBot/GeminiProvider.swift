@@ -162,6 +162,9 @@ struct GeminiProvider: ChatProvider {
         }
         let message = parseErrorMessage(from: data)
 
+        if status == 401 || status == 403 {
+            throw ChatProviderError.invalidAPIKey(id, detail: message)
+        }
         if status == 429 {
             // Gemini returns retry-after as integer seconds when present.
             let retry = headers?.value(forHTTPHeaderField: "retry-after").flatMap(Double.init)
