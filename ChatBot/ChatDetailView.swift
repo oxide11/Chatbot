@@ -31,6 +31,9 @@ struct ChatDetailView: View {
     @State private var editDraft = ""
     @State private var searchText = ""
     @State private var isSearching = false
+    /// Drives the composer's paperclip → file-picker affordance for
+    /// importing a document into the wiki without leaving the chat.
+    @State private var showingAttachmentPicker = false
     @FocusState private var isInputFocused: Bool
     /// Set when the user taps an inline `[[Page]]` citation in an
     /// assistant reply. Drives the `WikiPageListView` sheet, which
@@ -184,9 +187,22 @@ struct ChatDetailView: View {
                 searchBar
             }
             messageList
+                .onDrop(of: DocumentDropSupport.acceptedContentTypes, isTargeted: nil) { providers in
+                    handleDocumentDrop(providers: providers)
+                }
             workerIndicator
+            importBanner
             contextBar
             inputBar
+        }
+        .fileImporter(
+            isPresented: $showingAttachmentPicker,
+            allowedContentTypes: DocumentDropSupport.acceptedContentTypes,
+            allowsMultipleSelection: true
+        ) { result in
+            if case .success(let urls) = result, !urls.isEmpty {
+                viewModel.documentImporter?.enqueue(urls: urls)
+            }
         }
     }
 
@@ -247,6 +263,82 @@ struct ChatDetailView: View {
             .background(.fill.quaternary, in: .capsule)
             .padding(.top, 4)
         }
+    }
+
+    // MARK: - Import Banner
+
+    /// Inline progress for documents being ingested. Visible only while
+    /// the importer has at least one in-flight job (queued, extracting,
+    /// importing). On completion the row drops out and the new wiki
+    /// pages become available to the model through the wiki tools.
+    @ViewBuilder
+    private var importBanner: some View {
+        if let importer = viewModel.documentImporter, let job = activeImportJob(in: importer) {
+            HStack(spacing: 8) {
+                ProgressView()
+                    .controlSize(.small)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Importing \(job.fileName)")
+                        .font(.system(size: 12, weight: .medium))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Text(importBannerSubtext(for: importer, currentJob: job))
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+                Spacer(minLength: 8)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(.fill.quaternary, in: .rect(cornerRadius: 10))
+            .padding(.horizontal)
+            .padding(.top, 4)
+        }
+    }
+
+    /// First in-flight job for the banner. Picks queued / extracting /
+    /// importing rows; ignores completed and failed.
+    private func activeImportJob(in importer: DocumentImporter) -> DocumentImportJob? {
+        importer.queue.first { job in
+            switch job.status {
+            case .completed, .failed: return false
+            default:                  return true
+            }
+        }
+    }
+
+    private func importBannerSubtext(
+        for importer: DocumentImporter,
+        currentJob: DocumentImportJob
+    ) -> String {
+        switch currentJob.status {
+        case .queued:
+            return "Queued"
+        case .extractingText:
+            return "Reading text…"
+        case .importing(let progress):
+            if let progress, progress.chunkCount > 0 {
+                return "Chunk \(progress.chunkIndex) of \(progress.chunkCount) · \(Int(progress.fractionComplete * 100))%"
+            }
+            return "Extracting…"
+        case .completed, .failed:
+            return ""
+        }
+    }
+
+    /// `.onDrop` handler for the message list. Routes accepted file
+    /// types to the shared importer queue, identical to what the
+    /// Imports sheet does.
+    private func handleDocumentDrop(providers: [NSItemProvider]) -> Bool {
+        guard let importer = viewModel.documentImporter, !providers.isEmpty else { return false }
+        Task {
+            let resolved = await DocumentDropSupport.loadFileURLs(from: providers)
+            if !resolved.isEmpty {
+                await MainActor.run { importer.enqueue(urls: resolved) }
+            }
+        }
+        return true
     }
 
     // MARK: - Context Bar
@@ -603,6 +695,19 @@ struct ChatDetailView: View {
     private var inputBar: some View {
         GlassEffectContainer {
             HStack(spacing: 8) {
+                if viewModel.documentImporter != nil {
+                    Button {
+                        showingAttachmentPicker = true
+                    } label: {
+                        Image(systemName: "paperclip")
+                            .font(.title3)
+                    }
+                    .glassEffect(.regular.interactive(), in: .circle)
+                    .disabled(viewModel.isResponding)
+                    .help("Attach Document")
+                    .accessibilityLabel("Attach Document")
+                }
+
                 TextField("Message", text: $inputText, axis: .vertical)
                     .textFieldStyle(.plain)
                     .lineLimit(1...5)
