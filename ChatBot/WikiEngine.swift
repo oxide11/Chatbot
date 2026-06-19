@@ -435,10 +435,14 @@ struct WikiDocumentExtractionSummary: Sendable, Equatable {
 
 extension WikiEngine {
 
-    /// Maximum characters per LLM call. Comfortably under the 4096-token
+    /// Maximum characters per LLM call. Comfortably under the 8192-token
     /// budget once the prompt scaffolding is added.
-    private static var extractionChunkTarget: Int { 3000 }
-    private static var extractionChunkOverlap: Int { 200 }
+    /// Target chars per extraction chunk. Bumped from 3000 → 5500 for
+    /// iOS 27's 8192-token on-device window — halves the number of
+    /// chunks for a long PDF without crowding the prompt scaffolding,
+    /// so document imports finish in roughly half the LLM calls.
+    private static var extractionChunkTarget: Int { 5500 }
+    private static var extractionChunkOverlap: Int { 300 }
 
     /// Extract wiki pages from arbitrary document text. Honors cancellation
     /// (call `Task.cancel()` on the launching task) and reports progress

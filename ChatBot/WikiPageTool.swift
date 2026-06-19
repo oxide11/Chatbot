@@ -9,7 +9,7 @@
 //
 //  The model sees a TOC at session creation time and decides when to
 //  fetch which page; the per-turn `pageFetchCap` keeps a chatty model
-//  from burning the 4096-token window.
+//  from burning the 8192-token window.
 //
 
 import Foundation

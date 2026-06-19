@@ -290,7 +290,8 @@ enum WikiExtractionPrompts {
     /// honours whatever the user has bound there (on-device by default).
     static func summaryPrompt(title: String, body: String) -> String {
         // Cap the body slice we send to ~1500 chars — summaries don't
-        // need the whole page, and on-device extraction has 4k tokens.
+        // need the whole page, and even iOS 27's 8k on-device window
+        // leaves us plenty of room without sending a wall of text.
         let trimmedBody: String
         if body.count > 1500 {
             let cutoff = body.index(body.startIndex, offsetBy: 1500)

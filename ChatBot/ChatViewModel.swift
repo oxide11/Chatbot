@@ -129,8 +129,17 @@ final class ChatViewModel: Identifiable {
     /// providers from Keychain credentials. Set by ConversationStore.
     var providerRegistry: ProviderRegistry?
 
-    private static let maxTurnsBeforeRotation = 6
-    private static let estimatedMaxTokens = 4096.0
+    /// Turn count at which we summarise and rotate the on-device
+    /// session. iOS 27 doubled the FoundationModels window to 8192
+    /// tokens, so we can carry more turns before needing to compress.
+    private static let maxTurnsBeforeRotation = 9
+    /// Matches `SystemLanguageModel`'s context size on iOS 27 (newer
+    /// devices). Used purely for the chat header's "context filled"
+    /// indicator — the framework itself enforces the real limit and
+    /// will throw `.exceededContextWindowSize` if we ever try to push
+    /// past it, which `handleGenerationError` recovers from by
+    /// rotating early.
+    private static let estimatedMaxTokens = 8192.0
     private static let charsPerToken = 3.5
 
     /// Default system prompt for the chat. Kept short to leave context room

@@ -2,10 +2,11 @@
 //  WikiContextBudget.swift
 //  ChatBot
 //
-//  Per-provider caps for wiki injection and tool use. The on-device model
-//  has a 4096-token window, so wiki retrieval has to be tight: a 20-entry
-//  TOC, ≤4 page fetches per turn, ~1750 chars of body per page, and a
-//  pre-injection fallback of 2 full pages when tools aren't appropriate.
+//  Per-provider caps for wiki injection and tool use. The on-device
+//  model has an 8192-token window on iOS 27 (was 4096 on iOS 26), so
+//  wiki retrieval gets a generous-but-bounded budget: a 30-entry TOC,
+//  ≤5 page fetches per turn, ~3000 chars of body per page, and a
+//  pre-injection fallback of 3 full pages when tools aren't appropriate.
 //
 //  Remote providers (Anthropic / OpenAI / Gemini) have 100k+ token windows;
 //  they currently don't support tool calls through our `ChatProvider`
@@ -45,14 +46,16 @@ struct WikiContextBudget: Sendable, Equatable {
     /// the larger per-page size.
     var preInjectCharBudget: Int
 
-    /// Tight on-device profile — tuned for the 4096-token Foundation
-    /// Models window. Tools active; pre-inject fallback is small.
+    /// On-device profile — tuned for the 8192-token Foundation Models
+    /// window on iOS 27 (was 4096 on iOS 26). Tools active. Pre-inject
+    /// caps act as a fallback for the rare path where wiki injection is
+    /// on but tools aren't mounted.
     static let onDevice = WikiContextBudget(
-        tocEntryLimit: 20,
-        pageFetchCap: 4,
-        pageCharBudget: 1750,
-        preInjectPageLimit: 2,
-        preInjectCharBudget: 1750
+        tocEntryLimit: 30,
+        pageFetchCap: 5,
+        pageCharBudget: 3000,
+        preInjectPageLimit: 3,
+        preInjectCharBudget: 3500
     )
 
     /// Generous remote profile — Anthropic / OpenAI / Gemini all have
